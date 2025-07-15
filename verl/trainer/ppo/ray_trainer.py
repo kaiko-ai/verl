@@ -26,7 +26,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -87,6 +87,7 @@ class ResourcePoolManager:
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[Role, str]
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    config: Any = None
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
@@ -101,8 +102,18 @@ class ResourcePoolManager:
             # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
+            
+            # Get accelerator_type from config if available
+            accelerator_type = None
+            if self.config is not None and hasattr(self.config, 'trainer') and hasattr(self.config.trainer, 'accelerator_type'):
+                accelerator_type = self.config.trainer.accelerator_type
+            
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name
+                process_on_nodes=process_on_nodes, 
+                use_gpu=True, 
+                max_colocate_count=1, 
+                name_prefix=resource_pool_name,
+                accelerator_type=accelerator_type
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 

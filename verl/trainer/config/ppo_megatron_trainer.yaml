@@ -132,6 +132,9 @@ trainer:
   # The timeout for ray worker group to wait for the register center to be ready
   ray_wait_register_center_timeout: 300
   device: cuda
+  
+  # Accelerator type for Ray resource allocation (optional)
+  accelerator_type: null
   # see ppo_trainer.yaml for more details
   controller_nsight_options:
     trace: "cuda,nvtx,cublas,ucx"
