@@ -102,18 +102,22 @@ class ResourcePoolManager:
             # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
-            
+
             # Get accelerator_type from config if available
             accelerator_type = None
-            if self.config is not None and hasattr(self.config, 'trainer') and hasattr(self.config.trainer, 'accelerator_type'):
+            if (
+                self.config is not None
+                and hasattr(self.config, "trainer")
+                and hasattr(self.config.trainer, "accelerator_type")
+            ):
                 accelerator_type = self.config.trainer.accelerator_type
-            
+
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, 
-                use_gpu=True, 
-                max_colocate_count=1, 
+                process_on_nodes=process_on_nodes,
+                use_gpu=True,
+                max_colocate_count=1,
                 name_prefix=resource_pool_name,
-                accelerator_type=accelerator_type
+                accelerator_type=accelerator_type,
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 

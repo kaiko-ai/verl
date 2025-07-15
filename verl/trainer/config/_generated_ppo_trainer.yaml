@@ -215,6 +215,7 @@ trainer:
   ray_wait_register_center_timeout: 300
   device: cuda
   use_legacy_worker_impl: auto
+  accelerator_type: null
 data:
   tokenizer: null
   use_shm: false
