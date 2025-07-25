@@ -33,7 +33,8 @@ from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayWorkerGroup
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
-from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
+from verl.utils.rollout_trace import (RolloutTraceConfig, rollout_trace_attr,
+                                      rollout_trace_op)
 from verl.workers.rollout.async_server import async_server_class
 
 logger = logging.getLogger(__file__)
@@ -168,7 +169,7 @@ class AgentLoopBase(ABC):
         cls._class_initialized = True
 
     @abstractmethod
-    async def run(self, messages: list[dict[str, Any]], sampling_params: dict[str, Any]) -> AgentLoopOutput:
+    async def run(self, messages: list[dict[str, Any]], sampling_params: dict[str, Any], extra_info: dict[str, Any]) -> AgentLoopOutput:
         """Run agent loop to interact with LLM server and environment.
 
         Args:
@@ -274,6 +275,7 @@ class AgentLoopWorker:
         tasks = []
         agent_names = batch.non_tensor_batch["agent_name"]
         raw_prompts = batch.non_tensor_batch["raw_prompt"]
+        extra_info_batch = batch.non_tensor_batch["extra_info"]
         if "index" in batch.non_tensor_batch:
             index = batch.non_tensor_batch["index"]
         else:
@@ -283,9 +285,9 @@ class AgentLoopWorker:
             batch.meta_info.get("global_steps", -1), index, batch.meta_info.get("validate", False)
         )
 
-        for agent_name, messages, trajectory in zip(agent_names, raw_prompts, trajectory_info, strict=True):
+        for agent_name, messages, trajectory, extra_info in zip(agent_names, raw_prompts, trajectory_info, extra_info_batch, strict=True):
             tasks.append(
-                asyncio.create_task(self._run_agent_loop(agent_name, messages.tolist(), sampling_params, trajectory))
+                asyncio.create_task(self._run_agent_loop(agent_name, messages.tolist(), sampling_params, trajectory, extra_info))
             )
         outputs = await asyncio.gather(*tasks)
 
@@ -298,6 +300,7 @@ class AgentLoopWorker:
         messages: list[dict[str, Any]],
         sampling_params: dict[str, Any],
         trajectory: dict[str, Any],
+        extra_info: dict[str, Any],
     ) -> AgentLoopOutput:
         with rollout_trace_attr(
             step=trajectory["step"],
@@ -317,7 +320,7 @@ class AgentLoopWorker:
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
             )
-            output = await agent_loop.run(messages, sampling_params)
+            output = await agent_loop.run(messages, sampling_params, extra_info=extra_info)
             return output
 
     def _postprocess(self, inputs: list[AgentLoopOutput]) -> DataProto:
