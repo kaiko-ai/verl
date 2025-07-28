@@ -1217,14 +1217,22 @@ class SGLangRollout(BaseRollout):
             loop = asyncio.get_event_loop()
             loop.run_until_complete(self._engine.flush_cache())
 
+        non_tensor_batch = {
+            "messages": np.array(messages),
+            "reward_scores": np.array(reward_scores),
+            "request_id": np.array(request_ids),
+        }
+
+        is_multimodal = isinstance(self.processing_class, ProcessorMixin) and (
+            hasattr(self.processing_class, "image_processor") or hasattr(self.model_hf_config, "vision_config")
+        )
+
+        if is_multimodal:
+            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs, dtype=object)
+
         return DataProto(
             batch=batch,
-            non_tensor_batch={
-                "messages": np.array(messages),
-                "reward_scores": np.array(reward_scores),
-                "multi_modal_inputs": np.array(multi_modal_inputs, dtype=object),
-                "request_id": np.array(request_ids),
-            },
+            non_tensor_batch=non_tensor_batch,
         )
 
     def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto, n: int = 1) -> list[AsyncRolloutRequest]:
@@ -1373,11 +1381,11 @@ class SGLangRollout(BaseRollout):
         # this function is left for uniform train-inference resharding
 
     async def generate(
-        self, prompt_ids: torch.Tensor, sampling_params: dict[str, Any], request_id: str
+        self, prompt_ids: torch.Tensor, sampling_params: dict[str, Any], request_id: str, image_data: Optional[list[Any]] = None
     ) -> torch.Tensor:
         request_sampling_params = self.sampling_params.copy()
         request_sampling_params.update(sampling_params)
-        output = await self._handle_engine_generate(prompt_ids, request_sampling_params)
+        output = await self._handle_engine_generate(prompt_ids, request_sampling_params, image_data=image_data)
         return output["output_ids"]
 
     async def wake_up(self):
