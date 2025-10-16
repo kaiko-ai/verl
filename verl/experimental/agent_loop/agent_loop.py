@@ -36,7 +36,8 @@ from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
-from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
+from verl.utils.rollout_trace import (RolloutTraceConfig, rollout_trace_attr,
+                                      rollout_trace_op)
 from verl.workers.rollout.async_server import TokenOutput, async_server_class
 
 logger = logging.getLogger(__file__)
@@ -566,6 +567,9 @@ class AgentLoopManager:
                 for worker in self.worker_group.workers
             ]
         )
+        self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size
+        # Store the node IDs for the servers
+        self.server_node_ids = [workers_info[i * self.rollout_tp_size] for i in range(self.rollout_dp_size)]
         assert len(workers_info) == self.worker_group.world_size
 
         self.async_llm_servers = [None] * self.rollout_dp_size
@@ -611,11 +615,10 @@ class AgentLoopManager:
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
-
-        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        num_server_nodes = len(self.server_node_ids)
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
-            node_id = node_ids[i % len(node_ids)]
+            node_id = self.server_node_ids[i % num_server_nodes]
             self.agent_loop_workers.append(
                 AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
