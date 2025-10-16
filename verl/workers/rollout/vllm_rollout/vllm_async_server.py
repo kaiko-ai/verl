@@ -42,6 +42,7 @@ from vllm.v1.executor.abstract import Executor
 
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.import_utils import import_external_libs
 from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_free_port, run_unvicorn
@@ -142,6 +143,26 @@ class vLLMHttpServer:
         self.config.max_model_len = self.config.prompt_length + self.config.response_length
         self.rollout_mode = rollout_mode
         self.workers = workers
+
+        ext_libs: list[str] = []
+        if hasattr(self.model_config, "external_lib") and self.model_config.external_lib:
+            ext_libs = list(self.model_config.external_lib)
+
+        if ext_libs:
+            logger.info(f"Loading external libs: {ext_libs}")
+            import_external_libs(ext_libs)
+
+            try:
+                ray.get([
+                    w.__ray_call__.remote(
+                        lambda self, libs=ext_libs: (
+                            __import__("verl.utils.import_utils", fromlist=["import_external_libs"])
+                            .import_external_libs(libs)
+                        )
+                    ) for w in self.workers
+                ])
+            except Exception as e:
+                logger.warning(f"Failed to import external libs in workers: {e!r}")
 
         self.replica_rank = replica_rank
         self.node_rank = node_rank
