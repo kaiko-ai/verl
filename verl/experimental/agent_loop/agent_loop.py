@@ -398,11 +398,17 @@ class AgentLoopWorker:
             agent_loop_configs = OmegaConf.load(agent_loop_config_path)
             for agent_loop_config in agent_loop_configs:
                 _agent_loop_registry[agent_loop_config.name] = agent_loop_config
-        if self.config.actor_rollout_ref.model.get("custom_chat_template", None) is not None:
-            if self.processor is not None:
-                self.processor.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
-            self.tokenizer.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
 
+        if config.actor_rollout_ref.get("custom_chat_template_path"):
+            with open(config.actor_rollout_ref.get("custom_chat_template_path")) as f:
+                print(
+                    "loading custom chat template from",
+                    config.actor_rollout_ref.get("custom_chat_template_path"),
+                )
+                rollout_chat_template = f.read()
+            if self.processor is not None:
+                self.processor.chat_template = rollout_chat_template
+            self.tokenizer.chat_template = rollout_chat_template
         self.reward_manager_worker = RewardManagerWorker.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
@@ -816,12 +822,27 @@ class AgentLoopManager:
             self._run_all([server.init_standalone() for server in self.rollout_replicas])
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
+        self.server_node_ids = ray.get(
+            [
+                h.__ray_call__.remote(
+                    lambda self: ray.get_runtime_context().get_node_id()
+                )
+                for h in self.server_handles
+            ]
+        )
 
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
 
-        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        node_ids = getattr(self, "server_node_ids", None)
+        if not node_ids:
+            node_ids = [
+                node["NodeID"]
+                for node in ray.nodes()
+                if node["Alive"] and node["Resources"].get("CPU", 0) > 0
+            ]
+
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
