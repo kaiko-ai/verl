@@ -27,15 +27,19 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+from verl.trainer.ppo.core_algos import (agg_loss, get_policy_loss_fn,
+                                         kl_penalty)
+from verl.utils.attention_utils import (index_first_axis, pad_input, rearrange,
+                                        unpad_input)
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.seqlen_balancing import (prepare_dynamic_batch,
+                                         restore_dynamic_batch)
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+from verl.utils.ulysses import (gather_outputs_and_unpad, ulysses_pad,
+                                ulysses_pad_and_slice_inputs)
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
@@ -126,7 +130,9 @@ class DataParallelPPOActor(BasePPOActor):
                     ).transpose(0, 1)
 
                 if "image_bound" in multi_modal_inputs:
-                    from verl.utils.dataset.vision_utils import process_multi_modal_inputs_for_minicpmo
+                    from verl.utils.dataset.vision_utils import \
+                        process_multi_modal_inputs_for_minicpmo
+                    print("Image bound found in multi_modal_inputs, processing for minicpmo...")
 
                     multi_modal_inputs = process_multi_modal_inputs_for_minicpmo(
                         input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
@@ -137,6 +143,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
+                    print("Using Ulysses Sequence Parallelism in DP Actor")
                     is_vlm_model = hasattr(
                         getattr(self.actor_module, "module", self.actor_module).config, "vision_config"
                     )
@@ -166,7 +173,9 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
-
+                print("Calling actor_module forward with rmpad inputs...")
+                print("Keys in multi_modal_inputs:", multi_modal_inputs.keys())
+                print("Keys in extra_args:", extra_args.keys())
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -329,7 +338,15 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
             micro_batches = data.split(micro_batch_size)
-
+            print("Number of micro batches:", len(micro_batches))
+        # Maybe we can check this?
+        # inputs_embeds = model.get_input_embeddings()(input_ids)
+        # image_mask, video_mask = None, None
+        # if pixel_values is not None:
+        #     pixel_values = pixel_values.type(model.visual.dtype)
+        #     image_embeds, deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        #     n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
+        #     n_image_features = image_embeds.shape[0]
         log_probs_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
