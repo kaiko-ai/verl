@@ -178,12 +178,12 @@ class DataParallelPPOActor(BasePPOActor):
                 print("Keys in extra_args:", extra_args.keys())
                 for key, value in multi_modal_inputs.items():
                     print(f"multi_modal_inputs[{key}]: shape={value.shape}, dtype={value.dtype}")
-                inputs_embeds = self.actor_module.get_input_embeddings()(input_ids)
+                inputs_embeds = self.actor_module.get_input_embeddings()(input_ids_rmpad)
                 pixel_values = multi_modal_inputs.get("pixel_values", None)
                 if pixel_values is not None:
                     pixel_values = pixel_values.type(self.actor_module.visual.dtype)
                     image_embeds, deepstack_image_embeds = self.actor_module.visual(pixel_values, grid_thw=multi_modal_inputs["image_grid_thw"])
-                    n_image_tokens = (input_ids == self.actor_module.config.image_token_id).sum().item()
+                    n_image_tokens = (input_ids_rmpad == self.actor_module.config.image_token_id).sum().item()
                     n_image_features = image_embeds.shape[0]
                     if n_image_tokens != n_image_features:
                         print(
