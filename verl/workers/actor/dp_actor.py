@@ -178,6 +178,17 @@ class DataParallelPPOActor(BasePPOActor):
                 print("Keys in extra_args:", extra_args.keys())
                 for key, value in multi_modal_inputs.items():
                     print(f"multi_modal_inputs[{key}]: shape={value.shape}, dtype={value.dtype}")
+                inputs_embeds = self.actor_module.get_input_embeddings()(input_ids)
+                pixel_values = multi_modal_inputs.get("pixel_values", None)
+                if pixel_values is not None:
+                    pixel_values = pixel_values.type(self.actor_module.visual.dtype)
+                    image_embeds, deepstack_image_embeds = self.actor_module.visual(pixel_values, grid_thw=multi_modal_inputs["image_grid_thw"])
+                    n_image_tokens = (input_ids == self.actor_module.config.image_token_id).sum().item()
+                    n_image_features = image_embeds.shape[0]
+                    if n_image_tokens != n_image_features:
+                        print(
+                            f"ERROR: Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                        )
             #     output = self.actor_module(
             #         input_ids=input_ids_rmpad,
             #         attention_mask=None,
@@ -545,7 +556,8 @@ class DataParallelPPOActor(BasePPOActor):
         #     n_image_features = image_embeds.shape[0]
         log_probs_lst = []
         entropy_lst = []
-        for micro_batch in micro_batches:
+        for i, micro_batch in enumerate(micro_batches):
+            print("Micro batch", i, "size:", micro_batch.batch["input_ids"].shape[0])
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
