@@ -422,7 +422,7 @@ class AgentLoopWorker:
             self.config.trainer.experiment_name,
             trace_config.get("backend"),
             trace_config.get("token2text", False),
-            trace_config.get("max_samples_per_step", None),
+            trace_config.get("max_samples_per_step_per_worker", None),
         )
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
@@ -469,14 +469,14 @@ class AgentLoopWorker:
         else:
             index = np.arange(len(batch))
 
-        max_samples_per_step = RolloutTraceConfig.get_instance().max_samples_per_step
+        max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
 
-        # Determine which batch indices to trace
         # For n rollouts per sample, we trace all n rollouts for selected samples
-        if max_samples_per_step is not None:
+        # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
+        if max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
-            if max_samples_per_step < len(unique_sample_indices):
-                selected_samples = set(np.random.choice(unique_sample_indices, max_samples_per_step, replace=False).tolist())
+            if max_samples_per_worker < len(unique_sample_indices):
+                selected_samples = set(np.random.choice(unique_sample_indices, max_samples_per_worker, replace=False).tolist())
                 traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
             else:
                 traced_indices = set(range(len(batch)))
