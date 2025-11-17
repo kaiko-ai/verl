@@ -32,6 +32,9 @@ class RolloutTraceConfig:
         token2text (bool): Whether to convert tokens to text in traces. Defaults to False.
         project_name (str): Name of the project for tracing.
         experiment_name (str): Name of the experiment for tracing.
+        max_samples_per_step (Optional[int]): Maximum number of unique samples to trace per step.
+            If None, all samples are traced. If set, only samples with sample_index < max_samples_per_step
+            will be traced (including all their GRPO rollouts).
     """
 
     _instance: Optional["RolloutTraceConfig"] = None
@@ -41,6 +44,7 @@ class RolloutTraceConfig:
     _initialized: bool = False
     project_name: str = None
     experiment_name: str = None
+    max_samples_per_step: Optional[int] = None
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -55,7 +59,14 @@ class RolloutTraceConfig:
         return cls._instance
 
     @classmethod
-    def init(cls, project_name: str, experiment_name: str, backend: str, token2text: bool = False):
+    def init(
+        cls,
+        project_name: str,
+        experiment_name: str,
+        backend: str,
+        token2text: bool = False,
+        max_samples_per_step: Optional[int] = None,
+    ):
         config = cls.get_instance()
         if config._initialized:
             return
@@ -64,6 +75,7 @@ class RolloutTraceConfig:
         config.token2text = token2text
         config.project_name = project_name
         config.experiment_name = experiment_name
+        config.max_samples_per_step = max_samples_per_step
 
         if backend == "weave":
             import weave
@@ -87,6 +99,13 @@ class RolloutTraceConfig:
     @classmethod
     def get_backend(cls) -> Optional[str]:
         return cls.get_instance().backend
+    
+    @classmethod
+    def should_trace_sample(cls, sample_index: int) -> bool:
+        max_samples = cls.get_instance().max_samples_per_step
+        if max_samples is None:
+            return True
+        return sample_index < max_samples
 
     @classmethod
     def get_client(cls) -> Optional[object]:
@@ -103,8 +122,31 @@ class RolloutTraceConfig:
 
 @contextlib.contextmanager
 def rollout_trace_attr(sample_index=None, step=None, rollout_n=None, name="rollout_trace", validate=False):
-    """A context manager to add attributes to a trace for the configured backend."""
+    """A context manager to add attributes to a trace for the configured backend.
+
+    If max_samples_per_step is configured and sample_index exceeds the limit,
+    this temporarily disables tracing for the duration of the context by setting
+    backend to None.
+    """
     backend = RolloutTraceConfig.get_backend()
+
+    should_skip = (
+        backend is not None
+        and sample_index is not None
+        and not RolloutTraceConfig.should_trace_sample(sample_index)
+    )
+
+    if should_skip:
+        config = RolloutTraceConfig.get_instance()
+        original_backend = config.backend
+        config.backend = None
+        try:
+            yield
+        finally:
+            config.backend = original_backend
+        return
+
+    # Build attributes for the trace
     attributes = {}
     if backend:
         if sample_index is not None:

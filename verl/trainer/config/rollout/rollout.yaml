@@ -258,6 +258,13 @@ trace:
   # whether translate token id to text in output
   token2text: False
 
+  # Maximum number of unique samples to trace per training step.
+  # If null, all samples are traced. If set to N, only the first N samples
+  # (by sample_index) will be traced, including all their GRPO rollouts.
+  # Example: max_samples_per_step=10 with GRPO n=16 will trace 160 total trajectories per step
+  # (10 prompts × 16 rollouts each), instead of tracing all prompts.
+  max_samples_per_step: null
+
 # When enabled (True), the trainer will attempt to load previously generated rollout data from the specified directory instead of computing new rollouts.
 # If no cached data is found or loading fails, new rollouts will be generated and automatically saved.
 # This feature is useful for debugging or when you want to reuse computation results across multiple runs.

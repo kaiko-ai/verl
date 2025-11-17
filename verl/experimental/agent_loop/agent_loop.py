@@ -422,6 +422,7 @@ class AgentLoopWorker:
             self.config.trainer.experiment_name,
             trace_config.get("backend"),
             trace_config.get("token2text", False),
+            trace_config.get("max_samples_per_step", None),
         )
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
