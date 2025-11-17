@@ -469,7 +469,7 @@ class AgentLoopWorker:
         else:
             index = np.arange(len(batch))
 
-        max_samples_per_step = RolloutTraceConfig.max_samples_per_step()
+        max_samples_per_step = RolloutTraceConfig.get_instance().max_samples_per_step
         if max_samples_per_step is not None and max_samples_per_step < len(batch):
             traced_indices = set(np.random.choice(len(batch), max_samples_per_step, replace=False).tolist())
         else:
