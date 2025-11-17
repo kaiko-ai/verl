@@ -469,14 +469,21 @@ class AgentLoopWorker:
         else:
             index = np.arange(len(batch))
 
+        max_samples_per_step = RolloutTraceConfig.get_max_samples_per_step()
+        if max_samples_per_step is not None and max_samples_per_step < len(batch):
+            traced_indices = set(np.random.choice(len(batch), max_samples_per_step, replace=False).tolist())
+        else:
+            traced_indices = set(range(len(batch)))
+
         trajectory_info = await get_trajectory_info(
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
         tasks = []
         for i in range(len(batch)):
+            trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
+            tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)))
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
@@ -488,6 +495,7 @@ class AgentLoopWorker:
         trajectory: dict[str, Any],
         *,
         agent_name: str,
+        trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
@@ -496,6 +504,7 @@ class AgentLoopWorker:
             rollout_n=trajectory["rollout_n"],
             validate=trajectory["validate"],
             name="agent_loop",
+            trace=trace,
         ):
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"

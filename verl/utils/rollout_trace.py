@@ -18,6 +18,9 @@ import functools
 import inspect
 import os
 from typing import Optional
+from contextvars import ContextVar
+
+_trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
 
 
 class RolloutTraceConfig:
@@ -99,13 +102,6 @@ class RolloutTraceConfig:
     @classmethod
     def get_backend(cls) -> Optional[str]:
         return cls.get_instance().backend
-    
-    @classmethod
-    def should_trace_sample(cls, sample_index: int) -> bool:
-        max_samples = cls.get_instance().max_samples_per_step
-        if max_samples is None:
-            return True
-        return sample_index < max_samples
 
     @classmethod
     def get_client(cls) -> Optional[object]:
@@ -121,7 +117,7 @@ class RolloutTraceConfig:
 
 
 @contextlib.contextmanager
-def rollout_trace_attr(sample_index=None, step=None, rollout_n=None, name="rollout_trace", validate=False):
+def rollout_trace_attr(sample_index=None, step=None, rollout_n=None, name="rollout_trace", validate=False, trace: bool = True):
     """A context manager to add attributes to a trace for the configured backend.
 
     If max_samples_per_step is configured and sample_index exceeds the limit,
@@ -131,19 +127,15 @@ def rollout_trace_attr(sample_index=None, step=None, rollout_n=None, name="rollo
     backend = RolloutTraceConfig.get_backend()
 
     should_skip = (
-        backend is not None
-        and sample_index is not None
-        and not RolloutTraceConfig.should_trace_sample(sample_index)
+        backend is not None and not trace
     )
 
     if should_skip:
-        config = RolloutTraceConfig.get_instance()
-        original_backend = config.backend
-        config.backend = None
+        token = _trace_enabled.set(False)
         try:
             yield
         finally:
-            config.backend = original_backend
+            _trace_enabled.reset(token)
         return
 
     # Build attributes for the trace
@@ -182,6 +174,9 @@ def rollout_trace_attr(sample_index=None, step=None, rollout_n=None, name="rollo
 def rollout_trace_op(func):
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
+        if not _trace_enabled.get():
+            return await func(self, *args, **kwargs)
+
         backend = RolloutTraceConfig.get_backend()
         enable_token2text = RolloutTraceConfig.enable_token2text()
         if backend is None:
@@ -246,6 +241,9 @@ def rollout_trace_op(func):
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
+        if not _trace_enabled.get():
+            return func(self, *args, **kwargs)
+
         backend = RolloutTraceConfig.get_backend()
         if backend is None:
             return func(self, *args, **kwargs)
