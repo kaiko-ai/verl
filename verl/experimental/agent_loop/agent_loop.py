@@ -470,8 +470,16 @@ class AgentLoopWorker:
             index = np.arange(len(batch))
 
         max_samples_per_step = RolloutTraceConfig.get_instance().max_samples_per_step
-        if max_samples_per_step is not None and max_samples_per_step < len(batch):
-            traced_indices = set(np.random.choice(len(batch), max_samples_per_step, replace=False).tolist())
+
+        # Determine which batch indices to trace
+        # For n rollouts per sample, we trace all n rollouts for selected samples
+        if max_samples_per_step is not None:
+            unique_sample_indices = np.unique(index)
+            if max_samples_per_step < len(unique_sample_indices):
+                selected_samples = set(np.random.choice(unique_sample_indices, max_samples_per_step, replace=False).tolist())
+                traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
+            else:
+                traced_indices = set(range(len(batch)))
         else:
             traced_indices = set(range(len(batch)))
 
