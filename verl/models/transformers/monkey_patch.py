@@ -325,7 +325,7 @@ def apply_monkey_patch(
         print("Monkey patch state_dict in AutoModelForCausalLMWithValueHead. ")
 
     # TODO: VLM models only, unify monkey patch to LLM models.
-    if model.config.model_type in ["qwen2_5_vl", "qwen2_vl"]:
+    if _has_any_model_type(model, {"qwen2_5_vl", "qwen2_5_vl_text", "qwen2_vl"}):
         # Step 1: patch model to support image-text mixed data
         if is_transformers_version_in_range(min_version="4.52.0"):
             from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
