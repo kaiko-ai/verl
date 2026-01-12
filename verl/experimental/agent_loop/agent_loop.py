@@ -555,6 +555,11 @@ class AgentLoopWorkerBase:
                 "tool_extra_fields": np.array([output.extra_fields], dtype=object),
             }
 
+            # Optionally pass multi_modal_data to reward computation (for vision judge models)
+            pass_mm_to_reward = self.config.reward_model.get("pass_multi_modal_data", False)
+            if pass_mm_to_reward and output.multi_modal_data is not None:
+                non_tensor_batch["multi_modal_data"] = np.array([output.multi_modal_data], dtype=object)
+
             data = DataProto(
                 batch=batch,
                 non_tensor_batch=non_tensor_batch,
