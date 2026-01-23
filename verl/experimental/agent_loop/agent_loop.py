@@ -37,6 +37,7 @@ from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
+from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
@@ -262,6 +263,9 @@ class AgentLoopWorkerBase:
         if not hasattr(self, "server_manager"):
             self.server_manager = AsyncLLMServerManager(config, server_handles)
 
+        import_external_libs(
+            config.actor_rollout_ref.model.get("external_lib", None)
+        )  # need the external libs for tokenizer/processor
         self.reward_router_address = reward_router_address
 
         model_path = config.actor_rollout_ref.model.path
