@@ -52,8 +52,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
-            prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+            prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         else:
             prompt_ids = await self.loop.run_in_executor(
                 None,
