@@ -111,7 +111,9 @@ class HFModelConfig(BaseConfig):
         if self.load_tokenizer:
             self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
             self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
-            self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code, **self.processor_kwargs)
+            self.processor = hf_processor(
+                self.local_tokenizer_path, trust_remote_code=self.trust_remote_code, **self.processor_kwargs
+            )
 
         if self.custom_chat_template is not None:
             if self.processor is not None:
