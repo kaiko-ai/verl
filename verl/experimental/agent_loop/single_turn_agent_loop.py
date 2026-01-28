@@ -52,7 +52,14 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+            if "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+                # qwenvl has deduplication of the image tokens, and later in the postprocessing we need to know the exact number of image tokens
+                # it's expected that the prompt_ids here is expanded for qwenvl so we just keep it
+                # as is
+                model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
+                prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+            else:
+                prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         else:
             prompt_ids = await self.loop.run_in_executor(
                 None,
