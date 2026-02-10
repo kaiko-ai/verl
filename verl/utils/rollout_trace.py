@@ -184,9 +184,11 @@ def rollout_trace_attr(
             yield
     elif backend == "arize":
         tracer = RolloutTraceConfig.get_client()
+        span_attributes = {str(k): str(v) for k, v in attributes.items()}
+        span_attributes["openinference.span.kind"] = "CHAIN"
         with tracer.start_as_current_span(
             name=name,
-            attributes={str(k): str(v) for k, v in attributes.items()},
+            attributes=span_attributes,
         ):
             yield
     else:
@@ -264,15 +266,20 @@ def rollout_trace_op(func):
             tracer = RolloutTraceConfig.get_client()
             with tracer.start_as_current_span(
                 name=func.__qualname__,
-                attributes={"inputs": str(inputs)},
+                attributes={
+                    "openinference.span.kind": "CHAIN",
+                    "input.value": str(inputs),
+                    "input.mime_type": "text/plain",
+                },
             ) as span:
                 try:
                     result = await func(self, *args, **kwargs)
                     if enable_token2text:
                         _result = await add_token2text(self, result)
-                        span.set_attribute("outputs", str(_result))
+                        span.set_attribute("output.value", str(_result))
                     else:
-                        span.set_attribute("outputs", str(result))
+                        span.set_attribute("output.value", str(result))
+                    span.set_attribute("output.mime_type", "text/plain")
                     span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
                     return result
                 except Exception as e:
@@ -321,11 +328,16 @@ def rollout_trace_op(func):
             tracer = RolloutTraceConfig.get_client()
             with tracer.start_as_current_span(
                 name=func.__qualname__,
-                attributes={"inputs": str(inputs)},
+                attributes={
+                    "openinference.span.kind": "CHAIN",
+                    "input.value": str(inputs),
+                    "input.mime_type": "text/plain",
+                },
             ) as span:
                 try:
                     result = func(self, *args, **kwargs)
-                    span.set_attribute("outputs", str(result))
+                    span.set_attribute("output.value", str(result))
+                    span.set_attribute("output.mime_type", "text/plain")
                     span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
                     return result
                 except Exception as e:

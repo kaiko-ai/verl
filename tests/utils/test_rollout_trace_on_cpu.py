@@ -287,8 +287,8 @@ async def test_rollout_trace_with_arize_tracer(mock_arize_tracer):
     mock_tracer.start_as_current_span.assert_called_once()
     call_kwargs = mock_tracer.start_as_current_span.call_args.kwargs
     assert call_kwargs["name"] == "TracedClass.my_method"
-    assert "inputs" in call_kwargs["attributes"]
-    mock_span.set_attribute.assert_any_call("outputs", str(result))
+    assert "input.value" in call_kwargs["attributes"]
+    mock_span.set_attribute.assert_any_call("output.value", str(result))
 
 
 async def test_rollout_trace_arize_with_exception(mock_arize_tracer):
