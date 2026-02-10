@@ -348,3 +348,66 @@ def rollout_trace_op(func):
             return func(self, *args, **kwargs)
 
     return async_wrapper if inspect.iscoroutinefunction(func) else wrapper
+
+
+def rollout_trace_attach_images(
+    images: list | None,
+    image_format: str = "png",
+    max_dimension: int | None = None,
+    message_index: int = 0,
+):
+    """Attach images to the current trace span for visualization in the tracing UI.
+
+    For the Arize backend, converts PIL images to base64 and sets them as
+    OpenInference-compliant span attributes. Should be called once at the end
+    of a traced function (within a @rollout_trace_op span), not per turn.
+
+    For the Weave backend, this is a no-op since Weave handles PIL images natively.
+
+    Args:
+        images: List of PIL Image objects to attach. If None or empty, no-op.
+        image_format: Image encoding format ('png' or 'jpeg'). Default 'png'.
+        max_dimension: If set, resize images so the largest dimension is at most
+            this value (preserving aspect ratio). Useful for reducing payload size.
+        message_index: OpenInference message index for the attributes. Default 0.
+    """
+    if not images:
+        return
+
+    backend = RolloutTraceConfig.get_backend()
+    if backend != "arize":
+        return
+
+    if not _trace_enabled.get():
+        return
+
+    import base64
+    import io
+
+    from opentelemetry import trace
+
+    span = trace.get_current_span()
+    if not span.is_recording():
+        return
+
+    for i, img in enumerate(images):
+        if not hasattr(img, "save"):
+            continue
+
+        if max_dimension is not None:
+            w, h = img.size
+            if max(w, h) > max_dimension:
+                scale = max_dimension / max(w, h)
+                img = img.resize(
+                    (int(w * scale), int(h * scale)),
+                    resample=getattr(img, "Resampling", img).LANCZOS if hasattr(img, "Resampling") else 1,
+                )
+
+        buffer = io.BytesIO()
+        img.save(buffer, format=image_format.upper())
+        b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        data_uri = f"data:image/{image_format.lower()};base64,{b64}"
+
+        prefix = f"llm.input_messages.{message_index}.message.contents.{i}"
+        span.set_attribute(f"{prefix}.message_content.type", "image")
+        span.set_attribute(f"{prefix}.message_content.image.image.url", data_uri)

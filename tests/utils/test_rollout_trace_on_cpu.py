@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
+from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attach_images, rollout_trace_attr, rollout_trace_op
 
 
 @pytest.fixture(autouse=True)
@@ -337,3 +337,120 @@ async def test_rollout_trace_with_real_arize_backend():
         await instance.my_method_with_exception()
 
     print("\nArize integration test ran successfully. Check your Arize project for the trace.")
+
+
+class FakePILImage:
+    """Minimal duck-type stand-in for a PIL Image."""
+
+    def __init__(self, width=100, height=80):
+        self._size = (width, height)
+
+    @property
+    def size(self):
+        return self._size
+
+    def resize(self, size, resample=None):
+        return FakePILImage(width=size[0], height=size[1])
+
+    def save(self, fp, format=None):
+        # Write a tiny valid payload so base64 is non-empty
+        fp.write(b"\x89PNG_FAKE")
+
+    class Resampling:
+        LANCZOS = 1
+
+
+async def test_rollout_trace_attach_images_with_arize(mock_arize_tracer):
+    """Tests that images are attached as OpenInference attributes on the Arize span."""
+    mock_tracer, mock_span = mock_arize_tracer
+    mock_span.is_recording.return_value = True
+
+    # Make get_current_span return our mock span
+    import sys
+
+    mock_otel = sys.modules["opentelemetry"]
+    mock_otel.trace.get_current_span.return_value = mock_span
+
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+
+    images = [FakePILImage(), FakePILImage()]
+    rollout_trace_attach_images(images, image_format="png")
+
+    # Should have set 4 attributes: type + url for each of 2 images
+    assert mock_span.set_attribute.call_count == 4
+    calls = {args[0]: args[1] for args, _ in [c for c in mock_span.set_attribute.call_args_list]}
+    assert calls["llm.input_messages.0.message.contents.0.message_content.type"] == "image"
+    assert calls["llm.input_messages.0.message.contents.0.message_content.image.image.url"].startswith(
+        "data:image/png;base64,"
+    )
+    assert calls["llm.input_messages.0.message.contents.1.message_content.type"] == "image"
+    assert calls["llm.input_messages.0.message.contents.1.message_content.image.image.url"].startswith(
+        "data:image/png;base64,"
+    )
+
+
+async def test_rollout_trace_attach_images_noop_without_backend():
+    """Tests that attach_images is a no-op when no backend is configured."""
+    images = [FakePILImage()]
+    # No backend configured (default after reset) — should silently return
+    rollout_trace_attach_images(images)
+
+
+async def test_rollout_trace_attach_images_noop_with_weave(mock_weave_client):
+    """Tests that attach_images is a no-op when Weave backend is configured."""
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="weave")
+    images = [FakePILImage()]
+    rollout_trace_attach_images(images)
+    # No span interaction should happen with weave
+
+
+async def test_rollout_trace_attach_images_with_resize(mock_arize_tracer):
+    """Tests that images are resized when max_dimension is set."""
+    mock_tracer, mock_span = mock_arize_tracer
+    mock_span.is_recording.return_value = True
+
+    import sys
+
+    mock_otel = sys.modules["opentelemetry"]
+    mock_otel.trace.get_current_span.return_value = mock_span
+
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+
+    saved_sizes = []
+
+    class TrackingImage(FakePILImage):
+        def resize(self, size, resample=None):
+            new_img = TrackingImage(width=size[0], height=size[1])
+            return new_img
+
+        def save(self, fp, format=None):
+            saved_sizes.append(self.size)
+            fp.write(b"\x89PNG_FAKE")
+
+    images = [TrackingImage(width=1024, height=512)]
+    rollout_trace_attach_images(images, max_dimension=256)
+
+    # 1024x512 scaled to max_dimension=256 → 256x128
+    assert saved_sizes[0] == (256, 128)
+    assert mock_span.set_attribute.call_count == 2
+
+
+async def test_rollout_trace_attach_images_respects_trace_disabled(mock_arize_tracer):
+    """Tests that attach_images is a no-op when tracing is disabled via rollout_trace_attr(trace=False)."""
+    mock_tracer, mock_span = mock_arize_tracer
+    mock_span.is_recording.return_value = True
+
+    import sys
+
+    mock_otel = sys.modules["opentelemetry"]
+    mock_otel.trace.get_current_span.return_value = mock_span
+
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+
+    images = [FakePILImage()]
+
+    with rollout_trace_attr(step=1, sample_index=0, rollout_n=0, trace=False):
+        rollout_trace_attach_images(images)
+
+    # No attributes should be set since tracing was disabled
+    mock_span.set_attribute.assert_not_called()
