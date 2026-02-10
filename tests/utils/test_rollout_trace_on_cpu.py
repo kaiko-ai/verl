@@ -393,6 +393,7 @@ async def test_attach_conversation_structured_messages(mock_arize_tracer):
 
     # Message 1: user with text + image
     assert calls["llm.input_messages.1.message.role"] == "user"
+    assert calls["llm.input_messages.1.message.content"] == "Analyze"
     assert calls["llm.input_messages.1.message.contents.0.message_content.type"] == "text"
     assert calls["llm.input_messages.1.message.contents.0.message_content.text"] == "Analyze"
     assert calls["llm.input_messages.1.message.contents.1.message_content.type"] == "image"
@@ -406,6 +407,7 @@ async def test_attach_conversation_structured_messages(mock_arize_tracer):
 
     # Message 3: tool with text + image
     assert calls["llm.input_messages.3.message.role"] == "tool"
+    assert calls["llm.input_messages.3.message.content"] == "Patch result"
     assert calls["llm.input_messages.3.message.contents.0.message_content.type"] == "text"
     assert calls["llm.input_messages.3.message.contents.1.message_content.type"] == "image"
 
@@ -467,3 +469,326 @@ async def test_attach_conversation_respects_trace_disabled(mock_arize_tracer):
         rollout_trace_attach_conversation(messages, [FakePILImage()])
 
     mock_span.set_attribute.assert_not_called()
+
+
+# ============================================================================
+# Diagnostic tests — verify attribute correctness before deploying
+# ============================================================================
+
+def _build_realistic_kaiko_messages():
+    """Build a realistic multi-turn conversation matching kaiko_tool_agent output."""
+    return [
+        {
+            "role": "system",
+            "content": "You are a slide-level analysis agent. Use tools to examine regions.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Analyze this slide for abnormal tissue."},
+                {"type": "image"},
+            ],
+        },
+        # After first generation — assistant message is a string (decoded tokens)
+        {"role": "assistant", "content": "I'll examine the tissue. Let me use extract_patch."},
+        # Tool response with image
+        {
+            "role": "tool",
+            "content": [
+                {"type": "text", "text": "Extracted patch at (100, 200), size 512x512"},
+                {"type": "image"},
+            ],
+        },
+        # Tool response with multiple images
+        {
+            "role": "tool",
+            "content": [
+                {"type": "text", "text": "Segmentation results for region A"},
+                {"type": "image"},
+                {"type": "image"},
+            ],
+        },
+        # Tool response without images — plain string
+        {"role": "tool", "content": "Invalid tool call: missing argument 'x'"},
+        # Last-turn message
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "This is the last turn, please make the final analysis.",
+                }
+            ],
+        },
+    ]
+
+
+def _collect_attributes(mock_span):
+    """Collect all set_attribute calls as a dict."""
+    return {args[0]: args[1] for args, _ in mock_span.set_attribute.call_args_list}
+
+
+async def test_diagnostic_realistic_kaiko_conversation(mock_arize_tracer):
+    """Full realistic multi-turn conversation — dumps all attributes for inspection."""
+    mock_span = _setup_mock_span(mock_arize_tracer)
+    RolloutTraceConfig.init(project_name="p", experiment_name="e", backend="arize")
+
+    messages = _build_realistic_kaiko_messages()
+    images = [FakePILImage(w, h) for w, h in [(512, 512), (512, 512), (256, 256), (256, 256)]]
+
+    rollout_trace_attach_conversation(
+        messages, images, image_format="jpeg", max_dimension=512, span_kind="AGENT"
+    )
+
+    attrs = _collect_attributes(mock_span)
+
+    # --- Span kind ---
+    assert attrs["openinference.span.kind"] == "AGENT"
+
+    # --- Message 0: system (string content) ---
+    assert attrs["llm.input_messages.0.message.role"] == "system"
+    assert attrs["llm.input_messages.0.message.content"] == (
+        "You are a slide-level analysis agent. Use tools to examine regions."
+    )
+
+    # --- Message 1: user with text + 1 image ---
+    assert attrs["llm.input_messages.1.message.role"] == "user"
+    assert attrs["llm.input_messages.1.message.content"] == (
+        "Analyze this slide for abnormal tissue."
+    )
+    assert attrs["llm.input_messages.1.message.contents.0.message_content.type"] == "text"
+    assert attrs["llm.input_messages.1.message.contents.0.message_content.text"] == (
+        "Analyze this slide for abnormal tissue."
+    )
+    assert attrs["llm.input_messages.1.message.contents.1.message_content.type"] == "image"
+    img_url = attrs["llm.input_messages.1.message.contents.1.message_content.image.image.url"]
+    assert img_url.startswith("data:image/jpeg;base64,"), f"Bad image URL prefix: {img_url[:40]}"
+
+    # --- Message 2: assistant (string content) ---
+    assert attrs["llm.input_messages.2.message.role"] == "assistant"
+    assert attrs["llm.input_messages.2.message.content"] == (
+        "I'll examine the tissue. Let me use extract_patch."
+    )
+
+    # --- Message 3: tool with text + 1 image ---
+    assert attrs["llm.input_messages.3.message.role"] == "tool"
+    assert attrs["llm.input_messages.3.message.contents.0.message_content.type"] == "text"
+    assert attrs["llm.input_messages.3.message.contents.0.message_content.text"] == (
+        "Extracted patch at (100, 200), size 512x512"
+    )
+    assert attrs["llm.input_messages.3.message.contents.1.message_content.type"] == "image"
+    # message.content also set for Arize text display
+    assert attrs["llm.input_messages.3.message.content"] == (
+        "Extracted patch at (100, 200), size 512x512"
+    )
+
+    # --- Message 4: tool with text + 2 images ---
+    assert attrs["llm.input_messages.4.message.role"] == "tool"
+    assert attrs["llm.input_messages.4.message.contents.0.message_content.type"] == "text"
+    assert attrs["llm.input_messages.4.message.contents.1.message_content.type"] == "image"
+    assert attrs["llm.input_messages.4.message.contents.2.message_content.type"] == "image"
+    assert attrs["llm.input_messages.4.message.content"] == "Segmentation results for region A"
+
+    # --- Message 5: tool (plain string, no images) ---
+    assert attrs["llm.input_messages.5.message.role"] == "tool"
+    assert attrs["llm.input_messages.5.message.content"] == (
+        "Invalid tool call: missing argument 'x'"
+    )
+
+    # --- Message 6: user text-only list content ---
+    assert attrs["llm.input_messages.6.message.role"] == "user"
+    assert attrs["llm.input_messages.6.message.contents.0.message_content.type"] == "text"
+    assert attrs["llm.input_messages.6.message.content"] == (
+        "This is the last turn, please make the final analysis."
+    )
+
+    # All 4 images consumed
+    image_url_keys = [k for k in attrs if k.endswith(".image.image.url")]
+    assert len(image_url_keys) == 4, f"Expected 4 image URLs, got {len(image_url_keys)}: {image_url_keys}"
+
+
+async def test_diagnostic_list_content_also_sets_message_content(mock_arize_tracer):
+    """Verifies that list content sets BOTH message.content AND message.contents.*.
+
+    Arize reads message.content for text display. Without it, structured messages
+    show empty text. We now set message.content as concatenated text from all
+    text items alongside the structured message.contents attributes.
+    """
+    mock_span = _setup_mock_span(mock_arize_tracer)
+    RolloutTraceConfig.init(project_name="p", experiment_name="e", backend="arize")
+
+    messages = [
+        {"role": "tool", "content": [
+            {"type": "text", "text": "Patch at (100, 200)"},
+            {"type": "image"},
+            {"type": "text", "text": "Region analysis complete"},
+        ]},
+    ]
+    rollout_trace_attach_conversation(messages, [FakePILImage()])
+
+    attrs = _collect_attributes(mock_span)
+
+    # Role is set
+    assert attrs["llm.input_messages.0.message.role"] == "tool"
+
+    # Structured content is set
+    assert attrs["llm.input_messages.0.message.contents.0.message_content.type"] == "text"
+    assert attrs["llm.input_messages.0.message.contents.0.message_content.text"] == "Patch at (100, 200)"
+    assert attrs["llm.input_messages.0.message.contents.1.message_content.type"] == "image"
+    assert attrs["llm.input_messages.0.message.contents.2.message_content.type"] == "text"
+
+    # FIX: message.content IS set — concatenated text for Arize display
+    assert attrs["llm.input_messages.0.message.content"] == (
+        "Patch at (100, 200)\nRegion analysis complete"
+    )
+
+
+async def test_diagnostic_image_count_mismatch_fewer_images(mock_arize_tracer):
+    """Tests behavior when fewer images than placeholders — images silently skipped."""
+    mock_span = _setup_mock_span(mock_arize_tracer)
+    RolloutTraceConfig.init(project_name="p", experiment_name="e", backend="arize")
+
+    messages = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "image"}, {"type": "image"}]},
+    ]
+    # Only 1 image for 3 placeholders
+    rollout_trace_attach_conversation(messages, [FakePILImage()])
+
+    attrs = _collect_attributes(mock_span)
+    image_url_keys = [k for k in attrs if k.endswith(".image.image.url")]
+
+    # Only 1 image attached, 2 placeholders silently skipped
+    assert len(image_url_keys) == 1, f"Expected 1 image, got {len(image_url_keys)}"
+
+
+async def test_diagnostic_image_count_mismatch_more_images(mock_arize_tracer):
+    """Tests behavior when more images than placeholders — extra images ignored."""
+    mock_span = _setup_mock_span(mock_arize_tracer)
+    RolloutTraceConfig.init(project_name="p", experiment_name="e", backend="arize")
+
+    messages = [
+        {"role": "user", "content": [{"type": "image"}]},
+    ]
+    # 3 images for 1 placeholder
+    rollout_trace_attach_conversation(messages, [FakePILImage(), FakePILImage(), FakePILImage()])
+
+    attrs = _collect_attributes(mock_span)
+    image_url_keys = [k for k in attrs if k.endswith(".image.image.url")]
+
+    # Only 1 image attached (matching the placeholder)
+    assert len(image_url_keys) == 1, f"Expected 1 image, got {len(image_url_keys)}"
+
+
+async def test_diagnostic_base64_image_size():
+    """Measures actual base64 image size to verify it fits within OPENINFERENCE limits."""
+    from verl.utils.rollout_trace import _encode_image
+
+    class RealisticImage(FakePILImage):
+        """Writes a payload similar in size to a 512x512 JPEG (~30-80KB)."""
+
+        def save(self, fp, format=None):
+            # Simulate ~50KB JPEG
+            fp.write(b"\xff\xd8" + b"\x00" * 50_000 + b"\xff\xd9")
+
+    data_uri = _encode_image(RealisticImage(512, 512), image_format="jpeg")
+    assert data_uri is not None
+
+    # base64 of 50KB ≈ 66K chars + prefix
+    uri_len = len(data_uri)
+    prefix = "data:image/jpeg;base64,"
+    assert data_uri.startswith(prefix)
+
+    # Should be well under 200K (our env var limit)
+    assert uri_len < 200_000, f"Image URI is {uri_len} chars — exceeds 200K limit!"
+    # Should exceed old default 32K limit (this was the REDACTED bug)
+    assert uri_len > 32_000, f"Image URI is {uri_len} chars — under old 32K default"
+
+    print(f"\n  Base64 image URI length: {uri_len:,} chars (limit: 200,000)")
+
+
+async def test_diagnostic_openinference_mask_passes_our_attributes():
+    """Uses the REAL OpenInference TraceConfig.mask() to verify our keys aren't dropped.
+
+    This catches cases where mask() returns None for our attribute keys,
+    which would cause OpenInferenceSpan to silently drop them.
+    """
+    from openinference.instrumentation.config import TraceConfig
+
+    # Default config (all hide_* = False), with our custom image max length
+    config = TraceConfig(base64_image_max_length=200_000)
+
+    test_keys_and_values = [
+        ("openinference.span.kind", "AGENT"),
+        ("llm.input_messages.0.message.role", "system"),
+        ("llm.input_messages.0.message.content", "You are helpful."),
+        ("llm.input_messages.1.message.role", "user"),
+        ("llm.input_messages.1.message.contents.0.message_content.type", "text"),
+        ("llm.input_messages.1.message.contents.0.message_content.text", "Analyze this"),
+        ("llm.input_messages.1.message.contents.1.message_content.type", "image"),
+        (
+            "llm.input_messages.1.message.contents.1.message_content.image.image.url",
+            "data:image/jpeg;base64,/9j/AAAA",  # short fake base64
+        ),
+        ("llm.input_messages.2.message.role", "tool"),
+        ("llm.input_messages.2.message.contents.0.message_content.type", "text"),
+        ("llm.input_messages.2.message.contents.0.message_content.text", "Patch result"),
+    ]
+
+    dropped = []
+    for key, value in test_keys_and_values:
+        masked = config.mask(key, value)
+        if masked is None:
+            dropped.append(key)
+
+    assert not dropped, f"TraceConfig.mask() dropped these keys: {dropped}"
+
+
+async def test_diagnostic_openinference_mask_redacts_large_images():
+    """Verifies that the mask REDACTS images over the size limit."""
+    from openinference.instrumentation.config import TraceConfig
+
+    # With default 32K limit (simulating missing env var)
+    config_default = TraceConfig(base64_image_max_length=32_000)
+
+    # Simulate a 50KB image base64 (≈67K chars)
+    import base64
+
+    fake_data = b"\xff" * 50_000
+    b64 = base64.b64encode(fake_data).decode()
+    data_uri = f"data:image/jpeg;base64,{b64}"
+
+    key = "llm.input_messages.0.message.contents.0.message_content.image.image.url"
+    masked = config_default.mask(key, data_uri)
+    assert masked == "__REDACTED__", (
+        f"Expected REDACTED with 32K limit, got: {str(masked)[:60]}..."
+    )
+
+    # With our 200K limit — should pass through
+    config_custom = TraceConfig(base64_image_max_length=200_000)
+    masked = config_custom.mask(key, data_uri)
+    assert masked == data_uri, "Image should NOT be redacted with 200K limit"
+
+
+async def test_diagnostic_openinference_mask_with_env_var():
+    """Verifies that OPENINFERENCE_BASE64_IMAGE_MAX_LENGTH env var is read by TraceConfig."""
+    from openinference.instrumentation.config import TraceConfig
+
+    import base64
+
+    fake_data = b"\xff" * 50_000
+    b64 = base64.b64encode(fake_data).decode()
+    data_uri = f"data:image/jpeg;base64,{b64}"
+    key = "llm.input_messages.0.message.contents.0.message_content.image.image.url"
+
+    # Without env var — uses default 32K, should REDACT
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("OPENINFERENCE_BASE64_IMAGE_MAX_LENGTH", None)
+        config_no_env = TraceConfig()
+        assert config_no_env.base64_image_max_length == 32_000
+        assert config_no_env.mask(key, data_uri) == "__REDACTED__"
+
+    # With env var set to 200K — should pass
+    with patch.dict(os.environ, {"OPENINFERENCE_BASE64_IMAGE_MAX_LENGTH": "200000"}):
+        config_with_env = TraceConfig()
+        assert config_with_env.base64_image_max_length == 200_000
+        assert config_with_env.mask(key, data_uri) == data_uri

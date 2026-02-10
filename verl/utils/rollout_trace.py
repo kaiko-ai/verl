@@ -435,14 +435,17 @@ def rollout_trace_attach_conversation(
         if isinstance(content, str):
             span.set_attribute(f"{prefix}.content", content)
         elif isinstance(content, list):
+            text_parts = []
             content_idx = 0
             for item in content:
                 item_type = item.get("type") if isinstance(item, dict) else None
                 content_prefix = f"{prefix}.contents.{content_idx}.message_content"
 
                 if item_type == "text":
+                    text = item.get("text", "")
+                    text_parts.append(text)
                     span.set_attribute(f"{content_prefix}.type", "text")
-                    span.set_attribute(f"{content_prefix}.text", item.get("text", ""))
+                    span.set_attribute(f"{content_prefix}.text", text)
                     content_idx += 1
                 elif item_type == "image":
                     if image_idx < len(images):
@@ -452,3 +455,5 @@ def rollout_trace_attach_conversation(
                             span.set_attribute(f"{content_prefix}.image.image.url", data_uri)
                             content_idx += 1
                     image_idx += 1
+            if text_parts:
+                span.set_attribute(f"{prefix}.content", "\n".join(text_parts))
