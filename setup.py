@@ -58,7 +58,7 @@ SGLANG_REQUIRES = [
 TRL_REQUIRES = ["trl<=0.9.6"]
 MCORE_REQUIRES = ["mbridge"]
 TRANSFERQUEUE_REQUIRES = ["TransferQueue==0.1.4.dev1"]
-ARIZE_REQUIRES = ["arize-otel>=2.0.0", "opentelemetry-api>=1.26.0", "opentelemetry-sdk>=1.26.0"]
+ARIZE_REQUIRES = ["arize-otel>=2.0.0", "openinference-instrumentation", "opentelemetry-api>=1.26.0", "opentelemetry-sdk>=1.26.0"]
 
 extras_require = {
     "test": TEST_REQUIRES,
