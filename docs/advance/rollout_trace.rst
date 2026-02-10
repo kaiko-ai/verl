@@ -8,13 +8,13 @@ Applicable Scenarios
 
 Agentic RL involves multiple turns of conversations, tool invocations, and user interactions during the rollout process. During the Model Training process, it is necessary to track function calls, inputs, and outputs to understand the flow path of data within the application. The Trace feature helps, in complex multi-round conversations, to view the transformation of data during each interaction and the entire process leading to the final output by recording the inputs, outputs, and corresponding timestamps of functions, which is conducive to understanding the details of how the model processes data and optimizing the training results.
 
-The Trace feature integrates commonly used Agent trace tools, including wandb weave and mlflow, which are already supported. Users can choose the appropriate trace tool according to their own needs and preferences. Here, we introduce the usage of each tool.
+The Trace feature integrates commonly used Agent trace tools, including wandb weave, mlflow, and Arize, which are already supported. Users can choose the appropriate trace tool according to their own needs and preferences. Here, we introduce the usage of each tool.
 
 
 Trace Parameter Configuration
 -----------------------------
 
-- ``actor_rollout_ref.rollout.trace.backend=mlflow|weave`` # the trace backend type
+- ``actor_rollout_ref.rollout.trace.backend=mlflow|weave|arize`` # the trace backend type
 - ``actor_rollout_ref.rollout.trace.token2text=True`` # To show decoded text in trace view
 - ``actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=N`` # Limit traces per worker (optional)
 
@@ -144,3 +144,52 @@ Note:
 
 1. mlflow does not support comparing multiple traces
 2. rollout_trace can not associate the mlflow trace with the run, so the trace content cannot be seen in the mlflow run logs.
+
+Usage of Arize
+--------------
+
+1. Basic Configuration
+~~~~~~~~~~~~~~~~~~~~~~
+
+1. Set the following environment variables:
+
+   - ``ARIZE_SPACE_ID``: Your Arize space ID
+   - ``ARIZE_API_KEY``: Your Arize API key
+
+2. Configuration Parameters
+
+   1. ``actor_rollout_ref.rollout.trace.backend=arize``
+   2. ``trainer.project_name=$project_name``: Maps to the Arize project name
+   3. ``trainer.experiment_name=$experiment_name``
+   4. ``actor_rollout_ref.rollout.trace.token2text=True``: Optional, to show decoded text in trace view
+   5. ``actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=N``: Optional, to limit trace volume
+
+The Arize backend uses OpenTelemetry (OTel) for trace export. ``arize.otel.register()`` sets up the global OTel SDK with Arize's OTLP exporter. Each traced function creates an OTel span with inputs and outputs as attributes.
+
+2. View Trace Logs
+~~~~~~~~~~~~~~~~~~
+
+After executing the training, navigate to the Arize platform and select your project. Traces can be filtered by the following attributes set on each span:
+
+- ``step``: Training step number
+- ``sample_index``: Sample identifier
+- ``rollout_n``: Rollout number (for GRPO)
+- ``validate``: Whether this is a validation run
+- ``experiment_name``: Experiment name
+
+After enabling ``token2text``, prompt_text and response_text will be automatically added to the output attributes, making it convenient to view the content.
+
+3. Dependencies
+~~~~~~~~~~~~~~~
+
+Install the required packages:
+
+.. code-block:: bash
+
+   pip install arize-otel opentelemetry-api opentelemetry-sdk
+
+Or install with the optional extras:
+
+.. code-block:: bash
+
+   pip install verl[arize]

@@ -252,7 +252,7 @@ trace:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.TraceConfig
 
-  # trace backend, support mlflow, weave
+  # trace backend, support mlflow, weave, arize
   backend: null
 
   # whether translate token id to text in output

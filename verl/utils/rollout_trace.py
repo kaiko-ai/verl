@@ -30,7 +30,7 @@ class RolloutTraceConfig:
     tracing backends like Weave and MLflow.
 
     Args:
-        backend (Optional[str]): Tracing backend to use ('weave', 'mlflow', or None).
+        backend (Optional[str]): Tracing backend to use ('weave', 'mlflow', 'arize', or None).
         client (Optional[object]): Client instance for the selected backend.
         token2text (bool): Whether to convert tokens to text in traces. Defaults to False.
         project_name (str): Name of the project for tracing.
@@ -95,6 +95,16 @@ class RolloutTraceConfig:
             mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
             mlflow.set_experiment(project_name)
+        elif backend == "arize":
+            from arize.otel import register
+            from opentelemetry import trace
+
+            register(
+                space_id=os.environ["ARIZE_SPACE_ID"],
+                api_key=os.environ["ARIZE_API_KEY"],
+                project_name=project_name,
+            )
+            config.client = trace.get_tracer(f"verl.rollout.{project_name}")
         else:
             config.client = None
 
@@ -172,6 +182,13 @@ def rollout_trace_attr(
             for key, value in attributes.items():
                 mlflow.set_trace_tag(trace_id, str(key), str(value))
             yield
+    elif backend == "arize":
+        tracer = RolloutTraceConfig.get_client()
+        with tracer.start_as_current_span(
+            name=name,
+            attributes={str(k): str(v) for k, v in attributes.items()},
+        ):
+            yield
     else:
         yield
 
@@ -241,6 +258,28 @@ def rollout_trace_op(func):
 
             return result
 
+        elif backend == "arize":
+            from opentelemetry import trace as otel_trace
+
+            tracer = RolloutTraceConfig.get_client()
+            with tracer.start_as_current_span(
+                name=func.__qualname__,
+                attributes={"inputs": str(inputs)},
+            ) as span:
+                try:
+                    result = await func(self, *args, **kwargs)
+                    if enable_token2text:
+                        _result = await add_token2text(self, result)
+                        span.set_attribute("outputs", str(_result))
+                    else:
+                        span.set_attribute("outputs", str(result))
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
+                    return result
+                except Exception as e:
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
+                    span.record_exception(e)
+                    raise
+
         else:
             return await func(self, *args, **kwargs)
 
@@ -276,6 +315,23 @@ def rollout_trace_op(func):
             import mlflow
 
             return mlflow.trace(func)(self, *args, **kwargs)
+        elif backend == "arize":
+            from opentelemetry import trace as otel_trace
+
+            tracer = RolloutTraceConfig.get_client()
+            with tracer.start_as_current_span(
+                name=func.__qualname__,
+                attributes={"inputs": str(inputs)},
+            ) as span:
+                try:
+                    result = func(self, *args, **kwargs)
+                    span.set_attribute("outputs", str(result))
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
+                    return result
+                except Exception as e:
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
+                    span.record_exception(e)
+                    raise
         else:
             return func(self, *args, **kwargs)
 

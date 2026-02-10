@@ -243,4 +243,97 @@ async def test_rollout_trace_with_real_mlflow_backend():
     # with pytest.raises(ValueError, match="Test Exception"):
     #     await instance.my_method_with_exception()
 
-    print("\nWeave integration test ran successfully. Check your weave project for the trace.")
+    print("\nMlflow integration test ran successfully. Check your mlflow project for the trace.")
+
+
+@pytest.fixture
+def mock_arize_tracer():
+    """Mocks the arize.otel and opentelemetry modules, yielding (mock_tracer, mock_span)."""
+    mock_arize_otel = MagicMock()
+    mock_otel = MagicMock()
+    mock_tracer = MagicMock()
+    mock_span = MagicMock()
+    mock_span.__enter__ = MagicMock(return_value=mock_span)
+    mock_span.__exit__ = MagicMock(return_value=False)
+    mock_tracer.start_as_current_span.return_value = mock_span
+    mock_otel.trace.get_tracer.return_value = mock_tracer
+    mock_otel.trace.Status = MagicMock()
+    mock_otel.trace.StatusCode = MagicMock()
+    mock_otel.trace.StatusCode.OK = "OK"
+    mock_otel.trace.StatusCode.ERROR = "ERROR"
+
+    with patch.dict(
+        sys.modules,
+        {
+            "arize": MagicMock(),
+            "arize.otel": mock_arize_otel,
+            "opentelemetry": mock_otel,
+            "opentelemetry.trace": mock_otel.trace,
+        },
+    ):
+        with patch.dict(os.environ, {"ARIZE_SPACE_ID": "test-space", "ARIZE_API_KEY": "test-key"}):
+            yield mock_tracer, mock_span
+
+
+async def test_rollout_trace_with_arize_tracer(mock_arize_tracer):
+    """Tests that the Arize backend creates spans with inputs/outputs."""
+    mock_tracer, mock_span = mock_arize_tracer
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+    instance = TracedClass()
+
+    result = await instance.my_method("test_a", b="test_b")
+
+    assert result == "result: test_a, test_b"
+    mock_tracer.start_as_current_span.assert_called_once()
+    call_kwargs = mock_tracer.start_as_current_span.call_args.kwargs
+    assert call_kwargs["name"] == "TracedClass.my_method"
+    assert "inputs" in call_kwargs["attributes"]
+    mock_span.set_attribute.assert_any_call("outputs", str(result))
+
+
+async def test_rollout_trace_arize_with_exception(mock_arize_tracer):
+    """Tests that the Arize backend records exceptions on spans."""
+    mock_tracer, mock_span = mock_arize_tracer
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+    instance = TracedClass()
+
+    with pytest.raises(ValueError, match="Test Exception"):
+        await instance.my_method_with_exception()
+
+    mock_tracer.start_as_current_span.assert_called_once()
+    mock_span.record_exception.assert_called_once()
+    assert isinstance(mock_span.record_exception.call_args[0][0], ValueError)
+    mock_span.set_status.assert_called_once()
+
+
+async def test_trace_disabled_with_arize(mock_arize_tracer):
+    """Tests that trace=False disables Arize tracing."""
+    mock_tracer, mock_span = mock_arize_tracer
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+    instance = TracedClass()
+
+    with rollout_trace_attr(step=1, sample_index=0, rollout_n=0, trace=False):
+        result = await instance.my_method("test_a", b="test_b")
+        assert result == "result: test_a, test_b"
+
+    mock_tracer.start_as_current_span.assert_not_called()
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_ARIZE_INTEGRATION_TESTS", "false").lower() != "true",
+    reason="Skipping Arize integration test. Set RUN_ARIZE_INTEGRATION_TESTS=true to run.",
+)
+async def test_rollout_trace_with_real_arize_backend():
+    """Integration test with a real Arize backend."""
+
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+
+    instance = TracedClass()
+
+    with rollout_trace_attr(step=1, sample_index=2, rollout_n=3):
+        await instance.upper_method()
+
+    with pytest.raises(ValueError, match="Test Exception"):
+        await instance.my_method_with_exception()
+
+    print("\nArize integration test ran successfully. Check your Arize project for the trace.")
