@@ -350,28 +350,60 @@ def rollout_trace_op(func):
     return async_wrapper if inspect.iscoroutinefunction(func) else wrapper
 
 
-def rollout_trace_attach_images(
-    images: list | None,
+def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
+    """Encode a PIL image to a base64 data URI. Returns None if img is not a valid image."""
+    if not hasattr(img, "save"):
+        return None
+
+    import base64
+    import io
+
+    if max_dimension is not None:
+        w, h = img.size
+        if max(w, h) > max_dimension:
+            scale = max_dimension / max(w, h)
+            img = img.resize(
+                (int(w * scale), int(h * scale)),
+                resample=getattr(img, "Resampling", img).LANCZOS if hasattr(img, "Resampling") else 1,
+            )
+
+    buffer = io.BytesIO()
+    img.save(buffer, format=image_format.upper())
+    b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/{image_format.lower()};base64,{b64}"
+
+
+def rollout_trace_attach_conversation(
+    messages: list[dict] | None,
+    images: list | None = None,
     image_format: str = "png",
     max_dimension: int | None = None,
-    message_index: int = 0,
+    span_kind: str | None = None,
 ):
-    """Attach images to the current trace span for visualization in the tracing UI.
+    """Attach a conversation (messages + images) to the current trace span.
 
-    For the Arize backend, converts PIL images to base64 and sets them as
-    OpenInference-compliant span attributes. Should be called once at the end
-    of a traced function (within a @rollout_trace_op span), not per turn.
+    For the Arize backend, serializes the conversation as OpenInference
+    ``llm.input_messages`` attributes with roles, text, and inline images.
+    Image placeholders (``{"type": "image"}``) in message content are resolved
+    to base64-encoded images from the ``images`` list, consumed in order.
 
-    For the Weave backend, this is a no-op since Weave handles PIL images natively.
+    Should be called once at the end of a ``@rollout_trace_op``-decorated function.
+
+    For Weave/MLflow backends, this is a no-op.
 
     Args:
-        images: List of PIL Image objects to attach. If None or empty, no-op.
+        messages: Chat message dicts with ``role`` and ``content`` keys.
+            Content can be a string or a list of content items
+            (``{"type": "text", "text": "..."}`` or ``{"type": "image"}``).
+        images: Flat list of PIL Image objects, consumed in order as
+            ``{"type": "image"}`` placeholders are encountered.
         image_format: Image encoding format ('png' or 'jpeg'). Default 'png'.
         max_dimension: If set, resize images so the largest dimension is at most
-            this value (preserving aspect ratio). Useful for reducing payload size.
-        message_index: OpenInference message index for the attributes. Default 0.
+            this value (preserving aspect ratio).
+        span_kind: If set, override the ``openinference.span.kind`` attribute
+            on the current span (e.g. "AGENT").
     """
-    if not images:
+    if not messages:
         return
 
     backend = RolloutTraceConfig.get_backend()
@@ -381,33 +413,42 @@ def rollout_trace_attach_images(
     if not _trace_enabled.get():
         return
 
-    import base64
-    import io
-
     from opentelemetry import trace
 
     span = trace.get_current_span()
     if not span.is_recording():
         return
 
-    for i, img in enumerate(images):
-        if not hasattr(img, "save"):
-            continue
+    if span_kind:
+        span.set_attribute("openinference.span.kind", span_kind)
 
-        if max_dimension is not None:
-            w, h = img.size
-            if max(w, h) > max_dimension:
-                scale = max_dimension / max(w, h)
-                img = img.resize(
-                    (int(w * scale), int(h * scale)),
-                    resample=getattr(img, "Resampling", img).LANCZOS if hasattr(img, "Resampling") else 1,
-                )
+    image_idx = 0
+    images = images or []
 
-        buffer = io.BytesIO()
-        img.save(buffer, format=image_format.upper())
-        b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        data_uri = f"data:image/{image_format.lower()};base64,{b64}"
+    for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "unknown")
+        content = msg.get("content")
+        prefix = f"llm.input_messages.{msg_idx}.message"
 
-        prefix = f"llm.input_messages.{message_index}.message.contents.{i}"
-        span.set_attribute(f"{prefix}.message_content.type", "image")
-        span.set_attribute(f"{prefix}.message_content.image.image.url", data_uri)
+        span.set_attribute(f"{prefix}.role", role)
+
+        if isinstance(content, str):
+            span.set_attribute(f"{prefix}.content", content)
+        elif isinstance(content, list):
+            content_idx = 0
+            for item in content:
+                item_type = item.get("type") if isinstance(item, dict) else None
+                content_prefix = f"{prefix}.contents.{content_idx}.message_content"
+
+                if item_type == "text":
+                    span.set_attribute(f"{content_prefix}.type", "text")
+                    span.set_attribute(f"{content_prefix}.text", item.get("text", ""))
+                    content_idx += 1
+                elif item_type == "image":
+                    if image_idx < len(images):
+                        data_uri = _encode_image(images[image_idx], image_format, max_dimension)
+                        if data_uri:
+                            span.set_attribute(f"{content_prefix}.type", "image")
+                            span.set_attribute(f"{content_prefix}.image.image.url", data_uri)
+                            content_idx += 1
+                    image_idx += 1
