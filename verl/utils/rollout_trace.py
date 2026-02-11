@@ -16,10 +16,12 @@ import asyncio
 import contextlib
 import functools
 import inspect
+import logging
 import os
 from contextvars import ContextVar
 from typing import Optional
 
+_log = logging.getLogger(__name__)
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
 
 
@@ -146,12 +148,22 @@ def rollout_trace_attr(
     should_skip = backend is not None and not trace
 
     if should_skip:
+        _log.warning(
+            "[rollout_trace_attr] SKIP trace: sample_index=%s, step=%s, rollout_n=%s",
+            sample_index, step, rollout_n,
+        )
         token = _trace_enabled.set(False)
         try:
             yield
         finally:
             _trace_enabled.reset(token)
         return
+
+    if backend is not None:
+        _log.warning(
+            "[rollout_trace_attr] TRACE: sample_index=%s, step=%s, rollout_n=%s, backend=%s",
+            sample_index, step, rollout_n, backend,
+        )
 
     # Build attributes for the trace
     attributes = {}
@@ -199,12 +211,15 @@ def rollout_trace_op(func):
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
         if not _trace_enabled.get():
+            _log.warning("[rollout_trace_op] %s SKIPPED (_trace_enabled=False)", func.__qualname__)
             return await func(self, *args, **kwargs)
 
         backend = RolloutTraceConfig.get_backend()
         enable_token2text = RolloutTraceConfig.enable_token2text()
         if backend is None:
             return await func(self, *args, **kwargs)
+
+        _log.warning("[rollout_trace_op] %s CREATING SPAN (backend=%s)", func.__qualname__, backend)
 
         sig = inspect.signature(func)
         bound_args = sig.bind(self, *args, **kwargs)

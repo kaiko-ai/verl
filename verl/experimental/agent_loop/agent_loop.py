@@ -365,6 +365,17 @@ class AgentLoopWorkerBase:
         else:
             traced_indices = set(range(len(batch)))
 
+        logger.warning(
+            "[trace_sampling] backend=%s, max_samples_per_worker=%s, "
+            "batch_size=%d, unique_samples=%d, traced_indices=%d/%d",
+            RolloutTraceConfig.get_backend(),
+            max_samples_per_worker,
+            len(batch),
+            len(np.unique(index)),
+            len(traced_indices),
+            len(batch),
+        )
+
         trajectory_info = await get_trajectory_info(
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
