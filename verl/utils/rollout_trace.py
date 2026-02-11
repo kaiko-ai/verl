@@ -403,7 +403,12 @@ def rollout_trace_attach_conversation(
         span_kind: If set, override the ``openinference.span.kind`` attribute
             on the current span (e.g. "AGENT").
     """
+    import logging
+
+    _log = logging.getLogger(__name__)
+
     if not messages:
+        _log.warning("[attach_conversation] no messages, returning")
         return
 
     backend = RolloutTraceConfig.get_backend()
@@ -411,19 +416,35 @@ def rollout_trace_attach_conversation(
         return
 
     if not _trace_enabled.get():
+        _log.warning("[attach_conversation] trace disabled, skipping")
         return
 
     from opentelemetry import trace
 
     span = trace.get_current_span()
     if not span.is_recording():
+        _log.warning(
+            "[attach_conversation] span not recording: type=%s repr=%r",
+            type(span).__name__,
+            span,
+        )
         return
+
+    _log.warning(
+        "[attach_conversation] START: %d messages, %d images, span_type=%s, is_recording=%s",
+        len(messages),
+        len(images) if images else 0,
+        type(span).__name__,
+        span.is_recording(),
+    )
 
     if span_kind:
         span.set_attribute("openinference.span.kind", span_kind)
 
     image_idx = 0
     images = images or []
+    attr_count = 0
+    images_attached = 0
 
     for msg_idx, msg in enumerate(messages):
         role = msg.get("role", "unknown")
@@ -431,9 +452,11 @@ def rollout_trace_attach_conversation(
         prefix = f"llm.input_messages.{msg_idx}.message"
 
         span.set_attribute(f"{prefix}.role", role)
+        attr_count += 1
 
         if isinstance(content, str):
             span.set_attribute(f"{prefix}.content", content)
+            attr_count += 1
         elif isinstance(content, list):
             text_parts = []
             content_idx = 0
@@ -447,6 +470,7 @@ def rollout_trace_attach_conversation(
                     span.set_attribute(f"{content_prefix}.type", "text")
                     span.set_attribute(f"{content_prefix}.text", text)
                     content_idx += 1
+                    attr_count += 2
                 elif item_type == "image":
                     if image_idx < len(images):
                         data_uri = _encode_image(images[image_idx], image_format, max_dimension)
@@ -454,6 +478,33 @@ def rollout_trace_attach_conversation(
                             span.set_attribute(f"{content_prefix}.type", "image")
                             span.set_attribute(f"{content_prefix}.image.image.url", data_uri)
                             content_idx += 1
+                            attr_count += 2
+                            images_attached += 1
+                        else:
+                            _log.warning(
+                                "[attach_conversation] _encode_image returned None for image %d",
+                                image_idx,
+                            )
                     image_idx += 1
             if text_parts:
                 span.set_attribute(f"{prefix}.content", "\n".join(text_parts))
+                attr_count += 1
+        elif content is None:
+            _log.warning("[attach_conversation] msg[%d] role=%s has content=None", msg_idx, role)
+        else:
+            _log.warning(
+                "[attach_conversation] msg[%d] role=%s has unexpected content type: %s",
+                msg_idx,
+                role,
+                type(content).__name__,
+            )
+
+    _log.warning(
+        "[attach_conversation] DONE: set %d attributes, attached %d/%d images, "
+        "consumed %d/%d image placeholders",
+        attr_count,
+        images_attached,
+        len(images),
+        image_idx,
+        len(images),
+    )
