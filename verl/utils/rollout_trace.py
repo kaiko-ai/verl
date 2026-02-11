@@ -462,37 +462,45 @@ def rollout_trace_attach_conversation(
             span.set_attribute(f"{prefix}.content", content)
             attr_count += 1
         elif isinstance(content, list):
-            text_parts = []
-            content_idx = 0
-            for item in content:
-                item_type = item.get("type") if hasattr(item, "get") else None
-                content_prefix = f"{prefix}.contents.{content_idx}.message_content"
+            has_images = any(
+                hasattr(item, "get") and item.get("type") == "image" for item in content
+            )
+            if not has_images:
+                # Text-only list: set as plain string to avoid duplication
+                text = "\n".join(
+                    item.get("text", "") for item in content if hasattr(item, "get") and item.get("type") == "text"
+                )
+                if text:
+                    span.set_attribute(f"{prefix}.content", text)
+                    attr_count += 1
+            else:
+                # Mixed content (text + images): use structured format only
+                content_idx = 0
+                for item in content:
+                    item_type = item.get("type") if hasattr(item, "get") else None
+                    content_prefix = f"{prefix}.contents.{content_idx}.message_content"
 
-                if item_type == "text":
-                    text = item.get("text", "")
-                    text_parts.append(text)
-                    span.set_attribute(f"{content_prefix}.type", "text")
-                    span.set_attribute(f"{content_prefix}.text", text)
-                    content_idx += 1
-                    attr_count += 2
-                elif item_type == "image":
-                    if image_idx < len(images):
-                        data_uri = _encode_image(images[image_idx], image_format, max_dimension)
-                        if data_uri:
-                            span.set_attribute(f"{content_prefix}.type", "image")
-                            span.set_attribute(f"{content_prefix}.image.image.url", data_uri)
-                            content_idx += 1
-                            attr_count += 2
-                            images_attached += 1
-                        else:
-                            _log.warning(
-                                "[attach_conversation] _encode_image returned None for image %d",
-                                image_idx,
-                            )
-                    image_idx += 1
-            if text_parts:
-                span.set_attribute(f"{prefix}.content", "\n".join(text_parts))
-                attr_count += 1
+                    if item_type == "text":
+                        text = item.get("text", "")
+                        span.set_attribute(f"{content_prefix}.type", "text")
+                        span.set_attribute(f"{content_prefix}.text", text)
+                        content_idx += 1
+                        attr_count += 2
+                    elif item_type == "image":
+                        if image_idx < len(images):
+                            data_uri = _encode_image(images[image_idx], image_format, max_dimension)
+                            if data_uri:
+                                span.set_attribute(f"{content_prefix}.type", "image")
+                                span.set_attribute(f"{content_prefix}.image.image.url", data_uri)
+                                content_idx += 1
+                                attr_count += 2
+                                images_attached += 1
+                            else:
+                                _log.warning(
+                                    "[attach_conversation] _encode_image returned None for image %d",
+                                    image_idx,
+                                )
+                        image_idx += 1
         elif content is None:
             _log.warning("[attach_conversation] msg[%d] role=%s has content=None", msg_idx, role)
         else:
