@@ -451,6 +451,10 @@ def rollout_trace_attach_conversation(
         content = msg.get("content")
         prefix = f"llm.input_messages.{msg_idx}.message"
 
+        # Normalize OmegaConf ListConfig to native Python list
+        if not isinstance(content, (str, list, type(None))) and hasattr(content, "__iter__"):
+            content = list(content)
+
         span.set_attribute(f"{prefix}.role", role)
         attr_count += 1
 
@@ -461,7 +465,7 @@ def rollout_trace_attach_conversation(
             text_parts = []
             content_idx = 0
             for item in content:
-                item_type = item.get("type") if isinstance(item, dict) else None
+                item_type = item.get("type") if hasattr(item, "get") else None
                 content_prefix = f"{prefix}.contents.{content_idx}.message_content"
 
                 if item_type == "text":
