@@ -41,6 +41,8 @@ class RolloutTraceConfig:
             per worker per step. If None, all samples are traced. If set, each worker will randomly
             select up to this many unique samples to trace (including all their rollouts for GRPO).
             Total traces = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample.
+        trace_step_interval (int): Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
+            Defaults to 1 (trace every step).
     """
 
     _instance: Optional["RolloutTraceConfig"] = None
@@ -51,6 +53,7 @@ class RolloutTraceConfig:
     project_name: str = None
     experiment_name: str = None
     max_samples_per_step_per_worker: Optional[int] = None
+    trace_step_interval: int = 1
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -72,6 +75,7 @@ class RolloutTraceConfig:
         backend: str,
         token2text: bool = False,
         max_samples_per_step_per_worker: Optional[int] = None,
+        trace_step_interval: int = 1,
     ):
         config = cls.get_instance()
         if config._initialized:
@@ -82,6 +86,7 @@ class RolloutTraceConfig:
         config.project_name = project_name
         config.experiment_name = experiment_name
         config.max_samples_per_step_per_worker = max_samples_per_step_per_worker
+        config.trace_step_interval = max(1, trace_step_interval)
 
         if backend == "weave":
             import weave

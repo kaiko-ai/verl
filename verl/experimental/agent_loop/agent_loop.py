@@ -302,6 +302,7 @@ class AgentLoopWorkerBase:
             trace_config.get("backend"),
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
+            trace_config.get("trace_step_interval", 1),
         )
 
     @tqbridge()
@@ -350,10 +351,15 @@ class AgentLoopWorkerBase:
             index = np.arange(len(batch))
 
         max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+        trace_step_interval = RolloutTraceConfig.get_instance().trace_step_interval
+        global_steps = batch.meta_info.get("global_steps", 0)
+        trace_this_step = (global_steps % trace_step_interval) == 0
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
         # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        if max_samples_per_worker is not None:
+        if not trace_this_step:
+            traced_indices = set()
+        elif max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
             if max_samples_per_worker < len(unique_sample_indices):
                 selected_samples = set(
@@ -366,10 +372,13 @@ class AgentLoopWorkerBase:
             traced_indices = set(range(len(batch)))
 
         logger.warning(
-            "[trace_sampling] backend=%s, max_samples_per_worker=%s, "
-            "batch_size=%d, unique_samples=%d, traced_indices=%d/%d",
+            "[trace_sampling] backend=%s, max_samples_per_worker=%s, step_interval=%s, "
+            "step=%s, trace_this_step=%s, batch_size=%d, unique_samples=%d, traced_indices=%d/%d",
             RolloutTraceConfig.get_backend(),
             max_samples_per_worker,
+            trace_step_interval,
+            global_steps,
+            trace_this_step,
             len(batch),
             len(np.unique(index)),
             len(traced_indices),
