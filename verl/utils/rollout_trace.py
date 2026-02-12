@@ -23,6 +23,7 @@ from typing import Optional
 
 _log = logging.getLogger(__name__)
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
+_root_trace_span: ContextVar = ContextVar("_root_trace_span", default=None)
 
 
 class RolloutTraceConfig:
@@ -206,8 +207,12 @@ def rollout_trace_attr(
         with tracer.start_as_current_span(
             name=name,
             attributes=span_attributes,
-        ):
-            yield
+        ) as span:
+            token = _root_trace_span.set(span)
+            try:
+                yield
+            finally:
+                _root_trace_span.reset(token)
     else:
         yield
 
@@ -283,12 +288,16 @@ def rollout_trace_op(func):
         elif backend == "arize":
             from opentelemetry import trace as otel_trace
 
+            # Flatten **kwargs into top-level so _set_arize_root_span_metadata sees them
+            flat_inputs = {k: v for k, v in inputs.items() if k != "kwargs"}
+            if isinstance(inputs.get("kwargs"), dict):
+                flat_inputs.update(inputs["kwargs"])
+            _set_arize_root_span_metadata(flat_inputs)
+
             tracer = RolloutTraceConfig.get_client()
-            span_attrs = {"openinference.span.kind": "CHAIN"}
-            span_attrs.update(_extract_arize_metadata(inputs))
             with tracer.start_as_current_span(
                 name=func.__qualname__,
-                attributes=span_attrs,
+                attributes={"openinference.span.kind": "CHAIN"},
             ) as span:
                 try:
                     result = await func(self, *args, **kwargs)
@@ -342,12 +351,15 @@ def rollout_trace_op(func):
         elif backend == "arize":
             from opentelemetry import trace as otel_trace
 
+            flat_inputs = {k: v for k, v in inputs.items() if k != "kwargs"}
+            if isinstance(inputs.get("kwargs"), dict):
+                flat_inputs.update(inputs["kwargs"])
+            _set_arize_root_span_metadata(flat_inputs)
+
             tracer = RolloutTraceConfig.get_client()
-            span_attrs = {"openinference.span.kind": "CHAIN"}
-            span_attrs.update(_extract_arize_metadata(inputs))
             with tracer.start_as_current_span(
                 name=func.__qualname__,
-                attributes=span_attrs,
+                attributes={"openinference.span.kind": "CHAIN"},
             ) as span:
                 try:
                     result = func(self, *args, **kwargs)
@@ -363,25 +375,28 @@ def rollout_trace_op(func):
     return async_wrapper if inspect.iscoroutinefunction(func) else wrapper
 
 
-def _extract_arize_metadata(inputs: dict) -> dict[str, str]:
-    """Extract scalar fields from inputs as individual span attributes for Arize searchability.
+def _set_arize_root_span_metadata(inputs: dict) -> None:
+    """Extract scalar fields from function inputs and set them on the root trace span.
 
-    Flattens top-level scalars and one level of 'extra_info' dict into
-    ``metadata.<key>`` attributes. Skips complex types (lists, dicts) and
-    the ``messages`` key (handled separately by ``rollout_trace_attach_conversation``).
+    For the Arize backend, writes flat top-level attributes on the ``rollout_trace_attr``
+    span so they appear alongside ``step``, ``sample_index``, etc. and are searchable.
+    Flattens one level of ``extra_info``. Skips complex types and keys already handled
+    elsewhere (``messages``, ``multi_modal_inputs``, ``sampling_params``).
     """
-    metadata = {}
-    skip_keys = {"messages", "multi_modal_inputs"}
+    root_span = _root_trace_span.get()
+    if root_span is None or not root_span.is_recording():
+        return
+
+    skip_keys = {"messages", "multi_modal_inputs", "sampling_params"}
     for key, value in inputs.items():
         if key in skip_keys:
             continue
         if isinstance(value, (str, int, float, bool)):
-            metadata[f"metadata.{key}"] = str(value)
+            root_span.set_attribute(key, str(value))
         elif isinstance(value, dict) and key == "extra_info":
             for sub_key, sub_value in value.items():
                 if isinstance(sub_value, (str, int, float, bool)):
-                    metadata[f"metadata.extra_info.{sub_key}"] = str(sub_value)
-    return metadata
+                    root_span.set_attribute(f"extra_info.{sub_key}", str(sub_value))
 
 
 def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
