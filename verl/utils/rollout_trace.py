@@ -16,12 +16,10 @@ import asyncio
 import contextlib
 import functools
 import inspect
-import logging
 import os
 from contextvars import ContextVar
 from typing import Optional
 
-_log = logging.getLogger(__name__)
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
 _root_trace_span: ContextVar = ContextVar("_root_trace_span", default=None)
 
@@ -154,22 +152,12 @@ def rollout_trace_attr(
     should_skip = backend is not None and not trace
 
     if should_skip:
-        _log.warning(
-            "[rollout_trace_attr] SKIP trace: sample_index=%s, step=%s, rollout_n=%s",
-            sample_index, step, rollout_n,
-        )
         token = _trace_enabled.set(False)
         try:
             yield
         finally:
             _trace_enabled.reset(token)
         return
-
-    if backend is not None:
-        _log.warning(
-            "[rollout_trace_attr] TRACE: sample_index=%s, step=%s, rollout_n=%s, backend=%s",
-            sample_index, step, rollout_n, backend,
-        )
 
     # Build attributes for the trace
     attributes = {}
@@ -221,15 +209,12 @@ def rollout_trace_op(func):
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
         if not _trace_enabled.get():
-            _log.warning("[rollout_trace_op] %s SKIPPED (_trace_enabled=False)", func.__qualname__)
             return await func(self, *args, **kwargs)
 
         backend = RolloutTraceConfig.get_backend()
         enable_token2text = RolloutTraceConfig.enable_token2text()
         if backend is None:
             return await func(self, *args, **kwargs)
-
-        _log.warning("[rollout_trace_op] %s CREATING SPAN (backend=%s)", func.__qualname__, backend)
 
         sig = inspect.signature(func)
         bound_args = sig.bind(self, *args, **kwargs)
@@ -474,12 +459,7 @@ def rollout_trace_attach_conversation(
         span_kind: If set, override the ``openinference.span.kind`` attribute
             on the current span (e.g. "AGENT").
     """
-    import logging
-
-    _log = logging.getLogger(__name__)
-
     if not messages:
-        _log.warning("[attach_conversation] no messages, returning")
         return
 
     backend = RolloutTraceConfig.get_backend()
@@ -487,35 +467,19 @@ def rollout_trace_attach_conversation(
         return
 
     if not _trace_enabled.get():
-        _log.warning("[attach_conversation] trace disabled, skipping")
         return
 
     from opentelemetry import trace
 
     span = trace.get_current_span()
     if not span.is_recording():
-        _log.warning(
-            "[attach_conversation] span not recording: type=%s repr=%r",
-            type(span).__name__,
-            span,
-        )
         return
-
-    _log.warning(
-        "[attach_conversation] START: %d messages, %d images, span_type=%s, is_recording=%s",
-        len(messages),
-        len(images) if images else 0,
-        type(span).__name__,
-        span.is_recording(),
-    )
 
     if span_kind:
         span.set_attribute("openinference.span.kind", span_kind)
 
     image_idx = 0
     images = images or []
-    attr_count = 0
-    images_attached = 0
 
     for msg_idx, msg in enumerate(messages):
         role = msg.get("role", "unknown")
@@ -527,11 +491,9 @@ def rollout_trace_attach_conversation(
             content = list(content)
 
         span.set_attribute(f"{prefix}.role", role)
-        attr_count += 1
 
         if isinstance(content, str):
             span.set_attribute(f"{prefix}.content", content)
-            attr_count += 1
         elif isinstance(content, list):
             has_images = any(
                 hasattr(item, "get") and item.get("type") == "image" for item in content
@@ -543,7 +505,6 @@ def rollout_trace_attach_conversation(
                 )
                 if text:
                     span.set_attribute(f"{prefix}.content", text)
-                    attr_count += 1
             else:
                 # Mixed content (text + images): use structured format only
                 content_idx = 0
@@ -556,7 +517,6 @@ def rollout_trace_attach_conversation(
                         span.set_attribute(f"{content_prefix}.type", "text")
                         span.set_attribute(f"{content_prefix}.text", text)
                         content_idx += 1
-                        attr_count += 2
                     elif item_type == "image":
                         if image_idx < len(images):
                             data_uri = _encode_image(images[image_idx], image_format, max_dimension)
@@ -564,30 +524,4 @@ def rollout_trace_attach_conversation(
                                 span.set_attribute(f"{content_prefix}.type", "image")
                                 span.set_attribute(f"{content_prefix}.image.image.url", data_uri)
                                 content_idx += 1
-                                attr_count += 2
-                                images_attached += 1
-                            else:
-                                _log.warning(
-                                    "[attach_conversation] _encode_image returned None for image %d",
-                                    image_idx,
-                                )
                         image_idx += 1
-        elif content is None:
-            _log.warning("[attach_conversation] msg[%d] role=%s has content=None", msg_idx, role)
-        else:
-            _log.warning(
-                "[attach_conversation] msg[%d] role=%s has unexpected content type: %s",
-                msg_idx,
-                role,
-                type(content).__name__,
-            )
-
-    _log.warning(
-        "[attach_conversation] DONE: set %d attributes, attached %d/%d images, "
-        "consumed %d/%d image placeholders",
-        attr_count,
-        images_attached,
-        len(images),
-        image_idx,
-        len(images),
-    )
