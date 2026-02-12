@@ -276,7 +276,7 @@ def mock_arize_tracer():
 
 
 async def test_rollout_trace_with_arize_tracer(mock_arize_tracer):
-    """Tests that the Arize backend creates spans with inputs/outputs."""
+    """Tests that the Arize backend creates spans without input/output dumps."""
     mock_tracer, mock_span = mock_arize_tracer
     RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
     instance = TracedClass()
@@ -287,8 +287,11 @@ async def test_rollout_trace_with_arize_tracer(mock_arize_tracer):
     mock_tracer.start_as_current_span.assert_called_once()
     call_kwargs = mock_tracer.start_as_current_span.call_args.kwargs
     assert call_kwargs["name"] == "TracedClass.my_method"
-    assert "input.value" in call_kwargs["attributes"]
-    mock_span.set_attribute.assert_any_call("output.value", str(result))
+    # Child span should only have span kind, not input/output dumps
+    assert call_kwargs["attributes"] == {"openinference.span.kind": "CHAIN"}
+    # No output.value with raw token dump
+    output_calls = [c for c in mock_span.set_attribute.call_args_list if c[0][0] == "output.value"]
+    assert len(output_calls) == 0
 
 
 async def test_rollout_trace_arize_with_exception(mock_arize_tracer):
@@ -391,9 +394,9 @@ async def test_attach_conversation_structured_messages(mock_arize_tracer):
     assert calls["llm.input_messages.0.message.role"] == "system"
     assert calls["llm.input_messages.0.message.content"] == "You are helpful."
 
-    # Message 1: user with text + image
+    # Message 1: user with text + image (mixed → structured only, no message.content)
     assert calls["llm.input_messages.1.message.role"] == "user"
-    assert calls["llm.input_messages.1.message.content"] == "Analyze"
+    assert "llm.input_messages.1.message.content" not in calls
     assert calls["llm.input_messages.1.message.contents.0.message_content.type"] == "text"
     assert calls["llm.input_messages.1.message.contents.0.message_content.text"] == "Analyze"
     assert calls["llm.input_messages.1.message.contents.1.message_content.type"] == "image"
@@ -405,9 +408,9 @@ async def test_attach_conversation_structured_messages(mock_arize_tracer):
     assert calls["llm.input_messages.2.message.role"] == "assistant"
     assert calls["llm.input_messages.2.message.content"] == "I see tissue."
 
-    # Message 3: tool with text + image
+    # Message 3: tool with text + image (mixed → structured only, no message.content)
     assert calls["llm.input_messages.3.message.role"] == "tool"
-    assert calls["llm.input_messages.3.message.content"] == "Patch result"
+    assert "llm.input_messages.3.message.content" not in calls
     assert calls["llm.input_messages.3.message.contents.0.message_content.type"] == "text"
     assert calls["llm.input_messages.3.message.contents.1.message_content.type"] == "image"
 
@@ -551,11 +554,9 @@ async def test_diagnostic_realistic_kaiko_conversation(mock_arize_tracer):
         "You are a slide-level analysis agent. Use tools to examine regions."
     )
 
-    # --- Message 1: user with text + 1 image ---
+    # --- Message 1: user with text + 1 image (mixed → structured only) ---
     assert attrs["llm.input_messages.1.message.role"] == "user"
-    assert attrs["llm.input_messages.1.message.content"] == (
-        "Analyze this slide for abnormal tissue."
-    )
+    assert "llm.input_messages.1.message.content" not in attrs
     assert attrs["llm.input_messages.1.message.contents.0.message_content.type"] == "text"
     assert attrs["llm.input_messages.1.message.contents.0.message_content.text"] == (
         "Analyze this slide for abnormal tissue."
@@ -570,24 +571,21 @@ async def test_diagnostic_realistic_kaiko_conversation(mock_arize_tracer):
         "I'll examine the tissue. Let me use extract_patch."
     )
 
-    # --- Message 3: tool with text + 1 image ---
+    # --- Message 3: tool with text + 1 image (mixed → structured only) ---
     assert attrs["llm.input_messages.3.message.role"] == "tool"
+    assert "llm.input_messages.3.message.content" not in attrs
     assert attrs["llm.input_messages.3.message.contents.0.message_content.type"] == "text"
     assert attrs["llm.input_messages.3.message.contents.0.message_content.text"] == (
         "Extracted patch at (100, 200), size 512x512"
     )
     assert attrs["llm.input_messages.3.message.contents.1.message_content.type"] == "image"
-    # message.content also set for Arize text display
-    assert attrs["llm.input_messages.3.message.content"] == (
-        "Extracted patch at (100, 200), size 512x512"
-    )
 
-    # --- Message 4: tool with text + 2 images ---
+    # --- Message 4: tool with text + 2 images (mixed → structured only) ---
     assert attrs["llm.input_messages.4.message.role"] == "tool"
+    assert "llm.input_messages.4.message.content" not in attrs
     assert attrs["llm.input_messages.4.message.contents.0.message_content.type"] == "text"
     assert attrs["llm.input_messages.4.message.contents.1.message_content.type"] == "image"
     assert attrs["llm.input_messages.4.message.contents.2.message_content.type"] == "image"
-    assert attrs["llm.input_messages.4.message.content"] == "Segmentation results for region A"
 
     # --- Message 5: tool (plain string, no images) ---
     assert attrs["llm.input_messages.5.message.role"] == "tool"
@@ -595,9 +593,9 @@ async def test_diagnostic_realistic_kaiko_conversation(mock_arize_tracer):
         "Invalid tool call: missing argument 'x'"
     )
 
-    # --- Message 6: user text-only list content ---
+    # --- Message 6: user text-only list content (text-only → message.content only) ---
     assert attrs["llm.input_messages.6.message.role"] == "user"
-    assert attrs["llm.input_messages.6.message.contents.0.message_content.type"] == "text"
+    assert "llm.input_messages.6.message.contents.0.message_content.type" not in attrs
     assert attrs["llm.input_messages.6.message.content"] == (
         "This is the last turn, please make the final analysis."
     )
@@ -607,12 +605,11 @@ async def test_diagnostic_realistic_kaiko_conversation(mock_arize_tracer):
     assert len(image_url_keys) == 4, f"Expected 4 image URLs, got {len(image_url_keys)}: {image_url_keys}"
 
 
-async def test_diagnostic_list_content_also_sets_message_content(mock_arize_tracer):
-    """Verifies that list content sets BOTH message.content AND message.contents.*.
+async def test_diagnostic_list_content_mixed_uses_structured_only(mock_arize_tracer):
+    """Verifies that mixed list content (text+images) uses structured format only.
 
-    Arize reads message.content for text display. Without it, structured messages
-    show empty text. We now set message.content as concatenated text from all
-    text items alongside the structured message.contents attributes.
+    To avoid double-rendering in Arize, mixed content only sets message.contents.*
+    (not message.content). Text-only lists set message.content only.
     """
     mock_span = _setup_mock_span(mock_arize_tracer)
     RolloutTraceConfig.init(project_name="p", experiment_name="e", backend="arize")
@@ -631,16 +628,14 @@ async def test_diagnostic_list_content_also_sets_message_content(mock_arize_trac
     # Role is set
     assert attrs["llm.input_messages.0.message.role"] == "tool"
 
-    # Structured content is set
+    # Structured content is set (mixed → structured only)
     assert attrs["llm.input_messages.0.message.contents.0.message_content.type"] == "text"
     assert attrs["llm.input_messages.0.message.contents.0.message_content.text"] == "Patch at (100, 200)"
     assert attrs["llm.input_messages.0.message.contents.1.message_content.type"] == "image"
     assert attrs["llm.input_messages.0.message.contents.2.message_content.type"] == "text"
 
-    # FIX: message.content IS set — concatenated text for Arize display
-    assert attrs["llm.input_messages.0.message.content"] == (
-        "Patch at (100, 200)\nRegion analysis complete"
-    )
+    # message.content is NOT set for mixed content (avoids double-rendering)
+    assert "llm.input_messages.0.message.content" not in attrs
 
 
 async def test_diagnostic_image_count_mismatch_fewer_images(mock_arize_tracer):
@@ -792,3 +787,564 @@ async def test_diagnostic_openinference_mask_with_env_var():
         config_with_env = TraceConfig()
         assert config_with_env.base64_image_max_length == 200_000
         assert config_with_env.mask(key, data_uri) == data_uri
+
+
+# ============================================================================
+# Real pipeline tests — uses actual OTel SDK spans, not mocks
+# ============================================================================
+
+@pytest.fixture
+def real_otel_pipeline():
+    """Creates a real OpenInference tracing pipeline with in-memory span export.
+
+    Yields (tracer, get_exported_spans) where:
+    - tracer: a real OITracer that creates real OpenInferenceSpans
+    - get_exported_spans: callable returning list of exported ReadableSpans
+
+    Also sets RolloutTraceConfig.backend = "arize" so rollout_trace_attach_conversation works.
+    """
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+    from openinference.instrumentation.config import TraceConfig
+
+    exporter = InMemorySpanExporter()
+
+    config = TraceConfig(base64_image_max_length=200_000)
+    provider = OITracerProvider(config=config)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    tracer = provider.get_tracer("test-tracer")
+
+    # Set backend so rollout_trace_attach_conversation doesn't bail out
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc._initialized = True
+
+    def get_exported_spans():
+        provider.force_flush()
+        return exporter.get_finished_spans()
+
+    yield tracer, get_exported_spans
+
+    provider.shutdown()
+
+
+def test_real_pipeline_attributes_land_on_span(real_otel_pipeline):
+    """Uses REAL OTel SDK + OpenInference pipeline to verify attributes are exported.
+
+    This catches issues that mock tests miss:
+    - OTel rejecting attribute value types
+    - OpenInferenceSpan masking dropping keys
+    - trace.get_current_span() returning wrong span type
+    - SpanLimits truncating attributes
+    """
+    from opentelemetry import trace
+
+    tracer, get_spans = real_otel_pipeline
+
+    messages = _build_realistic_kaiko_messages()
+    images = [FakePILImage(512, 512) for _ in range(4)]
+
+    # Simulate what rollout_trace_op does for arize backend
+    with tracer.start_as_current_span(
+        name="KaikoToolAgent.run",
+        attributes={
+            "openinference.span.kind": "CHAIN",
+            "input.value": "test inputs",
+            "input.mime_type": "text/plain",
+        },
+    ) as span:
+        # This is what our code does inside the traced function
+        current = trace.get_current_span()
+
+        # Verify we get the right span type
+        assert current is not None
+        assert hasattr(current, 'set_attribute'), "get_current_span() returned invalid span"
+
+        rollout_trace_attach_conversation(
+            messages, images,
+            image_format="jpeg", max_dimension=512, span_kind="AGENT",
+        )
+
+    exported = get_spans()
+    assert len(exported) == 1, f"Expected 1 span, got {len(exported)}"
+
+    attrs = dict(exported[0].attributes)
+
+    # --- Verify span kind was overridden ---
+    assert attrs.get("openinference.span.kind") == "AGENT", (
+        f"span.kind = {attrs.get('openinference.span.kind')!r}, expected 'AGENT'"
+    )
+
+    # --- Message 0: system (string content) ---
+    assert attrs.get("llm.input_messages.0.message.role") == "system", (
+        f"Missing or wrong role for msg 0: {attrs.get('llm.input_messages.0.message.role')!r}"
+    )
+    assert "llm.input_messages.0.message.content" in attrs, (
+        "message.content missing for system message (string content)"
+    )
+
+    # --- Message 1: user with list content [text, image] (mixed → structured only) ---
+    assert attrs.get("llm.input_messages.1.message.role") == "user"
+    assert "llm.input_messages.1.message.content" not in attrs
+    # Structured contents
+    assert attrs.get("llm.input_messages.1.message.contents.0.message_content.type") == "text"
+    assert "llm.input_messages.1.message.contents.0.message_content.text" in attrs
+    assert attrs.get("llm.input_messages.1.message.contents.1.message_content.type") == "image"
+    img_key = "llm.input_messages.1.message.contents.1.message_content.image.image.url"
+    assert img_key in attrs, f"Image URL not in exported span! Keys containing 'image': {[k for k in attrs if 'image' in k]}"
+    assert attrs[img_key].startswith("data:image/jpeg;base64,"), (
+        f"Image URL has wrong format: {attrs[img_key][:50]}..."
+    )
+
+    # --- Message 2: assistant (string content) ---
+    assert attrs.get("llm.input_messages.2.message.role") == "assistant"
+    assert attrs.get("llm.input_messages.2.message.content") == (
+        "I'll examine the tissue. Let me use extract_patch."
+    )
+
+    # --- Message 3: tool with list content [text, image] (mixed → structured only) ---
+    assert attrs.get("llm.input_messages.3.message.role") == "tool"
+    assert "llm.input_messages.3.message.content" not in attrs
+    assert attrs.get("llm.input_messages.3.message.contents.0.message_content.type") == "text"
+    assert attrs.get("llm.input_messages.3.message.contents.1.message_content.type") == "image"
+
+    # --- Message 5: tool with plain string content ---
+    assert attrs.get("llm.input_messages.5.message.role") == "tool"
+    assert attrs.get("llm.input_messages.5.message.content") == (
+        "Invalid tool call: missing argument 'x'"
+    )
+
+    # --- Count total image URLs ---
+    image_url_keys = [k for k in attrs if k.endswith(".image.image.url")]
+    assert len(image_url_keys) == 4, (
+        f"Expected 4 images in exported span, got {len(image_url_keys)}: {image_url_keys}"
+    )
+
+    # --- Print summary for debugging ---
+    all_msg_keys = sorted(k for k in attrs if k.startswith("llm.input_messages"))
+    print(f"\n  Exported {len(all_msg_keys)} message attributes on real OTel span")
+    for k in all_msg_keys:
+        v = attrs[k]
+        if isinstance(v, str) and len(v) > 80:
+            v = v[:80] + "..."
+        print(f"    {k} = {v!r}")
+
+
+def test_real_pipeline_get_current_span_returns_oi_span(real_otel_pipeline):
+    """Verifies trace.get_current_span() inside an OITracer span returns a usable span."""
+    from opentelemetry import trace
+
+    tracer, get_spans = real_otel_pipeline
+
+    with tracer.start_as_current_span("test-span") as span:
+        current = trace.get_current_span()
+
+        # Must be recording (not INVALID_SPAN)
+        assert current.is_recording(), "get_current_span() returned non-recording span!"
+
+        # Must accept string attributes without error
+        current.set_attribute("test.key", "test.value")
+
+    exported = get_spans()
+    assert len(exported) == 1
+    assert exported[0].attributes.get("test.key") == "test.value"
+
+
+def test_real_pipeline_image_not_redacted_with_200k_limit(real_otel_pipeline):
+    """Verifies that a ~50KB image base64 is NOT redacted with 200K limit in real pipeline."""
+    from opentelemetry import trace
+
+    tracer, get_spans = real_otel_pipeline
+
+    class BigImage(FakePILImage):
+        def save(self, fp, format=None):
+            fp.write(b"\xff\xd8" + b"\x00" * 50_000 + b"\xff\xd9")
+
+    messages = [{"role": "user", "content": [{"type": "image"}]}]
+
+    with tracer.start_as_current_span("test-span", attributes={"openinference.span.kind": "AGENT"}):
+        rollout_trace_attach_conversation(messages, [BigImage(512, 512)], image_format="jpeg")
+
+    exported = get_spans()
+    attrs = dict(exported[0].attributes)
+
+    img_key = "llm.input_messages.0.message.contents.0.message_content.image.image.url"
+    assert img_key in attrs, f"Image key missing! All keys: {sorted(attrs.keys())}"
+    assert attrs[img_key] != "__REDACTED__", "Image was REDACTED despite 200K limit!"
+    assert attrs[img_key].startswith("data:image/jpeg;base64,")
+
+
+def test_real_pipeline_image_redacted_with_default_limit():
+    """Verifies that without custom limit, a ~50KB image IS redacted in real pipeline."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+    from openinference.instrumentation.config import TraceConfig
+
+    exporter = InMemorySpanExporter()
+    # Default config: base64_image_max_length = 32_000
+    config = TraceConfig()
+    provider = OITracerProvider(config=config)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-default-limit")
+
+    # Set backend so rollout_trace_attach_conversation works
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc._initialized = True
+
+    class BigImage(FakePILImage):
+        def save(self, fp, format=None):
+            fp.write(b"\xff\xd8" + b"\x00" * 50_000 + b"\xff\xd9")
+
+    messages = [{"role": "user", "content": [{"type": "image"}]}]
+
+    with tracer.start_as_current_span("test-span", attributes={"openinference.span.kind": "AGENT"}):
+        rollout_trace_attach_conversation(messages, [BigImage(512, 512)], image_format="jpeg")
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    attrs = dict(exported[0].attributes)
+
+    img_key = "llm.input_messages.0.message.contents.0.message_content.image.image.url"
+    assert img_key in attrs, f"Image key missing! Keys: {sorted(attrs.keys())}"
+    assert attrs[img_key] == "__REDACTED__", (
+        f"Expected REDACTED with default 32K limit, got: {str(attrs[img_key])[:60]}..."
+    )
+
+    provider.shutdown()
+
+
+# ============================================================================
+# Full-flow test — rollout_trace_op + attach_conversation (mirrors production)
+# ============================================================================
+
+
+async def test_full_flow_rollout_trace_op_with_attach_conversation():
+    """End-to-end test: @rollout_trace_op creates span, attach_conversation sets attrs.
+
+    This mirrors the production flow in KaikoToolAgent.run():
+    1. @rollout_trace_op decorator creates the span via tracer.start_as_current_span()
+    2. Inside the function, rollout_trace_attach_conversation() is called
+    3. Attributes should appear on the exported span
+
+    Uses a real OITracerProvider (same as arize.otel.register() creates) with
+    InMemorySpanExporter to capture and verify exported spans.
+    """
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+    from openinference.instrumentation.config import TraceConfig
+
+    exporter = InMemorySpanExporter()
+    config = TraceConfig(base64_image_max_length=200_000)
+    provider = OITracerProvider(config=config)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-full-flow")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    class AgentUnderTest:
+        @rollout_trace_op
+        async def run(self, messages, images):
+            """Simulates KaikoToolAgent.run() — decorated, calls attach at end."""
+            rollout_trace_attach_conversation(
+                messages,
+                images,
+                image_format="jpeg",
+                max_dimension=512,
+                span_kind="AGENT",
+            )
+            return "done"
+
+    messages = _build_realistic_kaiko_messages()
+    images = [FakePILImage(512, 512) for _ in range(4)]
+
+    agent = AgentUnderTest()
+    result = await agent.run(messages, images)
+    assert result == "done"
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    assert len(exported) >= 1, f"Expected at least 1 span, got {len(exported)}"
+
+    span = exported[0]
+    attrs = dict(span.attributes)
+
+    # Verify span kind was overridden to AGENT
+    assert attrs.get("openinference.span.kind") == "AGENT", (
+        f"span.kind={attrs.get('openinference.span.kind')!r}, expected 'AGENT'"
+    )
+
+    # Verify system message (string content)
+    assert attrs.get("llm.input_messages.0.message.role") == "system"
+    assert "llm.input_messages.0.message.content" in attrs
+
+    # Verify user message with list content [text, image] (mixed → structured only)
+    assert attrs.get("llm.input_messages.1.message.role") == "user"
+    assert "llm.input_messages.1.message.content" not in attrs
+    assert attrs.get("llm.input_messages.1.message.contents.0.message_content.type") == "text"
+    assert "llm.input_messages.1.message.contents.0.message_content.text" in attrs
+
+    img_key = "llm.input_messages.1.message.contents.1.message_content.image.image.url"
+    assert img_key in attrs, (
+        f"Image URL missing! Keys with 'image': {[k for k in attrs if 'image' in k.lower()]}"
+    )
+    assert str(attrs[img_key]).startswith("data:image/jpeg;base64,"), (
+        f"Image URL wrong format: {str(attrs[img_key])[:50]}"
+    )
+    assert attrs[img_key] != "__REDACTED__", "Image was REDACTED despite 200K limit!"
+
+    # Verify assistant message (string content)
+    assert attrs.get("llm.input_messages.2.message.role") == "assistant"
+    assert "llm.input_messages.2.message.content" in attrs
+
+    # Verify tool message with list content (mixed → structured only)
+    assert attrs.get("llm.input_messages.3.message.role") == "tool"
+    assert "llm.input_messages.3.message.content" not in attrs
+
+    # Verify plain string tool message
+    assert attrs.get("llm.input_messages.5.message.role") == "tool"
+    assert attrs.get("llm.input_messages.5.message.content") == (
+        "Invalid tool call: missing argument 'x'"
+    )
+
+    # Count total images
+    image_url_keys = [k for k in attrs if k.endswith(".image.image.url")]
+    assert len(image_url_keys) == 4, (
+        f"Expected 4 images, got {len(image_url_keys)}: {image_url_keys}"
+    )
+
+    # Print all llm.input_messages attributes for debugging
+    msg_keys = sorted(k for k in attrs if k.startswith("llm.input_messages"))
+    print(f"\n  Full-flow test: {len(msg_keys)} message attributes on exported span")
+    for k in msg_keys:
+        v = attrs[k]
+        if isinstance(v, str) and len(v) > 100:
+            v = v[:100] + "..."
+        print(f"    {k} = {v!r}")
+
+    provider.shutdown()
+
+
+async def test_full_flow_with_omegaconf_listconfig():
+    """Verifies that OmegaConf ListConfig/DictConfig content is handled correctly.
+
+    In production, Hydra/OmegaConf wraps config values in ListConfig/DictConfig
+    instead of native list/dict. This caused the original bug where isinstance(content, list)
+    returned False for ListConfig.
+    """
+    from omegaconf import DictConfig, ListConfig
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+    from openinference.instrumentation.config import TraceConfig
+
+    exporter = InMemorySpanExporter()
+    config = TraceConfig(base64_image_max_length=200_000)
+    provider = OITracerProvider(config=config)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-omegaconf")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    # Build messages using OmegaConf types (matching production)
+    messages = [
+        DictConfig({
+            "role": "system",
+            "content": ListConfig([
+                DictConfig({"type": "text", "text": "You are a helpful agent."}),
+            ]),
+        }),
+        DictConfig({
+            "role": "user",
+            "content": ListConfig([
+                DictConfig({"type": "text", "text": "Analyze this slide."}),
+                DictConfig({"type": "image"}),
+            ]),
+        }),
+        DictConfig({
+            "role": "assistant",
+            "content": "I see tissue with abnormal patterns.",
+        }),
+        DictConfig({
+            "role": "tool",
+            "content": ListConfig([
+                DictConfig({"type": "text", "text": "Patch at (100, 200)"}),
+                DictConfig({"type": "image"}),
+            ]),
+        }),
+        DictConfig({
+            "role": "tool",
+            "content": "Invalid tool call: missing argument",
+        }),
+    ]
+    images = [FakePILImage(512, 512), FakePILImage(256, 256)]
+
+    class AgentUnderTest:
+        @rollout_trace_op
+        async def run(self, msgs, imgs):
+            rollout_trace_attach_conversation(
+                msgs, imgs, image_format="jpeg", max_dimension=512, span_kind="AGENT",
+            )
+            return "done"
+
+    agent = AgentUnderTest()
+    await agent.run(messages, images)
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    assert len(exported) >= 1
+    attrs = dict(exported[0].attributes)
+
+    # System message with text-only ListConfig → message.content only
+    assert attrs.get("llm.input_messages.0.message.role") == "system"
+    assert attrs.get("llm.input_messages.0.message.content") == "You are a helpful agent."
+    assert "llm.input_messages.0.message.contents.0.message_content.type" not in attrs
+
+    # User message with ListConfig [text, image] → mixed → structured only
+    assert attrs.get("llm.input_messages.1.message.role") == "user"
+    assert "llm.input_messages.1.message.content" not in attrs
+    assert attrs.get("llm.input_messages.1.message.contents.0.message_content.type") == "text"
+    assert attrs.get("llm.input_messages.1.message.contents.1.message_content.type") == "image"
+    img_key = "llm.input_messages.1.message.contents.1.message_content.image.image.url"
+    assert img_key in attrs, f"Image missing! Keys: {[k for k in attrs if 'image' in k]}"
+    assert attrs[img_key] != "__REDACTED__"
+
+    # Assistant with plain string (still works)
+    assert attrs.get("llm.input_messages.2.message.content") == (
+        "I see tissue with abnormal patterns."
+    )
+
+    # Tool with ListConfig [text, image] → mixed → structured only
+    assert attrs.get("llm.input_messages.3.message.role") == "tool"
+    assert "llm.input_messages.3.message.content" not in attrs
+    assert attrs.get("llm.input_messages.3.message.contents.1.message_content.type") == "image"
+
+    # Tool with plain string
+    assert attrs.get("llm.input_messages.4.message.content") == (
+        "Invalid tool call: missing argument"
+    )
+
+    # All 2 images consumed
+    image_url_keys = [k for k in attrs if k.endswith(".image.image.url")]
+    assert len(image_url_keys) == 2, f"Expected 2 images, got {len(image_url_keys)}"
+
+    provider.shutdown()
+
+
+async def test_root_span_metadata_from_rollout_trace_op():
+    """Verifies that rollout_trace_op sets scalar inputs on the root (rollout_trace_attr) span.
+
+    This mirrors the production flow:
+    1. rollout_trace_attr creates the top-level 'agent_loop' span
+    2. rollout_trace_op creates a child span for 'run()'
+    3. Scalar kwargs (wsi_name, data_source, etc.) should be set on the root span
+    """
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+
+    exporter = InMemorySpanExporter()
+    provider = OITracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-root-metadata")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    class FakeResult:
+        def __init__(self):
+            self.reward_score = 0.85
+            self.num_turns = 7
+            self.prompt_ids = [1, 2, 3]
+            self.response_ids = [4, 5, 6]
+            self.response_mask = [1, 1, 1]
+            self.response_logprobs = [-0.1, -0.2]
+            self.multi_modal_data = {}
+            self.extra_fields = {"turn_scores": [0.1, 0.2]}
+            self.metrics = {"latency": 1.5}
+
+    class AgentUnderTest:
+        @rollout_trace_op
+        async def run(self, sampling_params, **kwargs):
+            return FakeResult()
+
+    agent = AgentUnderTest()
+
+    with rollout_trace_attr(
+        step=5, sample_index=42, rollout_n=3, validate=False, name="agent_loop",
+    ):
+        await agent.run(
+            sampling_params={"temperature": 0.7},
+            wsi_name="TCGA-TEST-001",
+            data_source="test_dataset",
+            primary_site_bb="Breast",
+            index=207,
+            extra_info={"wsi_id": "TCGA-TEST-001", "slide_level_task": True, "reward_groups": ["a", "b"]},
+            messages=[{"role": "system", "content": "hello"}],
+            multi_modal_inputs={"image": [1, 2, 3]},
+        )
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    assert len(exported) == 2, f"Expected 2 spans (child + root), got {len(exported)}"
+
+    # Spans are exported child-first, root-last
+    child_attrs = dict(exported[0].attributes)
+    root_attrs = dict(exported[1].attributes)
+
+    # Root span should have the original rollout_trace_attr attributes
+    assert root_attrs.get("step") == "5"
+    assert root_attrs.get("sample_index") == "42"
+
+    # Root span should also have scalar kwargs from rollout_trace_op
+    assert root_attrs.get("wsi_name") == "TCGA-TEST-001"
+    assert root_attrs.get("data_source") == "test_dataset"
+    assert root_attrs.get("primary_site_bb") == "Breast"
+    assert root_attrs.get("index") == "207"
+
+    # extra_info scalars should be flattened one level
+    assert root_attrs.get("extra_info.wsi_id") == "TCGA-TEST-001"
+    assert root_attrs.get("extra_info.slide_level_task") == "True"
+
+    # Non-scalar extra_info values should be skipped
+    assert "extra_info.reward_groups" not in root_attrs
+
+    # Skipped keys should not appear on root span
+    assert "messages" not in root_attrs
+    assert "multi_modal_inputs" not in root_attrs
+    assert "sampling_params" not in root_attrs
+
+    # Root span should have scalar result fields (reward_score, num_turns)
+    assert root_attrs.get("reward_score") == "0.85"
+    assert root_attrs.get("num_turns") == "7"
+
+    # Raw tensor fields from result should NOT appear on root span
+    assert "prompt_ids" not in root_attrs
+    assert "response_ids" not in root_attrs
+    assert "response_mask" not in root_attrs
+    assert "response_logprobs" not in root_attrs
+    assert "extra_fields" not in root_attrs
+    assert "metrics" not in root_attrs
+
+    # Child span should NOT have input/output dumps
+    assert "input.value" not in child_attrs
+    assert "output.value" not in child_attrs
+
+    provider.shutdown()

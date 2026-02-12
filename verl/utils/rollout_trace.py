@@ -301,6 +301,7 @@ def rollout_trace_op(func):
             ) as span:
                 try:
                     result = await func(self, *args, **kwargs)
+                    _set_arize_root_span_result(result)
                     if enable_token2text:
                         _result = await add_token2text(self, result)
                         if isinstance(_result, dict) and "response_text" in _result:
@@ -363,6 +364,7 @@ def rollout_trace_op(func):
             ) as span:
                 try:
                     result = func(self, *args, **kwargs)
+                    _set_arize_root_span_result(result)
                     span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
                     return result
                 except Exception as e:
@@ -397,6 +399,26 @@ def _set_arize_root_span_metadata(inputs: dict) -> None:
             for sub_key, sub_value in value.items():
                 if isinstance(sub_value, (str, int, float, bool)):
                     root_span.set_attribute(f"extra_info.{sub_key}", str(sub_value))
+
+
+def _set_arize_root_span_result(result) -> None:
+    """Extract scalar fields from the function result and set them on the root trace span.
+
+    Mirrors how Weave captures the full output object — but for Arize we only write
+    scalar attributes (``reward_score``, ``num_turns``, etc.) to keep spans clean.
+    """
+    root_span = _root_trace_span.get()
+    if root_span is None or not root_span.is_recording():
+        return
+
+    result_dict = vars(result) if hasattr(result, "__dict__") else {}
+    skip_keys = {"prompt_ids", "response_ids", "response_mask", "response_logprobs",
+                 "multi_modal_data", "extra_fields", "metrics"}
+    for key, value in result_dict.items():
+        if key in skip_keys:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            root_span.set_attribute(key, str(value))
 
 
 def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
