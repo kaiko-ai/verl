@@ -284,22 +284,19 @@ def rollout_trace_op(func):
             from opentelemetry import trace as otel_trace
 
             tracer = RolloutTraceConfig.get_client()
+            span_attrs = {"openinference.span.kind": "CHAIN"}
+            span_attrs.update(_extract_arize_metadata(inputs))
             with tracer.start_as_current_span(
                 name=func.__qualname__,
-                attributes={
-                    "openinference.span.kind": "CHAIN",
-                    "input.value": str(inputs),
-                    "input.mime_type": "text/plain",
-                },
+                attributes=span_attrs,
             ) as span:
                 try:
                     result = await func(self, *args, **kwargs)
                     if enable_token2text:
                         _result = await add_token2text(self, result)
-                        span.set_attribute("output.value", str(_result))
-                    else:
-                        span.set_attribute("output.value", str(result))
-                    span.set_attribute("output.mime_type", "text/plain")
+                        if isinstance(_result, dict) and "response_text" in _result:
+                            span.set_attribute("output.value", _result["response_text"])
+                            span.set_attribute("output.mime_type", "text/plain")
                     span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
                     return result
                 except Exception as e:
@@ -346,18 +343,14 @@ def rollout_trace_op(func):
             from opentelemetry import trace as otel_trace
 
             tracer = RolloutTraceConfig.get_client()
+            span_attrs = {"openinference.span.kind": "CHAIN"}
+            span_attrs.update(_extract_arize_metadata(inputs))
             with tracer.start_as_current_span(
                 name=func.__qualname__,
-                attributes={
-                    "openinference.span.kind": "CHAIN",
-                    "input.value": str(inputs),
-                    "input.mime_type": "text/plain",
-                },
+                attributes=span_attrs,
             ) as span:
                 try:
                     result = func(self, *args, **kwargs)
-                    span.set_attribute("output.value", str(result))
-                    span.set_attribute("output.mime_type", "text/plain")
                     span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
                     return result
                 except Exception as e:
@@ -368,6 +361,27 @@ def rollout_trace_op(func):
             return func(self, *args, **kwargs)
 
     return async_wrapper if inspect.iscoroutinefunction(func) else wrapper
+
+
+def _extract_arize_metadata(inputs: dict) -> dict[str, str]:
+    """Extract scalar fields from inputs as individual span attributes for Arize searchability.
+
+    Flattens top-level scalars and one level of 'extra_info' dict into
+    ``metadata.<key>`` attributes. Skips complex types (lists, dicts) and
+    the ``messages`` key (handled separately by ``rollout_trace_attach_conversation``).
+    """
+    metadata = {}
+    skip_keys = {"messages", "multi_modal_inputs"}
+    for key, value in inputs.items():
+        if key in skip_keys:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            metadata[f"metadata.{key}"] = str(value)
+        elif isinstance(value, dict) and key == "extra_info":
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, (str, int, float, bool)):
+                    metadata[f"metadata.extra_info.{sub_key}"] = str(sub_value)
+    return metadata
 
 
 def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
