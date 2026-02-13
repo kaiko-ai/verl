@@ -503,17 +503,17 @@ class vLLMHttpServerBase:
             # Directly call engine to wake up without sync weights.
             if self.node_rank == 0:
                 await self.engine.wake_up(tags=["kv_cache", "weights"])
+                await self.engine.reset_prefix_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        if not self.config.free_cache_engine:
+            return
         if self.rollout_mode == RolloutMode.HYBRID:
-            if self.node_rank == 0:
-                await self.engine.reset_prefix_cache()
             await asyncio.gather(*[worker.sleep.remote() for worker in self.workers])
         elif self.rollout_mode == RolloutMode.COLOCATED:
             if self.node_rank == 0:
-                await self.engine.reset_prefix_cache()
                 await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
