@@ -499,6 +499,8 @@ class vLLMHttpServerBase:
         if self.rollout_mode == RolloutMode.HYBRID:
             # Call all workers to switch between trainer mode and rollout mode.
             await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
+            if self.node_rank == 0:
+                await self.engine.reset_prefix_cache()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             if self.node_rank == 0:
