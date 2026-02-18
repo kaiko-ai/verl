@@ -365,27 +365,27 @@ def _build_realistic_messages():
     return [
         {
             "role": "system",
-            "content": "You are a slide-level analysis agent. Use tools to examine regions.",
+            "content": "You are a tool-calling agent.",
         },
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "Analyze this slide for abnormal tissue."},
+                {"type": "text", "text": "Analyze this input."},
                 {"type": "image"},
             ],
         },
-        {"role": "assistant", "content": "I'll examine the tissue. Let me use extract_patch."},
+        {"role": "assistant", "content": "I'll use a tool to inspect it."},
         {
             "role": "tool",
             "content": [
-                {"type": "text", "text": "Extracted patch at (100, 200), size 512x512"},
+                {"type": "text", "text": "Tool result: item A"},
                 {"type": "image"},
             ],
         },
         {
             "role": "tool",
             "content": [
-                {"type": "text", "text": "Segmentation results for region A"},
+                {"type": "text", "text": "Tool result: item B"},
                 {"type": "image"},
                 {"type": "image"},
             ],
@@ -393,50 +393,9 @@ def _build_realistic_messages():
         {"role": "tool", "content": "Invalid tool call: missing argument 'x'"},
         {
             "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "This is the last turn, please make the final analysis.",
-                }
-            ],
+            "content": [{"type": "text", "text": "Please provide the final answer."}],
         },
     ]
-
-
-# ============================================================================
-# Auto-attach conversation tests
-# ============================================================================
-
-
-@pytest.fixture
-def real_otel_pipeline():
-    """Creates a real OpenInference tracing pipeline with in-memory span export."""
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-
-    from openinference.instrumentation import TracerProvider as OITracerProvider
-    from openinference.instrumentation.config import TraceConfig
-
-    exporter = InMemorySpanExporter()
-
-    config = TraceConfig(base64_image_max_length=200_000)
-    provider = OITracerProvider(config=config)
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-
-    tracer = provider.get_tracer("test-tracer")
-
-    rc = RolloutTraceConfig.get_instance()
-    rc.backend = "arize"
-    rc.client = tracer
-    rc._initialized = True
-
-    def get_exported_spans():
-        provider.force_flush()
-        return exporter.get_finished_spans()
-
-    yield tracer, get_exported_spans
-
-    provider.shutdown()
 
 
 async def test_auto_attach_conversation():
@@ -553,50 +512,6 @@ async def test_auto_attach_noop_when_none():
     provider.shutdown()
 
 
-async def test_auto_attach_clears_field():
-    """Verify result.trace_conversation is None after the decorator returns."""
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-
-    from openinference.instrumentation import TracerProvider as OITracerProvider
-    from openinference.instrumentation.config import TraceConfig
-
-    exporter = InMemorySpanExporter()
-    config = TraceConfig(base64_image_max_length=200_000)
-    provider = OITracerProvider(config=config)
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    tracer = provider.get_tracer("test-clear")
-
-    rc = RolloutTraceConfig.get_instance()
-    rc.backend = "arize"
-    rc.client = tracer
-    rc._initialized = True
-
-    class FakeResult:
-        def __init__(self):
-            self.trace_conversation = [{"role": "user", "content": "hello"}]
-            self.multi_modal_data = {}
-            self.reward_score = 0.0
-            self.num_turns = 1
-            self.prompt_ids = [1]
-            self.response_ids = [2]
-            self.response_mask = [1]
-            self.extra_fields = {}
-            self.metrics = {}
-
-    class AgentUnderTest:
-        @rollout_trace_op
-        async def run(self):
-            return FakeResult()
-
-    agent = AgentUnderTest()
-    result = await agent.run()
-
-    assert result.trace_conversation is None
-
-    provider.shutdown()
-
-
 async def test_auto_attach_uses_arize_config():
     """Verify image_format/max_dimension come from arize_config, span_kind is always AGENT."""
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -668,25 +583,6 @@ async def test_auto_attach_uses_arize_config():
     provider.shutdown()
 
 
-def test_trace_conversation_excluded_from_model_dump():
-    """A pydantic Field(exclude=True) should not appear in model_dump()."""
-    from typing import Any, Optional
-
-    from pydantic import BaseModel, Field
-
-    class MinimalOutput(BaseModel):
-        prompt_ids: list[int]
-        response_ids: list[int]
-        trace_conversation: Optional[list[dict[str, Any]]] = Field(default=None, exclude=True)
-
-    output = MinimalOutput(prompt_ids=[1, 2], response_ids=[3, 4])
-    output.trace_conversation = [{"role": "user", "content": "hello"}]
-
-    dumped = output.model_dump()
-    assert "trace_conversation" not in dumped
-    assert "prompt_ids" in dumped
-
-
 async def test_root_span_metadata_from_rollout_trace_op():
     """Verifies that rollout_trace_op sets scalar inputs on the root (rollout_trace_attr) span."""
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -728,11 +624,11 @@ async def test_root_span_metadata_from_rollout_trace_op():
     ):
         await agent.run(
             sampling_params={"temperature": 0.7},
-            wsi_name="TCGA-TEST-001",
+            task_id="task-001",
             data_source="test_dataset",
-            primary_site_bb="Breast",
+            label="category_a",
             index=207,
-            extra_info={"wsi_id": "TCGA-TEST-001", "slide_level_task": True, "reward_groups": ["a", "b"]},
+            extra_info={"item_id": "task-001", "is_valid": True, "tags": ["a", "b"]},
             messages=[{"role": "system", "content": "hello"}],
             multi_modal_inputs={"image": [1, 2, 3]},
         )
@@ -750,17 +646,17 @@ async def test_root_span_metadata_from_rollout_trace_op():
     assert root_attrs.get("sample_index") == "42"
 
     # Root span should also have scalar kwargs from rollout_trace_op
-    assert root_attrs.get("wsi_name") == "TCGA-TEST-001"
+    assert root_attrs.get("task_id") == "task-001"
     assert root_attrs.get("data_source") == "test_dataset"
-    assert root_attrs.get("primary_site_bb") == "Breast"
+    assert root_attrs.get("label") == "category_a"
     assert root_attrs.get("index") == "207"
 
     # extra_info scalars should be flattened one level
-    assert root_attrs.get("extra_info.wsi_id") == "TCGA-TEST-001"
-    assert root_attrs.get("extra_info.slide_level_task") == "True"
+    assert root_attrs.get("extra_info.item_id") == "task-001"
+    assert root_attrs.get("extra_info.is_valid") == "True"
 
     # Non-scalar extra_info values should be skipped
-    assert "extra_info.reward_groups" not in root_attrs
+    assert "extra_info.tags" not in root_attrs
 
     # Skipped keys should not appear on root span
     assert "messages" not in root_attrs

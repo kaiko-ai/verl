@@ -276,7 +276,6 @@ def rollout_trace_op(func):
         elif backend == "arize":
             from opentelemetry import trace as otel_trace
 
-            # Flatten **kwargs into top-level so _set_arize_root_span_metadata sees them
             flat_inputs = {k: v for k, v in inputs.items() if k != "kwargs"}
             if isinstance(inputs.get("kwargs"), dict):
                 flat_inputs.update(inputs["kwargs"])
@@ -368,12 +367,10 @@ def rollout_trace_op(func):
 
 
 def _set_arize_root_span_metadata(inputs: dict) -> None:
-    """Extract scalar fields from function inputs and set them on the root trace span.
+    """Write scalar kwargs onto the root rollout_trace_attr span as searchable attributes.
 
-    For the Arize backend, writes flat top-level attributes on the ``rollout_trace_attr``
-    span so they appear alongside ``step``, ``sample_index``, etc. and are searchable.
-    Flattens one level of ``extra_info``. Skips complex types and keys already handled
-    elsewhere (``messages``, ``multi_modal_inputs``, ``sampling_params``).
+    Flattens one level of ``extra_info``. Skips ``messages``, ``multi_modal_inputs``,
+    and ``sampling_params``.
     """
     root_span = _root_trace_span.get()
     if root_span is None or not root_span.is_recording():
@@ -392,11 +389,7 @@ def _set_arize_root_span_metadata(inputs: dict) -> None:
 
 
 def _set_arize_root_span_result(result) -> None:
-    """Extract scalar fields from the function result and set them on the root trace span.
-
-    Mirrors how Weave captures the full output object — but for Arize we only write
-    scalar attributes (``reward_score``, ``num_turns``, etc.) to keep spans clean.
-    """
+    """Write scalar result fields (e.g. ``reward_score``, ``num_turns``) onto the root span."""
     root_span = _root_trace_span.get()
     if root_span is None or not root_span.is_recording():
         return
