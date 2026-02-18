@@ -53,6 +53,7 @@ class RolloutTraceConfig:
     experiment_name: str = None
     max_samples_per_step_per_worker: Optional[int] = None
     trace_step_interval: int = 1
+    arize_config: dict = {}
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -75,6 +76,7 @@ class RolloutTraceConfig:
         token2text: bool = False,
         max_samples_per_step_per_worker: Optional[int] = None,
         trace_step_interval: int = 1,
+        arize_config: Optional[dict] = None,
     ):
         config = cls.get_instance()
         if config._initialized:
@@ -86,6 +88,7 @@ class RolloutTraceConfig:
         config.experiment_name = experiment_name
         config.max_samples_per_step_per_worker = max_samples_per_step_per_worker
         config.trace_step_interval = max(1, trace_step_interval)
+        config.arize_config = arize_config or {}
 
         if backend == "weave":
             import weave
@@ -287,6 +290,7 @@ def rollout_trace_op(func):
                 try:
                     result = await func(self, *args, **kwargs)
                     _set_arize_root_span_result(result)
+                    _auto_attach_trace_conversation(result)
                     if enable_token2text:
                         _result = await add_token2text(self, result)
                         if isinstance(_result, dict) and "response_text" in _result:
@@ -350,6 +354,7 @@ def rollout_trace_op(func):
                 try:
                     result = func(self, *args, **kwargs)
                     _set_arize_root_span_result(result)
+                    _auto_attach_trace_conversation(result)
                     span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
                     return result
                 except Exception as e:
@@ -404,6 +409,26 @@ def _set_arize_root_span_result(result) -> None:
             continue
         if isinstance(value, (str, int, float, bool)):
             root_span.set_attribute(key, str(value))
+
+
+def _auto_attach_trace_conversation(result) -> None:
+    """If result has trace_conversation, attach it to the current span and clear it."""
+    messages = getattr(result, "trace_conversation", None)
+    if messages is None:
+        return
+    images = None
+    multi_modal = getattr(result, "multi_modal_data", None)
+    if isinstance(multi_modal, dict):
+        images = multi_modal.get("image")
+    arize = RolloutTraceConfig.get_instance().arize_config
+    rollout_trace_attach_conversation(
+        messages=messages,
+        images=images,
+        image_format=arize.get("image_format", "png"),
+        max_dimension=arize.get("max_dimension"),
+        span_kind="AGENT",
+    )
+    result.trace_conversation = None
 
 
 def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
