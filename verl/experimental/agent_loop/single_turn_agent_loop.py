@@ -52,8 +52,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
+            prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)  # image token not expanded
+            # image tokens possibly expanded by the processor
+            # the prompt_ids in AgentLoopOutput will be merged together with the input batch and be fed
+            # directly to actor module, so it needs to be in the format expected by the model.
             model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
-            prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+            prompt_ids_possibly_expanded = model_inputs.pop("input_ids").squeeze(0).tolist()
+
         else:
             prompt_ids = await self.loop.run_in_executor(
                 None,
@@ -61,6 +66,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     messages, add_generation_prompt=True, tokenize=True, **self.apply_chat_template_kwargs
                 ),
             )
+            prompt_ids_possibly_expanded = prompt_ids
 
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
@@ -69,7 +75,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         response_mask = [1] * len(output.token_ids)
 
         output = AgentLoopOutput(
-            prompt_ids=prompt_ids,
+            prompt_ids=prompt_ids_possibly_expanded,
             response_ids=output.token_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
