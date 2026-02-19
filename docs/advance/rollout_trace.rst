@@ -168,6 +168,7 @@ Usage of Arize
    3. ``trainer.experiment_name=$experiment_name``
    4. ``actor_rollout_ref.rollout.trace.token2text=True``: Optional, to show decoded text in trace view
    5. ``actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=N``: Optional, to limit trace volume
+   6. ``actor_rollout_ref.rollout.trace.trace_step_interval=N``: Optional, only trace every N steps
 
 The Arize backend uses OpenTelemetry (OTel) for trace export. ``arize.otel.register()`` sets up the global OTel SDK with Arize's OTLP exporter. Each traced function creates an OTel span with inputs and outputs as attributes.
 
