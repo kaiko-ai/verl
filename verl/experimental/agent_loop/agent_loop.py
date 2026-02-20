@@ -522,6 +522,7 @@ class AgentLoopWorkerBase:
                     f"\n  151657 positions in input_ids ({len(token_ids_list)} total): {positions_of_image_token}"
                     f"\n  full text: {repr(current_text)}"
                 )
+                current_text = current_text.replace("<image>", "")
             processor_kwargs = self.config.actor_rollout_ref.model.get("processor_kwargs", {})
             multi_modal_inputs = self.processor(
                 text=[current_text], images=images, return_tensors="pt", **processor_kwargs
