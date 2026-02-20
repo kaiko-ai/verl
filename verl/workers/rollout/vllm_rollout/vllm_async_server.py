@@ -13,6 +13,9 @@
 # limitations under the License.
 import argparse
 import asyncio
+
+_logit_bias_log_count = 0
+_LOGIT_BIAS_LOG_MAX = 3
 import inspect
 import json
 import logging
@@ -447,6 +450,10 @@ class vLLMHttpServerBase:
         max_tokens = self.config.max_model_len - len(prompt_ids)
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        global _logit_bias_log_count
+        if "logit_bias" in sampling_params and _logit_bias_log_count < _LOGIT_BIAS_LOG_MAX:
+            _logit_bias_log_count += 1
+            print(f"[vllm_async_server] logit_bias in sampling_params ({_logit_bias_log_count}/{_LOGIT_BIAS_LOG_MAX}): {sampling_params['logit_bias']}")
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         prompt = TokensPrompt(
