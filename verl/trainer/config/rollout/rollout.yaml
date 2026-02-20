@@ -267,8 +267,10 @@ trace:
   # Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
   trace_step_interval: 1
 
-  # Backend-specific config (e.g. image_format, max_dimension for arize)
-  arize: {}
+  # Arize-specific config
+  arize:
+    image_format: png
+    max_dimension: null
 
 # When enabled (True), the trainer will attempt to load previously generated rollout data from the specified directory instead of computing new rollouts.
 # If no cached data is found or loading fails, new rollouts will be generated and automatically saved.
