@@ -510,18 +510,7 @@ class AgentLoopWorkerBase:
         if self.processor is not None:
             images = getattr(output, "multi_modal_data", {}).get("image", None)
             current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-            image_count = current_text.count("<image>")
-            if image_count > 0:
-                _image_token_id = 151657
-                token_ids_list = input_ids.squeeze(0).tolist()
-                positions_of_image_token = [i for i, t in enumerate(token_ids_list) if t == _image_token_id]
-                is_special = _image_token_id in self.tokenizer.all_special_ids
-                print(
-                    f"[_agent_loop_postprocess] <image> count after skip_special_tokens=True: {image_count}"
-                    f"\n  151657 is special token: {is_special}"
-                    f"\n  151657 positions in input_ids ({len(token_ids_list)} total): {positions_of_image_token}"
-                    f"\n  full text: {repr(current_text)}"
-                )
+            if "<image>" in current_text:
                 current_text = current_text.replace("<image>", "")
             processor_kwargs = self.config.actor_rollout_ref.model.get("processor_kwargs", {})
             multi_modal_inputs = self.processor(
