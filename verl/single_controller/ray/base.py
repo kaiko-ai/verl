@@ -505,7 +505,10 @@ class RayWorkerGroup(WorkerGroup):
 
         rank = -1
         local_world_size = resource_pool.store[0]
-        self._get_master_addr_port(pgs[0])
+        # placement groups in the subresource_pool is still the list of all placement groups from the parent
+        # resource_pool, not the ones for the subresource_pool only. Assuming the distribution group is intended
+        # for each resource_pool, we assign the master addr and port to the first placement group in the subresource_pool.
+        self._get_master_addr_port(pgs[resource_pool.start_bundle_index // local_world_size])
         for curr_rank in range(resource_pool.start_bundle_index, resource_pool.start_bundle_index + world_size):
             pg_idx = curr_rank // local_world_size
             pg = pgs[pg_idx]
