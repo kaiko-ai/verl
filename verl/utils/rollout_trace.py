@@ -21,6 +21,7 @@ from contextvars import ContextVar
 from typing import Optional
 
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
+_root_trace_span: ContextVar = ContextVar("_root_trace_span", default=None)
 
 
 class RolloutTraceConfig:
@@ -30,7 +31,7 @@ class RolloutTraceConfig:
     tracing backends like Weave and MLflow.
 
     Args:
-        backend (Optional[str]): Tracing backend to use ('weave', 'mlflow', or None).
+        backend (Optional[str]): Tracing backend to use ('weave', 'mlflow', 'arize', or None).
         client (Optional[object]): Client instance for the selected backend.
         token2text (bool): Whether to convert tokens to text in traces. Defaults to False.
         project_name (str): Name of the project for tracing.
@@ -39,6 +40,8 @@ class RolloutTraceConfig:
             per worker per step. If None, all samples are traced. If set, each worker will randomly
             select up to this many unique samples to trace (including all their rollouts for GRPO).
             Total traces = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample.
+        trace_step_interval (int): Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
+            Defaults to 1 (trace every step).
     """
 
     _instance: Optional["RolloutTraceConfig"] = None
@@ -49,6 +52,8 @@ class RolloutTraceConfig:
     project_name: str = None
     experiment_name: str = None
     max_samples_per_step_per_worker: Optional[int] = None
+    trace_step_interval: int = 1
+    arize_config: dict = {}
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -70,6 +75,8 @@ class RolloutTraceConfig:
         backend: str,
         token2text: bool = False,
         max_samples_per_step_per_worker: Optional[int] = None,
+        trace_step_interval: int = 1,
+        arize_config: Optional[dict] = None,
     ):
         config = cls.get_instance()
         if config._initialized:
@@ -80,6 +87,8 @@ class RolloutTraceConfig:
         config.project_name = project_name
         config.experiment_name = experiment_name
         config.max_samples_per_step_per_worker = max_samples_per_step_per_worker
+        config.trace_step_interval = max(1, trace_step_interval)
+        config.arize_config = arize_config or {}
 
         if backend == "weave":
             import weave
@@ -95,6 +104,16 @@ class RolloutTraceConfig:
             mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
             mlflow.set_experiment(project_name)
+        elif backend == "arize":
+            from arize.otel import register
+            from opentelemetry import trace
+
+            register(
+                space_id=os.environ["ARIZE_SPACE_ID"],
+                api_key=os.environ["ARIZE_API_KEY"],
+                project_name=project_name,
+            )
+            config.client = trace.get_tracer(f"verl.rollout.{project_name}")
         else:
             config.client = None
 
@@ -172,6 +191,19 @@ def rollout_trace_attr(
             for key, value in attributes.items():
                 mlflow.set_trace_tag(trace_id, str(key), str(value))
             yield
+    elif backend == "arize":
+        tracer = RolloutTraceConfig.get_client()
+        span_attributes = {str(k): str(v) for k, v in attributes.items()}
+        span_attributes["openinference.span.kind"] = "CHAIN"
+        with tracer.start_as_current_span(
+            name=name,
+            attributes=span_attributes,
+        ) as span:
+            token = _root_trace_span.set(span)
+            try:
+                yield
+            finally:
+                _root_trace_span.reset(token)
     else:
         yield
 
@@ -241,6 +273,35 @@ def rollout_trace_op(func):
 
             return result
 
+        elif backend == "arize":
+            from opentelemetry import trace as otel_trace
+
+            flat_inputs = {k: v for k, v in inputs.items() if k != "kwargs"}
+            if isinstance(inputs.get("kwargs"), dict):
+                flat_inputs.update(inputs["kwargs"])
+            _set_arize_root_span_metadata(flat_inputs)
+
+            tracer = RolloutTraceConfig.get_client()
+            with tracer.start_as_current_span(
+                name=func.__qualname__,
+                attributes={"openinference.span.kind": "CHAIN"},
+            ) as span:
+                try:
+                    result = await func(self, *args, **kwargs)
+                    _set_arize_root_span_result(result)
+                    _auto_attach_trace_conversation(result)
+                    if enable_token2text:
+                        _result = await add_token2text(self, result)
+                        if isinstance(_result, dict) and "response_text" in _result:
+                            span.set_attribute("output.value", _result["response_text"])
+                            span.set_attribute("output.mime_type", "text/plain")
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
+                    return result
+                except Exception as e:
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
+                    span.record_exception(e)
+                    raise
+
         else:
             return await func(self, *args, **kwargs)
 
@@ -276,7 +337,209 @@ def rollout_trace_op(func):
             import mlflow
 
             return mlflow.trace(func)(self, *args, **kwargs)
+        elif backend == "arize":
+            from opentelemetry import trace as otel_trace
+
+            flat_inputs = {k: v for k, v in inputs.items() if k != "kwargs"}
+            if isinstance(inputs.get("kwargs"), dict):
+                flat_inputs.update(inputs["kwargs"])
+            _set_arize_root_span_metadata(flat_inputs)
+
+            tracer = RolloutTraceConfig.get_client()
+            with tracer.start_as_current_span(
+                name=func.__qualname__,
+                attributes={"openinference.span.kind": "CHAIN"},
+            ) as span:
+                try:
+                    result = func(self, *args, **kwargs)
+                    _set_arize_root_span_result(result)
+                    _auto_attach_trace_conversation(result)
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
+                    return result
+                except Exception as e:
+                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
+                    span.record_exception(e)
+                    raise
         else:
             return func(self, *args, **kwargs)
 
     return async_wrapper if inspect.iscoroutinefunction(func) else wrapper
+
+
+def _set_arize_root_span_metadata(inputs: dict) -> None:
+    """Write scalar kwargs onto the root rollout_trace_attr span as searchable attributes.
+
+    Flattens one level of ``extra_info``. Skips ``messages``, ``multi_modal_inputs``,
+    and ``sampling_params``.
+    """
+    root_span = _root_trace_span.get()
+    if root_span is None or not root_span.is_recording():
+        return
+
+    skip_keys = {"messages", "multi_modal_inputs", "sampling_params"}
+    for key, value in inputs.items():
+        if key in skip_keys:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            root_span.set_attribute(key, str(value))
+        elif isinstance(value, dict) and key == "extra_info":
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, (str, int, float, bool)):
+                    root_span.set_attribute(f"extra_info.{sub_key}", str(sub_value))
+
+
+def _set_arize_root_span_result(result) -> None:
+    """Write scalar result fields (e.g. ``reward_score``, ``num_turns``) onto the root span."""
+    root_span = _root_trace_span.get()
+    if root_span is None or not root_span.is_recording():
+        return
+
+    result_dict = vars(result) if hasattr(result, "__dict__") else {}
+    skip_keys = {"prompt_ids", "response_ids", "response_mask", "response_logprobs",
+                 "multi_modal_data", "extra_fields", "metrics"}
+    for key, value in result_dict.items():
+        if key in skip_keys:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            root_span.set_attribute(key, str(value))
+
+
+def _auto_attach_trace_conversation(result) -> None:
+    """If result has trace_conversation, attach it to the current span and clear it."""
+    messages = getattr(result, "trace_conversation", None)
+    if messages is None:
+        return
+    images = None
+    multi_modal = getattr(result, "multi_modal_data", None)
+    if isinstance(multi_modal, dict):
+        images = multi_modal.get("image")
+    arize = RolloutTraceConfig.get_instance().arize_config
+    rollout_trace_attach_conversation(
+        messages=messages,
+        images=images,
+        image_format=arize.get("image_format", "png"),
+        max_dimension=arize.get("max_dimension"),
+        span_kind="AGENT",
+    )
+    result.trace_conversation = None
+
+
+def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
+    """Encode a PIL image to a base64 data URI. Returns None if img is not a valid image."""
+    if not hasattr(img, "save"):
+        return None
+
+    import base64
+    import io
+
+    if max_dimension is not None:
+        w, h = img.size
+        if max(w, h) > max_dimension:
+            scale = max_dimension / max(w, h)
+            img = img.resize(
+                (int(w * scale), int(h * scale)),
+                resample=getattr(img, "Resampling", img).LANCZOS if hasattr(img, "Resampling") else 1,
+            )
+
+    buffer = io.BytesIO()
+    img.save(buffer, format=image_format.upper())
+    b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/{image_format.lower()};base64,{b64}"
+
+
+def rollout_trace_attach_conversation(
+    messages: list[dict] | None,
+    images: list | None = None,
+    image_format: str = "png",
+    max_dimension: int | None = None,
+    span_kind: str | None = None,
+):
+    """Attach a conversation (messages + images) to the current trace span.
+
+    For the Arize backend, serializes the conversation as OpenInference
+    ``llm.input_messages`` attributes with roles, text, and inline images.
+    Image placeholders (``{"type": "image"}``) in message content are resolved
+    to base64-encoded images from the ``images`` list, consumed in order.
+
+    Should be called once at the end of a ``@rollout_trace_op``-decorated function.
+
+    For Weave/MLflow backends, this is a no-op.
+
+    Args:
+        messages: Chat message dicts with ``role`` and ``content`` keys.
+            Content can be a string or a list of content items
+            (``{"type": "text", "text": "..."}`` or ``{"type": "image"}``).
+        images: Flat list of PIL Image objects, consumed in order as
+            ``{"type": "image"}`` placeholders are encountered.
+        image_format: Image encoding format ('png' or 'jpeg'). Default 'png'.
+        max_dimension: If set, resize images so the largest dimension is at most
+            this value (preserving aspect ratio).
+        span_kind: If set, override the ``openinference.span.kind`` attribute
+            on the current span (e.g. "AGENT").
+    """
+    if not messages:
+        return
+
+    backend = RolloutTraceConfig.get_backend()
+    if backend != "arize":
+        return
+
+    if not _trace_enabled.get():
+        return
+
+    from opentelemetry import trace
+
+    span = trace.get_current_span()
+    if not span.is_recording():
+        return
+
+    if span_kind:
+        span.set_attribute("openinference.span.kind", span_kind)
+
+    image_idx = 0
+    images = images or []
+
+    for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "unknown")
+        content = msg.get("content")
+        prefix = f"llm.input_messages.{msg_idx}.message"
+
+        # Normalize OmegaConf ListConfig to native Python list
+        if not isinstance(content, (str, list, type(None))) and hasattr(content, "__iter__"):
+            content = list(content)
+
+        span.set_attribute(f"{prefix}.role", role)
+
+        if isinstance(content, str):
+            span.set_attribute(f"{prefix}.content", content)
+        elif isinstance(content, list):
+            has_images = any(
+                hasattr(item, "get") and item.get("type") == "image" for item in content
+            )
+            if not has_images:
+                # Text-only list: set as plain string to avoid duplication
+                text = "\n".join(
+                    item.get("text", "") for item in content if hasattr(item, "get") and item.get("type") == "text"
+                )
+                if text:
+                    span.set_attribute(f"{prefix}.content", text)
+            else:
+                # Mixed content (text + images): use structured format only
+                content_idx = 0
+                for item in content:
+                    item_type = item.get("type") if hasattr(item, "get") else None
+                    content_prefix = f"{prefix}.contents.{content_idx}.message_content"
+
+                    if item_type == "text":
+                        text = item.get("text", "")
+                        span.set_attribute(f"{content_prefix}.type", "text")
+                        span.set_attribute(f"{content_prefix}.text", text)
+                        content_idx += 1
+                    elif item_type == "image":
+                        if image_idx < len(images):
+                            data_uri = _encode_image(images[image_idx], image_format, max_dimension)
+                            if data_uri:
+                                span.set_attribute(f"{content_prefix}.type", "image")
+                                span.set_attribute(f"{content_prefix}.image.image.url", data_uri)
+                                content_idx += 1
+                        image_idx += 1

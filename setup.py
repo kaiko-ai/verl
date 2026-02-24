@@ -58,6 +58,7 @@ SGLANG_REQUIRES = [
 TRL_REQUIRES = ["trl<=0.9.6"]
 MCORE_REQUIRES = ["mbridge"]
 TRANSFERQUEUE_REQUIRES = ["TransferQueue==0.1.4.dev1"]
+ARIZE_REQUIRES = ["arize-otel>=2.0.0", "openinference-instrumentation", "openinference-semantic-conventions", "opentelemetry-api>=1.26.0", "opentelemetry-sdk>=1.26.0"]
 
 extras_require = {
     "test": TEST_REQUIRES,
@@ -70,6 +71,7 @@ extras_require = {
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
     "transferqueue": TRANSFERQUEUE_REQUIRES,
+    "arize": ARIZE_REQUIRES,
 }
 
 

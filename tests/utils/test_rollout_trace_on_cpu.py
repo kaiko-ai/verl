@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
+from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attach_conversation, rollout_trace_attr, rollout_trace_op
 
 
 @pytest.fixture(autouse=True)
@@ -240,7 +240,443 @@ async def test_rollout_trace_with_real_mlflow_backend():
     with rollout_trace_attr(step=1, sample_index=2, rollout_n=3, name="agent_run"):
         assert await instance.upper_method()
 
-    # with pytest.raises(ValueError, match="Test Exception"):
-    #     await instance.my_method_with_exception()
+    print("\nMlflow integration test ran successfully. Check your mlflow project for the trace.")
 
-    print("\nWeave integration test ran successfully. Check your weave project for the trace.")
+
+@pytest.fixture
+def mock_arize_tracer():
+    """Mocks the arize.otel and opentelemetry modules, yielding (mock_tracer, mock_span)."""
+    mock_arize_otel = MagicMock()
+    mock_otel = MagicMock()
+    mock_tracer = MagicMock()
+    mock_span = MagicMock()
+    mock_span.__enter__ = MagicMock(return_value=mock_span)
+    mock_span.__exit__ = MagicMock(return_value=False)
+    mock_tracer.start_as_current_span.return_value = mock_span
+    mock_otel.trace.get_tracer.return_value = mock_tracer
+    mock_otel.trace.Status = MagicMock()
+    mock_otel.trace.StatusCode = MagicMock()
+    mock_otel.trace.StatusCode.OK = "OK"
+    mock_otel.trace.StatusCode.ERROR = "ERROR"
+
+    with patch.dict(
+        sys.modules,
+        {
+            "arize": MagicMock(),
+            "arize.otel": mock_arize_otel,
+            "opentelemetry": mock_otel,
+            "opentelemetry.trace": mock_otel.trace,
+        },
+    ):
+        with patch.dict(os.environ, {"ARIZE_SPACE_ID": "test-space", "ARIZE_API_KEY": "test-key"}):
+            yield mock_tracer, mock_span
+
+
+async def test_rollout_trace_with_arize_tracer(mock_arize_tracer):
+    """Tests that the Arize backend creates spans without input/output dumps."""
+    mock_tracer, mock_span = mock_arize_tracer
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+    instance = TracedClass()
+
+    result = await instance.my_method("test_a", b="test_b")
+
+    assert result == "result: test_a, test_b"
+    mock_tracer.start_as_current_span.assert_called_once()
+    call_kwargs = mock_tracer.start_as_current_span.call_args.kwargs
+    assert call_kwargs["name"] == "TracedClass.my_method"
+    # Child span should only have span kind, not input/output dumps
+    assert call_kwargs["attributes"] == {"openinference.span.kind": "CHAIN"}
+    # No output.value with raw token dump
+    output_calls = [c for c in mock_span.set_attribute.call_args_list if c[0][0] == "output.value"]
+    assert len(output_calls) == 0
+
+
+async def test_rollout_trace_arize_with_exception(mock_arize_tracer):
+    """Tests that the Arize backend records exceptions on spans."""
+    mock_tracer, mock_span = mock_arize_tracer
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+    instance = TracedClass()
+
+    with pytest.raises(ValueError, match="Test Exception"):
+        await instance.my_method_with_exception()
+
+    mock_tracer.start_as_current_span.assert_called_once()
+    mock_span.record_exception.assert_called_once()
+    assert isinstance(mock_span.record_exception.call_args[0][0], ValueError)
+    mock_span.set_status.assert_called_once()
+
+
+async def test_trace_disabled_with_arize(mock_arize_tracer):
+    """Tests that trace=False disables Arize tracing."""
+    mock_tracer, mock_span = mock_arize_tracer
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+    instance = TracedClass()
+
+    with rollout_trace_attr(step=1, sample_index=0, rollout_n=0, trace=False):
+        result = await instance.my_method("test_a", b="test_b")
+        assert result == "result: test_a, test_b"
+
+    mock_tracer.start_as_current_span.assert_not_called()
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_ARIZE_INTEGRATION_TESTS", "false").lower() != "true",
+    reason="Skipping Arize integration test. Set RUN_ARIZE_INTEGRATION_TESTS=true to run.",
+)
+async def test_rollout_trace_with_real_arize_backend():
+    """Integration test with a real Arize backend."""
+
+    RolloutTraceConfig.init(project_name="my-project", experiment_name="my-experiment", backend="arize")
+
+    instance = TracedClass()
+
+    with rollout_trace_attr(step=1, sample_index=2, rollout_n=3):
+        await instance.upper_method()
+
+    with pytest.raises(ValueError, match="Test Exception"):
+        await instance.my_method_with_exception()
+
+    print("\nArize integration test ran successfully. Check your Arize project for the trace.")
+
+
+class FakePILImage:
+    """Minimal duck-type stand-in for a PIL Image."""
+
+    def __init__(self, width=100, height=80):
+        self._size = (width, height)
+
+    @property
+    def size(self):
+        return self._size
+
+    def resize(self, size, resample=None):
+        return FakePILImage(width=size[0], height=size[1])
+
+    def save(self, fp, format=None):
+        # Write a tiny valid payload so base64 is non-empty
+        fp.write(b"\x89PNG_FAKE")
+
+    class Resampling:
+        LANCZOS = 1
+
+
+def _build_realistic_messages():
+    """Build a realistic multi-turn conversation."""
+    return [
+        {
+            "role": "system",
+            "content": "You are a tool-calling agent.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Analyze this input."},
+                {"type": "image"},
+            ],
+        },
+        {"role": "assistant", "content": "I'll use a tool to inspect it."},
+        {
+            "role": "tool",
+            "content": [
+                {"type": "text", "text": "Tool result: item A"},
+                {"type": "image"},
+            ],
+        },
+        {
+            "role": "tool",
+            "content": [
+                {"type": "text", "text": "Tool result: item B"},
+                {"type": "image"},
+                {"type": "image"},
+            ],
+        },
+        {"role": "tool", "content": "Invalid tool call: missing argument 'x'"},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Please provide the final answer."}],
+        },
+    ]
+
+
+async def test_auto_attach_conversation():
+    """End-to-end: result.trace_conversation triggers auto-attach in the decorator."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+    from openinference.instrumentation.config import TraceConfig
+
+    exporter = InMemorySpanExporter()
+    config = TraceConfig(base64_image_max_length=200_000)
+    provider = OITracerProvider(config=config)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-auto-attach")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    messages = _build_realistic_messages()
+    images = [FakePILImage(512, 512) for _ in range(4)]
+
+    class FakeResult:
+        def __init__(self):
+            self.trace_conversation = messages
+            self.multi_modal_data = {"image": images}
+            self.reward_score = 0.85
+            self.num_turns = 5
+            self.prompt_ids = [1, 2]
+            self.response_ids = [3, 4]
+            self.response_mask = [1, 1]
+            self.extra_fields = {}
+            self.metrics = {}
+
+    class AgentUnderTest:
+        @rollout_trace_op
+        async def run(self):
+            return FakeResult()
+
+    agent = AgentUnderTest()
+    result = await agent.run()
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    assert len(exported) >= 1
+
+    attrs = dict(exported[0].attributes)
+
+    # Verify span kind was set to AGENT by auto-attach
+    assert attrs.get("openinference.span.kind") == "AGENT"
+
+    # Verify messages were attached
+    assert attrs.get("llm.input_messages.0.message.role") == "system"
+    assert "llm.input_messages.0.message.content" in attrs
+    assert attrs.get("llm.input_messages.1.message.role") == "user"
+    assert attrs.get("llm.input_messages.2.message.role") == "assistant"
+    assert attrs.get("llm.input_messages.3.message.role") == "tool"
+
+    # Verify images were attached (4 image placeholders in messages)
+    image_url_keys = [k for k in attrs if k.endswith(".image.image.url")]
+    assert len(image_url_keys) == 4
+
+    # trace_conversation should be cleared after decorator
+    assert result.trace_conversation is None
+
+    provider.shutdown()
+
+
+async def test_auto_attach_noop_when_none():
+    """No trace_conversation on result → no error, no conversation attributes."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+
+    exporter = InMemorySpanExporter()
+    provider = OITracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-noop")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    class FakeResult:
+        def __init__(self):
+            self.reward_score = 0.5
+            self.num_turns = 1
+            self.prompt_ids = [1]
+            self.response_ids = [2]
+            self.response_mask = [1]
+            self.extra_fields = {}
+            self.metrics = {}
+
+    class AgentUnderTest:
+        @rollout_trace_op
+        async def run(self):
+            return FakeResult()
+
+    agent = AgentUnderTest()
+    await agent.run()
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    assert len(exported) == 1
+
+    attrs = dict(exported[0].attributes)
+    msg_keys = [k for k in attrs if k.startswith("llm.input_messages")]
+    assert len(msg_keys) == 0
+
+    provider.shutdown()
+
+
+async def test_auto_attach_uses_arize_config():
+    """Verify image_format/max_dimension come from arize_config, span_kind is always AGENT."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+    from openinference.instrumentation.config import TraceConfig
+
+    exporter = InMemorySpanExporter()
+    config = TraceConfig(base64_image_max_length=200_000)
+    provider = OITracerProvider(config=config)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-arize-config")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+    rc.arize_config = {"image_format": "jpeg", "max_dimension": 256}
+
+    saved_sizes = []
+
+    class TrackingImage(FakePILImage):
+        def resize(self, size, resample=None):
+            return TrackingImage(width=size[0], height=size[1])
+
+        def save(self, fp, format=None):
+            saved_sizes.append((self.size, format))
+            fp.write(b"\x89PNG_FAKE")
+
+    class FakeResult:
+        def __init__(self):
+            self.trace_conversation = [
+                {"role": "user", "content": [{"type": "image"}]},
+            ]
+            self.multi_modal_data = {"image": [TrackingImage(width=1024, height=512)]}
+            self.reward_score = 0.0
+            self.num_turns = 1
+            self.prompt_ids = [1]
+            self.response_ids = [2]
+            self.response_mask = [1]
+            self.extra_fields = {}
+            self.metrics = {}
+
+    class AgentUnderTest:
+        @rollout_trace_op
+        async def run(self):
+            return FakeResult()
+
+    agent = AgentUnderTest()
+    await agent.run()
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    attrs = dict(exported[0].attributes)
+
+    # span_kind is always AGENT
+    assert attrs.get("openinference.span.kind") == "AGENT"
+
+    # Image was resized to max_dimension=256 (1024x512 → 256x128)
+    assert saved_sizes[0][0] == (256, 128)
+    # Image format from arize_config
+    assert saved_sizes[0][1] == "JPEG"
+
+    # Image URL uses jpeg format
+    img_key = "llm.input_messages.0.message.contents.0.message_content.image.image.url"
+    assert attrs[img_key].startswith("data:image/jpeg;base64,")
+
+    provider.shutdown()
+
+
+async def test_root_span_metadata_from_rollout_trace_op():
+    """Verifies that rollout_trace_op sets scalar inputs on the root (rollout_trace_attr) span."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+
+    exporter = InMemorySpanExporter()
+    provider = OITracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-root-metadata")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    class FakeResult:
+        def __init__(self):
+            self.reward_score = 0.85
+            self.num_turns = 7
+            self.prompt_ids = [1, 2, 3]
+            self.response_ids = [4, 5, 6]
+            self.response_mask = [1, 1, 1]
+            self.response_logprobs = [-0.1, -0.2]
+            self.multi_modal_data = {}
+            self.extra_fields = {"turn_scores": [0.1, 0.2]}
+            self.metrics = {"latency": 1.5}
+
+    class AgentUnderTest:
+        @rollout_trace_op
+        async def run(self, sampling_params, **kwargs):
+            return FakeResult()
+
+    agent = AgentUnderTest()
+
+    with rollout_trace_attr(
+        step=5, sample_index=42, rollout_n=3, validate=False, name="agent_loop",
+    ):
+        await agent.run(
+            sampling_params={"temperature": 0.7},
+            task_id="task-001",
+            data_source="test_dataset",
+            label="category_a",
+            index=207,
+            extra_info={"item_id": "task-001", "is_valid": True, "tags": ["a", "b"]},
+            messages=[{"role": "system", "content": "hello"}],
+            multi_modal_inputs={"image": [1, 2, 3]},
+        )
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    assert len(exported) == 2, f"Expected 2 spans (child + root), got {len(exported)}"
+
+    # Spans are exported child-first, root-last
+    child_attrs = dict(exported[0].attributes)
+    root_attrs = dict(exported[1].attributes)
+
+    # Root span should have the original rollout_trace_attr attributes
+    assert root_attrs.get("step") == "5"
+    assert root_attrs.get("sample_index") == "42"
+
+    # Root span should also have scalar kwargs from rollout_trace_op
+    assert root_attrs.get("task_id") == "task-001"
+    assert root_attrs.get("data_source") == "test_dataset"
+    assert root_attrs.get("label") == "category_a"
+    assert root_attrs.get("index") == "207"
+
+    # extra_info scalars should be flattened one level
+    assert root_attrs.get("extra_info.item_id") == "task-001"
+    assert root_attrs.get("extra_info.is_valid") == "True"
+
+    # Non-scalar extra_info values should be skipped
+    assert "extra_info.tags" not in root_attrs
+
+    # Skipped keys should not appear on root span
+    assert "messages" not in root_attrs
+    assert "multi_modal_inputs" not in root_attrs
+    assert "sampling_params" not in root_attrs
+
+    # Root span should have scalar result fields (reward_score, num_turns)
+    assert root_attrs.get("reward_score") == "0.85"
+    assert root_attrs.get("num_turns") == "7"
+
+    # Raw tensor fields from result should NOT appear on root span
+    assert "prompt_ids" not in root_attrs
+    assert "response_ids" not in root_attrs
+    assert "response_mask" not in root_attrs
+    assert "response_logprobs" not in root_attrs
+    assert "extra_fields" not in root_attrs
+    assert "metrics" not in root_attrs
+
+    # Child span should NOT have input/output dumps
+    assert "input.value" not in child_attrs
+    assert "output.value" not in child_attrs
+
+    provider.shutdown()

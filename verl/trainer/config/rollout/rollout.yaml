@@ -252,7 +252,7 @@ trace:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.TraceConfig
 
-  # trace backend, support mlflow, weave
+  # trace backend, support mlflow, weave, arize
   backend: null
 
   # whether translate token id to text in output
@@ -263,6 +263,14 @@ trace:
   # select N unique samples to trace (including all their rollouts for GRPO).
   # Total traces per step = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample
   max_samples_per_step_per_worker: null
+
+  # Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
+  trace_step_interval: 1
+
+  # Arize-specific config
+  arize:
+    image_format: png
+    max_dimension: null
 
 # When enabled (True), the trainer will attempt to load previously generated rollout data from the specified directory instead of computing new rollouts.
 # If no cached data is found or loading fails, new rollouts will be generated and automatically saved.
