@@ -184,13 +184,15 @@ class RewardLoopManager:
 
     def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
         self.config = config
+        self.num_examine = config.get("reward_model", {}).get('num_examine', 0)
         if self.config.reward_model.enable:
             self.reward_model_manager = RewardModelManager(config.reward_model, rm_resource_pool)
             self.reward_router_address = self.reward_model_manager.get_router_address()
         else:
             self.reward_model_manager = None
             self.reward_router_address = None
-
+        input_tokenizer_local_path = copy_to_local(config.actor_rollout_ref.model.path)
+        self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=True)
         self._init_reward_loop_workers()
 
     def _init_reward_loop_workers(self):
@@ -243,6 +245,52 @@ class RewardLoopManager:
 
         if self.reward_model_manager is not None:
             self.reward_model_manager.sleep()
+
+        already_print_data_sources = {}
+
+        for i in range(len(data)):
+            # temporary solution to print out some examples
+            # following the code in verl/workers/reward_manager/dapo.py
+            data_item = data[i]  # DataProtoItem
+            data_source = data_item.non_tensor_batch["data_source"]
+            if data_source not in already_print_data_sources:
+                already_print_data_sources[data_source] = 0
+            
+            if already_print_data_sources[data_source] >= self.num_examine:
+                continue
+            already_print_data_sources[data_source] += 1
+            prompt_ids = data_item.batch["prompts"]
+
+            prompt_length = prompt_ids.shape[-1]
+
+            valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = data_item.batch["responses"]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            prompt_str = self.input_tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+            response_str = self.input_tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            eos_token = self.input_tokenizer.eos_token
+            if response_str.endswith(eos_token):
+                response_str = response_str[: -len(eos_token)]
+
+            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+
+            reward = scores[i]
+            result = outputs_flat[i]
+
+
+            print("[prompt]", prompt_str)
+            print("[response]", response_str)
+            print("[ground_truth]", ground_truth)
+            if isinstance(result, dict):
+                for key, value in result.items():
+                    print(f"[{key}]", value)
+            else:
+                print("[score]", reward)
 
         return DataProto(
             batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"reward_extra_keys": reward_extra_keys}
