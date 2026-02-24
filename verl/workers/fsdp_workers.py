@@ -981,6 +981,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
+        # Free PyTorch's cached-but-unused CUDA memory after init so that
+        # vLLM MP Executor workers (separate processes) see it as available.
+        aggressive_empty_cache(force_sync=True)
+        log_gpu_memory_usage("After init_model empty_cache", logger=logger)
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
