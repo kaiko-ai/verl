@@ -717,7 +717,7 @@ class AgentLoopWorker:
             }
 
             # Optionally pass multi_modal_data to reward computation (for vision judge models)
-            pass_mm_to_reward = self.config.reward_model.get("pass_multi_modal_data", False)
+            pass_mm_to_reward = self.config.reward.reward_model.get("pass_multi_modal_data", False)
             if pass_mm_to_reward and output.multi_modal_data is not None:
                 if "extra_info" in non_tensor_batch:
                     non_tensor_batch["extra_info"][0]["multi_modal_data"] = output.multi_modal_data
