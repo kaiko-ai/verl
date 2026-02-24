@@ -234,8 +234,10 @@ class AgentLoopBase(ABC):
         """
         multi_modal_data = {}
         if self.processor is not None:
+            image_processor = getattr(self.processor, "image_processor", None)
+            image_patch_size = getattr(image_processor, "patch_size", None)
             images, videos = await self.dataset_cls.process_vision_info(
-                messages, image_patch_size=self.processor.image_processor.patch_size, config=self.dataset_config
+                messages, image_patch_size=image_patch_size, config=self.dataset_config
             )
             if images is not None:
                 multi_modal_data["images"] = images
