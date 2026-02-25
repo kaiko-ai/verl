@@ -270,6 +270,11 @@ class vLLMHttpServerBase:
                 apply_vllm_fp8_patches()
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
+        hf_overrides = self.model_config.get("override_config", {})
+        if quantization == "fp8":
+            hf_overrides["quantization_config"] = fp8_block_quant_kwargs
+        print('hf_overrides', hf_overrides)
+
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
@@ -289,7 +294,7 @@ class vLLMHttpServerBase:
             "seed": self.config.get("seed", 0),
             "override_generation_config": json.dumps(override_generation_config),
             "quantization": quantization,
-            "hf_overrides": {"quantization_config": fp8_block_quant_kwargs} if quantization == "fp8" else None,
+            "hf_overrides": hf_overrides, #{"quantization_config": fp8_block_quant_kwargs} if quantization == "fp8" else None,
             **engine_kwargs,
         }
 
