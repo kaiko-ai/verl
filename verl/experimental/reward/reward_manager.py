@@ -278,10 +278,8 @@ class RewardLoopManager:
                 response_str = response_str[: -len(eos_token)]
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-
             reward = scores[i]
             result = outputs_flat[i]
-
 
             print("[prompt]", prompt_str)
             print("[response]", response_str)
