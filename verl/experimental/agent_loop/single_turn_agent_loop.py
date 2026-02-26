@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import logging
 import os
 from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 
 logger = logging.getLogger(__file__)
@@ -32,17 +32,34 @@ class SingleTurnAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
         self.prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
         self.response_length = self.config.actor_rollout_ref.rollout.response_length
-        self.apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+
+        tool_config_path = self.config.data.tool_config_path
+        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+        self.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
-        image_data = copy.deepcopy((kwargs.get("multi_modal_data") or {}).get("image", None))
 
+        # 1. extract images and videos from messages
+        multi_modal_data = await self.process_vision_info(messages)
+        images = multi_modal_data.get("images")
+        videos = multi_modal_data.get("videos")
+
+        # 2. apply chat template and tokenize
+        prompt_ids = await self.apply_chat_template(
+            messages,
+            tools=self.tool_schemas,
+            images=images,
+            videos=videos,
+        )
+
+        # 3. generate sequences
         metrics = {}
-        request_id = uuid4().hex
-
-        # Use processor if available for multimodal support
+        # apply_chat_template above called processor(text, images) → expanded ids (processor expansion
+        # track, e.g. Kitsune). vLLM expects unexpanded ids and handles expansion internally, so we
+        # keep two representations: unexpanded for vLLM generation, expanded for the actor forward pass.
         if self.processor is not None:
+            prompt_ids_possibly_expanded = prompt_ids
             raw_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.processor.apply_chat_template(
@@ -52,26 +69,20 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)  # image token not expanded
-            # image tokens possibly expanded by the processor
-            # the prompt_ids in AgentLoopOutput will be merged together with the input batch and be fed
-            # directly to actor module, so it needs to be in the format expected by the model.
-            model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
-            prompt_ids_possibly_expanded = model_inputs.pop("input_ids").squeeze(0).tolist()
-
+            prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         else:
-            prompt_ids = await self.loop.run_in_executor(
-                None,
-                lambda: self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=True, **self.apply_chat_template_kwargs
-                ),
-            )
             prompt_ids_possibly_expanded = prompt_ids
 
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
-                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
+                request_id=uuid4().hex,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=images,
+                video_data=videos,
             )
+        if metrics.get("num_preempted") is None:
+            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
 
         output = AgentLoopOutput(
@@ -84,8 +95,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 if output.routed_experts is not None
                 else None
             ),
-            multi_modal_data={"image": image_data} if image_data is not None else {},
+            multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,
         )
+
+        # keeping the schema consistent with tool_agent_loop
+        output.extra_fields.update({"turn_scores": [], "tool_rewards": []})
+
         return output
