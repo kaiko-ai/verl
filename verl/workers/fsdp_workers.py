@@ -817,6 +817,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             aggressive_empty_cache(force_sync=True)
 
+        aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
