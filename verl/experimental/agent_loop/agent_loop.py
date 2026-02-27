@@ -285,6 +285,7 @@ class AgentLoopBase(ABC):
             else:
                 video_metadatas = None
 
+            processor_kwargs = self.config.actor_rollout_ref.model.get("processor_kwargs", {})
             model_inputs = self.processor(
                 text=[raw_prompt],
                 images=images,
@@ -292,6 +293,7 @@ class AgentLoopBase(ABC):
                 video_metadata=video_metadatas,
                 return_tensors="pt",
                 do_sample_frames=False,
+                **processor_kwargs
             )
             prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
         else:
