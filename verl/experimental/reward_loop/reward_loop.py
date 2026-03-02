@@ -276,7 +276,7 @@ class RewardLoopManager:
 
     def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
         self.config = config
-        self.num_examine = config.get("reward_model", {}).get('num_examine', 0)
+        self.num_examine = config.get("reward", {}).get("reward_model", {}).get('num_examine', 0)
         if self.config.reward.reward_model.enable:
             self.reward_model_manager = RewardModelManager(config.reward.reward_model, rm_resource_pool)
             self.reward_router_address = self.reward_model_manager.get_router_address()

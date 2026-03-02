@@ -231,7 +231,7 @@ class vLLMHttpServer:
             set_expandable_segments(True)
 
         quantization = self.config.quantization
-        hf_overrides = {}
+        hf_overrides = self.model_config.get("override_config", {})
 
         # Handle QAT (Quantization-Aware Training) configuration
         qat_config_dict = getattr(self.config, "qat", {}) or {}
