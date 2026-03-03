@@ -21,13 +21,13 @@ import numpy as np
 import ray
 from omegaconf import DictConfig
 
+import verl.experimental.agent_loop.agent_loop as _base_agent_loop
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
     AgentLoopWorker,
     AsyncLLMServerManager,
     DictConfigWrap,
-    _agent_loop_registry,
     get_trajectory_info,
 )
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
@@ -87,24 +87,6 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
     ):
         self.server_manager = FullyAsyncLLMServerManager(config, server_handles)
         super().__init__(config, server_handles, reward_loop_worker_handles)
-        # The base class registers custom agents into its own module's _agent_loop_registry,
-        # which can be a different object than ours if Python loaded the module twice
-        # (e.g. editable install + pip install). Sync them.
-        import sys
-        import verl.experimental.agent_loop.agent_loop as _base_al_module
-        dupes = {k: v for k, v in sys.modules.items() if 'agent_loop' in k}
-        logger.warning(f"[FullyAsyncAgentLoopWorker] sys.modules agent_loop entries: {list(dupes.keys())}")
-        logger.warning(
-            f"[FullyAsyncAgentLoopWorker] this module: {__name__} from {__file__}, "
-            f"base module: {_base_al_module.__name__} from {_base_al_module.__file__}"
-        )
-        if id(_agent_loop_registry) != id(_base_al_module._agent_loop_registry):
-            logger.warning(
-                f"[FullyAsyncAgentLoopWorker] registry mismatch detected! "
-                f"local id={id(_agent_loop_registry)}, base id={id(_base_al_module._agent_loop_registry)}. "
-                f"Syncing {set(_base_al_module._agent_loop_registry) - set(_agent_loop_registry)} from base."
-            )
-            _agent_loop_registry.update(_base_al_module._agent_loop_registry)
         # A shared cancellation event for all agent loops running on this worker.
         self.cancellation_event = asyncio.Event()
 
@@ -197,16 +179,15 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
                 validate=trajectory["validate"],
                 name="agent_loop",
             ):
-                logger.warning(
-                    f"[_partial_run_agent_loop] looking up agent_name={agent_name!r}, "
-                    f"registry={list(_agent_loop_registry.keys())}, "
-                    f"id(_agent_loop_registry)={id(_agent_loop_registry)}"
-                )
-                assert agent_name in _agent_loop_registry, (
-                    f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+                # Always access the registry through the base module attribute to avoid
+                # stale references from `from ... import` when the module is re-loaded
+                # in Ray worker processes (e.g. dual sys.path entries).
+                registry = _base_agent_loop._agent_loop_registry
+                assert agent_name in registry, (
+                    f"Agent loop {agent_name} not registered, registered agent loops: {registry.keys()}"
                 )
 
-                agent_loop_config = _agent_loop_registry[agent_name]
+                agent_loop_config = registry[agent_name]
                 agent_loop = hydra.utils.instantiate(
                     config=agent_loop_config,
                     trainer_config=DictConfigWrap(config=self.config),
@@ -215,11 +196,6 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
                     processor=self.processor,
                     dataset_cls=self.dataset_cls,
                     dataset_config=DictConfigWrap(config=self.config.data),
-                )
-                logger.warning(
-                    f"[_partial_run_agent_loop] agent_name={agent_name}, "
-                    f"agent_class={type(agent_loop).__module__}.{type(agent_loop).__qualname__}, "
-                    f"has_processor={agent_loop.processor is not None}"
                 )
                 output: AgentLoopOutput = await agent_loop.run(
                     sampling_params, cancellation_event=self.cancellation_event, **kwargs
