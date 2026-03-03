@@ -421,7 +421,7 @@ def _auto_attach_trace_conversation(result) -> None:
     images = None
     multi_modal = getattr(result, "multi_modal_data", None)
     if isinstance(multi_modal, dict):
-        images = multi_modal.get("image")
+        images = multi_modal.get("images")
     arize = RolloutTraceConfig.get_instance().arize_config
     rollout_trace_attach_conversation(
         messages=messages,
