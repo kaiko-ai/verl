@@ -193,6 +193,11 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
                     dataset_cls=self.dataset_cls,
                     dataset_config=DictConfigWrap(config=self.config.data),
                 )
+                logger.warning(
+                    f"[_partial_run_agent_loop] agent_name={agent_name}, "
+                    f"agent_class={type(agent_loop).__module__}.{type(agent_loop).__qualname__}, "
+                    f"has_processor={agent_loop.processor is not None}"
+                )
                 output: AgentLoopOutput = await agent_loop.run(
                     sampling_params, cancellation_event=self.cancellation_event, **kwargs
                 )
