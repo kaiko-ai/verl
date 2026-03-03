@@ -14,6 +14,7 @@
 
 import asyncio
 import logging
+import time
 from collections import deque
 from typing import Any
 
@@ -114,6 +115,32 @@ class MessageQueue:
             data = self.queue.popleft()
             self.total_consumed += 1
             return data, len(self.queue)
+
+    async def get_samples(self, n: int, timeout: float = 5.0) -> tuple[list[Any], int]:
+        """Get up to n samples in bulk. Waits until n are available or timeout expires.
+
+        Returns:
+            tuple: (list of samples, remaining queue length)
+                   Empty list signals shutdown.
+        """
+        deadline = time.monotonic() + timeout
+        async with self._lock:
+            while len(self.queue) < n and self.running:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._consumer_condition.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+
+            if not self.running and len(self.queue) == 0:
+                return [], 0
+
+            count = min(n, len(self.queue))
+            samples = [self.queue.popleft() for _ in range(count)]
+            self.total_consumed += count
+            return samples, len(self.queue)
 
     async def update_param_version(self, version: int):
         """Update current parameter version"""
@@ -255,6 +282,10 @@ class MessageQueueClient:
     def get_sample_sync(self) -> Any | None:
         """Get single sample from queue (sync - deprecated, use get_sample instead)"""
         return ray.get(self.queue_actor.get_sample.remote())
+
+    def get_samples_sync(self, n: int, timeout: float = 5.0) -> tuple[list[Any], int]:
+        """Get up to n samples in bulk (sync). Returns (samples, queue_len)."""
+        return ray.get(self.queue_actor.get_samples.remote(n, timeout))
 
     def get_statistics_sync(self) -> dict[str, Any]:
         """Get statistics (sync - deprecated, use get_statistics instead)"""

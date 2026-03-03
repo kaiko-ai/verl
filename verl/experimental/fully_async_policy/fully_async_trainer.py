@@ -201,27 +201,29 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             flush=True,
         )
 
-        # Collect samples using a simple loop calling get_sample
+        # Collect samples in bulk RPCs (with timeout fallback for slow rollouts)
         consumer_start = time.time()
         queue_samples = []
         queue_len = 0
         while len(queue_samples) < self.required_samples:
-            # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = self.message_queue_client.get_sample_sync()
+            remaining = self.required_samples - len(queue_samples)
+            batch, queue_len = self.message_queue_client.get_samples_sync(remaining, timeout=5.0)
 
-            if sample is None:
+            if not batch:
+                if queue_len == 0:
+                    print(
+                        f"[FullyAsyncTrainer] Detected termination signal, stopping sample collection. "
+                        f"Collected {len(queue_samples)}/{self.required_samples} samples"
+                    )
+                    break
+                continue
+
+            queue_samples.extend(batch)
+
+            if len(queue_samples) < self.required_samples:
                 print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
-                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
-                )
-                break
-
-            queue_samples.append(sample)
-
-            if len(queue_samples) % 64 == 0:
-                print(
-                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
-                    f"mq_len: {queue_len}"
+                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples, "
+                    f"waiting... mq_len: {queue_len}"
                 )
 
         consumer_end = time.time()
