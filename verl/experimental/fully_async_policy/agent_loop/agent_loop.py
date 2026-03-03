@@ -86,9 +86,25 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
         self.server_manager = FullyAsyncLLMServerManager(config, server_handles)
-        logger.warning(f"[FullyAsyncAgentLoopWorker] calling super().__init__, registry before: {list(_agent_loop_registry.keys())}")
         super().__init__(config, server_handles, reward_loop_worker_handles)
-        logger.warning(f"[FullyAsyncAgentLoopWorker] super().__init__ done, registry after: {list(_agent_loop_registry.keys())}")
+        # The base class registers custom agents into its own module's _agent_loop_registry,
+        # which can be a different object than ours if Python loaded the module twice
+        # (e.g. editable install + pip install). Sync them.
+        import sys
+        import verl.experimental.agent_loop.agent_loop as _base_al_module
+        dupes = {k: v for k, v in sys.modules.items() if 'agent_loop' in k}
+        logger.warning(f"[FullyAsyncAgentLoopWorker] sys.modules agent_loop entries: {list(dupes.keys())}")
+        logger.warning(
+            f"[FullyAsyncAgentLoopWorker] this module: {__name__} from {__file__}, "
+            f"base module: {_base_al_module.__name__} from {_base_al_module.__file__}"
+        )
+        if id(_agent_loop_registry) != id(_base_al_module._agent_loop_registry):
+            logger.warning(
+                f"[FullyAsyncAgentLoopWorker] registry mismatch detected! "
+                f"local id={id(_agent_loop_registry)}, base id={id(_base_al_module._agent_loop_registry)}. "
+                f"Syncing {set(_base_al_module._agent_loop_registry) - set(_agent_loop_registry)} from base."
+            )
+            _agent_loop_registry.update(_base_al_module._agent_loop_registry)
         # A shared cancellation event for all agent loops running on this worker.
         self.cancellation_event = asyncio.Event()
 
