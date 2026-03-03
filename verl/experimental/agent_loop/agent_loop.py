@@ -380,11 +380,25 @@ class AgentLoopWorker:
         self.processor = hf_processor(local_path, trust_remote_code=True)
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
+        logger.warning(
+            f"[AgentLoopWorkerBase] agent_loop_config_path={agent_loop_config_path!r}, "
+            f"type={type(agent_loop_config_path).__name__}, "
+            f"truthiness={bool(agent_loop_config_path)}"
+        )
         if agent_loop_config_path:
-            resolved_path = resolve_config_path(agent_loop_config_path)
-            agent_loop_configs = OmegaConf.load(resolved_path)
-            for agent_loop_config in agent_loop_configs:
-                _agent_loop_registry[agent_loop_config.name] = agent_loop_config
+            try:
+                resolved_path = resolve_config_path(agent_loop_config_path)
+                logger.warning(f"[AgentLoopWorkerBase] resolved to: {resolved_path}")
+                agent_loop_configs = OmegaConf.load(resolved_path)
+                logger.warning(f"[AgentLoopWorkerBase] loaded {len(agent_loop_configs)} agent configs")
+                for agent_loop_config in agent_loop_configs:
+                    logger.warning(f"[AgentLoopWorkerBase] registering: {agent_loop_config.name}")
+                    _agent_loop_registry[agent_loop_config.name] = agent_loop_config
+            except Exception as e:
+                logger.error(f"[AgentLoopWorkerBase] failed to load agent_loop_config: {e}", exc_info=True)
+        else:
+            logger.warning("[AgentLoopWorkerBase] agent_loop_config_path is falsy, skipping")
+        logger.warning(f"[AgentLoopWorkerBase] registry keys: {list(_agent_loop_registry.keys())}, id={id(_agent_loop_registry)}")
         if self.config.actor_rollout_ref.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
                 self.processor.chat_template = self.config.actor_rollout_ref.model.custom_chat_template

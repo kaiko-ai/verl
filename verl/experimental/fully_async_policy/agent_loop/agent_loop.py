@@ -86,7 +86,9 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
         self.server_manager = FullyAsyncLLMServerManager(config, server_handles)
+        logger.warning(f"[FullyAsyncAgentLoopWorker] calling super().__init__, registry before: {list(_agent_loop_registry.keys())}")
         super().__init__(config, server_handles, reward_loop_worker_handles)
+        logger.warning(f"[FullyAsyncAgentLoopWorker] super().__init__ done, registry after: {list(_agent_loop_registry.keys())}")
         # A shared cancellation event for all agent loops running on this worker.
         self.cancellation_event = asyncio.Event()
 
@@ -179,6 +181,11 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
                 validate=trajectory["validate"],
                 name="agent_loop",
             ):
+                logger.warning(
+                    f"[_partial_run_agent_loop] looking up agent_name={agent_name!r}, "
+                    f"registry={list(_agent_loop_registry.keys())}, "
+                    f"id(_agent_loop_registry)={id(_agent_loop_registry)}"
+                )
                 assert agent_name in _agent_loop_registry, (
                     f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
                 )
