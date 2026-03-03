@@ -116,12 +116,12 @@ class MessageQueue:
             self.total_consumed += 1
             return data, len(self.queue)
 
-    async def get_samples(self, n: int, timeout: float = 5.0) -> tuple[list[Any], int]:
+    async def get_samples(self, n: int, timeout: float = 5.0) -> tuple[list[Any], int] | None:
         """Get up to n samples in bulk. Waits until n are available or timeout expires.
 
         Returns:
-            tuple: (list of samples, remaining queue length)
-                   Empty list signals shutdown.
+            None if the queue is shut down and empty (termination signal).
+            tuple: (list of samples, remaining queue length) otherwise.
         """
         deadline = time.monotonic() + timeout
         async with self._lock:
@@ -135,7 +135,7 @@ class MessageQueue:
                     break
 
             if not self.running and len(self.queue) == 0:
-                return [], 0
+                return None
 
             count = min(n, len(self.queue))
             samples = [self.queue.popleft() for _ in range(count)]
@@ -283,8 +283,8 @@ class MessageQueueClient:
         """Get single sample from queue (sync - deprecated, use get_sample instead)"""
         return ray.get(self.queue_actor.get_sample.remote())
 
-    def get_samples_sync(self, n: int, timeout: float = 5.0) -> tuple[list[Any], int]:
-        """Get up to n samples in bulk (sync). Returns (samples, queue_len)."""
+    def get_samples_sync(self, n: int, timeout: float = 5.0) -> tuple[list[Any], int] | None:
+        """Get up to n samples in bulk (sync). Returns (samples, queue_len) or None on shutdown."""
         return ray.get(self.queue_actor.get_samples.remote(n, timeout))
 
     def get_statistics_sync(self) -> dict[str, Any]:

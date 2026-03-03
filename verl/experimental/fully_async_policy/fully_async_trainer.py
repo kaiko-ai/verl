@@ -207,17 +207,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         queue_len = 0
         while len(queue_samples) < self.required_samples:
             remaining = self.required_samples - len(queue_samples)
-            batch, queue_len = self.message_queue_client.get_samples_sync(remaining, timeout=5.0)
+            result = self.message_queue_client.get_samples_sync(remaining, timeout=5.0)
 
-            if not batch:
-                if queue_len == 0:
-                    print(
-                        f"[FullyAsyncTrainer] Detected termination signal, stopping sample collection. "
-                        f"Collected {len(queue_samples)}/{self.required_samples} samples"
-                    )
-                    break
-                continue
+            if result is None:
+                print(
+                    f"[FullyAsyncTrainer] Detected termination signal, stopping sample collection. "
+                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
+                )
+                break
 
+            batch, queue_len = result
             queue_samples.extend(batch)
 
             if len(queue_samples) < self.required_samples:
