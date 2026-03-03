@@ -70,12 +70,18 @@ class MessageQueue:
         Put a batch sample into the queue
 
         Args:
-            sample: Sample data
+            sample: Sample data (None triggers shutdown)
             param_version: Parameter version number
 
         Returns:
             bool: Whether the sample was successfully put into the queue
         """
+        if sample is None:
+            async with self._lock:
+                self.running = False
+                self._consumer_condition.notify_all()
+            return True
+
         async with self._lock:
             # If queue is full, remove the oldest sample (rarely happens)
             is_drop = False
