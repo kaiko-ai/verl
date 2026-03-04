@@ -130,13 +130,31 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
     def _sync_vllm_weights_via_server_adapter(self, params, sync_group_name):
         """Sync weights when rollout uses ServerAdapter (async disaggregated mode).
 
-        Same NCCL broadcast as _sync_vllm_weights, but instead of directly updating
-        inference_model, accumulates tensors and forwards via ServerAdapter.update_weights()
-        which sends to the vLLM server process via IPC.
+        Streams weights from NCCL broadcast directly to ServerAdapter.update_weights()
+        via a thread-safe queue, avoiding accumulating all weights in GPU memory.
+        Weights are cast to bf16 before IPC transfer since the vLLM model uses bf16
+        and individual fp32 tensors (e.g. embed_tokens) can exceed the IPC bucket size.
         """
+        import asyncio
+        import queue as queue_module
+
         from ray.util.collective import collective
 
-        accumulated_weights = []
+        weight_queue = queue_module.Queue(maxsize=2)
+
+        def streaming_weight_generator():
+            while True:
+                item = weight_queue.get()
+                if item is None:
+                    return
+                yield item
+
+        async def run_ipc_update():
+            await self.rollout.update_weights(streaming_weight_generator())
+
+        if self._is_rollout:
+            ipc_future = asyncio.run_coroutine_threadsafe(run_ipc_update(), self._bg_loop)
+
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
@@ -148,12 +166,13 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
                     tensor.copy_(origin_data)
             collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
             if self._is_rollout:
-                accumulated_weights.append((key, tensor))
+                if tensor.dtype == torch.float32:
+                    tensor = tensor.to(torch.bfloat16)
+                weight_queue.put((key, tensor))
 
-        if self._is_rollout and accumulated_weights:
-            self._run_async_safely(
-                self.rollout.update_weights(iter(accumulated_weights))
-            )
+        if self._is_rollout:
+            weight_queue.put(None)
+            ipc_future.result()
 
     def cache_actor_weights_to_cpu(self):
         self.cpu_named_params = {}
