@@ -65,11 +65,17 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
         inference_model = None
         if self._is_rollout:
             if rollout_name == "vllm":
-                inference_model = BaseDetachNcclSync.get_inference_model(self.rollout)
+                from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter as VllmServerAdapter
 
-                from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+                if isinstance(self.rollout, VllmServerAdapter):
+                    # ServerAdapter has no inference_engine — use IPC-based weight sync
+                    inference_model = None
+                else:
+                    inference_model = BaseDetachNcclSync.get_inference_model(self.rollout)
 
-                patch_vllm_moe_model_weight_loader(inference_model)
+                    from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+                    patch_vllm_moe_model_weight_loader(inference_model)
             elif rollout_name == "sglang":
                 inference_model = self.rollout._engine
                 # For ServerAdapter, _engine might be None and needs async initialization
@@ -112,12 +118,42 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
 
         if rollout_name == "sglang" and self._is_rollout:
             self._sync_sglang_weights(inference_model, params, sync_group_name)
+        elif rollout_name == "vllm" and self._is_rollout and inference_model is None:
+            self._sync_vllm_weights_via_server_adapter(params, sync_group_name)
         else:
             self._sync_vllm_weights(inference_model, params, sync_group_name)
 
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         get_torch_device().empty_cache()
+
+    def _sync_vllm_weights_via_server_adapter(self, params, sync_group_name):
+        """Sync weights when rollout uses ServerAdapter (async disaggregated mode).
+
+        Same NCCL broadcast as _sync_vllm_weights, but instead of directly updating
+        inference_model, accumulates tensors and forwards via ServerAdapter.update_weights()
+        which sends to the vLLM server process via IPC.
+        """
+        from ray.util.collective import collective
+
+        accumulated_weights = []
+        for key, shape, dtype in self._weights_info:
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            if self._is_actor:
+                assert key in params
+                origin_data = params[key]
+                if hasattr(origin_data, "full_tensor"):
+                    origin_data = origin_data.full_tensor()
+                if torch.distributed.get_rank() == 0:
+                    tensor.copy_(origin_data)
+            collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
+            if self._is_rollout:
+                accumulated_weights.append((key, tensor))
+
+        if self._is_rollout and accumulated_weights:
+            self._run_async_safely(
+                self.rollout.update_weights(iter(accumulated_weights))
+            )
 
     def cache_actor_weights_to_cpu(self):
         self.cpu_named_params = {}
