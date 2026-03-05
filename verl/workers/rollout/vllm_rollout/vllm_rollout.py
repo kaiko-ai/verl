@@ -151,8 +151,25 @@ class ServerAdapter(BaseRollout):
             await self._execute_method("sleep", kwargs={"level": self.sleep_level})
 
     @torch.no_grad()
-    async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
-        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
+    async def update_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        *,
+        ipc_buffer: Optional[torch.Tensor] = None,
+        ipc_handle=None,
+        **kwargs,
+    ):
+        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers.
+
+        Args:
+            weights: Generator of (name, tensor) pairs.
+            ipc_buffer: Optional pre-allocated CUDA IPC buffer. When provided with
+                ipc_handle, skips buffer allocation and reduce_tensor() call. This is
+                needed when update_weights runs in a background thread, since
+                reduce_tensor (CUDA IPC handle creation) is not thread-safe and causes
+                SIGSEGV after repeated calls from non-main threads.
+            ipc_handle: Pre-computed IPC handle from reduce_tensor(ipc_buffer).
+        """
         start_time = time.time()
 
         future = await self._execute_method(
@@ -169,8 +186,12 @@ class ServerAdapter(BaseRollout):
 
         buffer, shm = None, None
         if not self.use_shm:
-            buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:0")
-            handle = reduce_tensor(buffer)
+            if ipc_buffer is not None and ipc_handle is not None:
+                buffer = ipc_buffer
+                handle = ipc_handle
+            else:
+                buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:0")
+                handle = reduce_tensor(buffer)
             s.send_pyobj(handle)
         else:
             import uuid

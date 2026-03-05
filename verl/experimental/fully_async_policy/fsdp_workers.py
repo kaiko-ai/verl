@@ -134,11 +134,26 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
         via a thread-safe queue, avoiding accumulating all weights in GPU memory.
         Weights are cast to bf16 before IPC transfer since the vLLM model uses bf16
         and individual fp32 tensors (e.g. embed_tokens) can exceed the IPC bucket size.
+
+        The IPC buffer and handle are pre-created in the main thread because
+        reduce_tensor() (CUDA IPC handle creation) is not thread-safe — calling it
+        repeatedly from the background event loop thread causes SIGSEGV in
+        torch::GetNewRefCountedSentData after several syncs.
         """
         import asyncio
         import queue as queue_module
 
         from ray.util.collective import collective
+
+        # Pre-create IPC buffer and handle in the main thread where CUDA IPC is safe.
+        ipc_buffer = None
+        ipc_handle = None
+        if self._is_rollout and not self.rollout.use_shm:
+            from torch.multiprocessing.reductions import reduce_tensor
+
+            bucket_size = int(self.rollout.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+            ipc_buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{device_name}:0")
+            ipc_handle = reduce_tensor(ipc_buffer)
 
         weight_queue = queue_module.Queue(maxsize=2)
 
@@ -150,7 +165,11 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
                 yield item
 
         async def run_ipc_update():
-            await self.rollout.update_weights(streaming_weight_generator())
+            await self.rollout.update_weights(
+                streaming_weight_generator(),
+                ipc_buffer=ipc_buffer,
+                ipc_handle=ipc_handle,
+            )
 
         if self._is_rollout:
             ipc_future = asyncio.run_coroutine_threadsafe(run_ipc_update(), self._bg_loop)
