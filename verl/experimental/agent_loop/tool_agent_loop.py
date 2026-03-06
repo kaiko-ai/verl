@@ -37,7 +37,7 @@ from verl.interactions.utils.interaction_registry import initialize_interactions
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
-from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_op
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -92,6 +92,10 @@ class AgentData:
 
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
+
+        # Trace-only: decoded conversation with assistant text.
+        # Needed because self.messages never has assistant turns in non-interaction mode.
+        self.trace_messages: list[dict] | None = None
 
 
 @register("tool_agent")
@@ -172,6 +176,9 @@ class ToolAgentLoop(AgentLoopBase):
             interaction_kwargs=interaction_kwargs,
         )
 
+        if RolloutTraceConfig.get_backend() is not None:
+            agent_data.trace_messages = list(messages)
+
         # State machine loop
         state = AgentState.PENDING
         while state != AgentState.TERMINATED:
@@ -209,6 +216,10 @@ class ToolAgentLoop(AgentLoopBase):
             extra_fields={},
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+
+        if agent_data.trace_messages is not None:
+            output.trace_conversation = agent_data.trace_messages
+
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -252,6 +263,13 @@ class ToolAgentLoop(AgentLoopBase):
 
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
+
+        if agent_data.trace_messages is not None:
+            _resp_ids = agent_data.response_ids
+            assistant_text = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(_resp_ids, skip_special_tokens=True)
+            )
+            agent_data.trace_messages.append({"role": "assistant", "content": assistant_text})
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
@@ -345,6 +363,9 @@ class ToolAgentLoop(AgentLoopBase):
                 agent_data.tool_rewards.append(tool_reward)
 
         agent_data.messages.extend(add_messages)
+
+        if agent_data.trace_messages is not None:
+            agent_data.trace_messages.extend(add_messages)
 
         if self.tool_parser_name == "gpt-oss":
             logger.info("manually format tool responses for gpt-oss")
