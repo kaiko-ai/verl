@@ -53,9 +53,6 @@ class ParameterSynchronizer:
         self._init_weights_info()
         self._init_sync_group()
 
-        if self.config.async_training.checkpoint_engine.enable:
-            self._init_actor_rollout_checkpoint_engine()
-
     def get_current_param_version(self) -> int:
         """Get current parameter version number"""
         return self.current_version
@@ -98,22 +95,6 @@ class ParameterSynchronizer:
                 group_name=self.sync_group_name,
             )
 
-    def _init_actor_rollout_checkpoint_engine(self):
-        ray.get(
-            self.actor_wg.init_checkpoint_engine(
-                rank_offset=0,
-                actor_num=len(self.actor_wg.workers),
-                rollout_num=len(self.rollout_wg.workers),
-            )
-        )
-        ray.get(
-            self.rollout_wg.init_checkpoint_engine(
-                rank_offset=len(self.actor_wg.workers),
-                actor_num=len(self.actor_wg.workers),
-                rollout_num=len(self.rollout_wg.workers),
-            )
-        )
-
     def sync_weights(self, version, validate=False, global_steps=0, use_trainer_do_validate=False):
         """Sync weights between trainer and rollouter, and update parameter version"""
         start_time = time.time()
@@ -127,18 +108,9 @@ class ParameterSynchronizer:
 
         pause_time = time.time()
 
-        # sync weights
-        # For sglang, always use sync_rollout_weights instead of sync_rollout_weights_by_checkpoint
-
-        # TODO use checkpoint engine for sglang rollout
-        # rollout_name = getattr(self.config.actor_rollout_ref.rollout, "name", None)
-        # use_checkpoint_engine = self.config.async_training.checkpoint_engine.enable and rollout_name != "sglang"
-        # if use_checkpoint_engine:
-        #     self.actor_wg.sync_rollout_weights_by_checkpoint(self.sync_group_name)
-        #     ray.get(self.rollout_wg.sync_rollout_weights_by_checkpoint(self.sync_group_name))
-        # else:
-        #     self.actor_wg.sync_rollout_weights(self.sync_group_name)
-        #     ray.get(self.rollout_wg.sync_rollout_weights(self.sync_group_name))
+        # sync weights via NCCL broadcast + ServerAdapter IPC
+        self.actor_wg.sync_rollout_weights(self.sync_group_name)
+        ray.get(self.rollout_wg.sync_rollout_weights(self.sync_group_name))
 
         end_time = time.time()
         print(

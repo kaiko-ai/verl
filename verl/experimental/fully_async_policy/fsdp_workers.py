@@ -65,11 +65,17 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
         inference_model = None
         if self._is_rollout:
             if rollout_name == "vllm":
-                inference_model = BaseDetachNcclSync.get_inference_model(self.rollout)
+                from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter as VllmServerAdapter
 
-                from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+                if isinstance(self.rollout, VllmServerAdapter):
+                    # ServerAdapter has no inference_engine — use IPC-based weight sync
+                    inference_model = None
+                else:
+                    inference_model = BaseDetachNcclSync.get_inference_model(self.rollout)
 
-                patch_vllm_moe_model_weight_loader(inference_model)
+                    from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+                    patch_vllm_moe_model_weight_loader(inference_model)
             elif rollout_name == "sglang":
                 inference_model = self.rollout._engine
                 # For ServerAdapter, _engine might be None and needs async initialization
@@ -112,12 +118,80 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
 
         if rollout_name == "sglang" and self._is_rollout:
             self._sync_sglang_weights(inference_model, params, sync_group_name)
+        elif rollout_name == "vllm" and self._is_rollout and inference_model is None:
+            self._sync_vllm_weights_via_server_adapter(params, sync_group_name)
         else:
             self._sync_vllm_weights(inference_model, params, sync_group_name)
 
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         get_torch_device().empty_cache()
+
+    def _sync_vllm_weights_via_server_adapter(self, params, sync_group_name):
+        """Sync weights when rollout uses ServerAdapter (async disaggregated mode).
+
+        Streams weights from NCCL broadcast directly to ServerAdapter.update_weights()
+        via a thread-safe queue, avoiding accumulating all weights in GPU memory.
+        Weights are cast to bf16 before IPC transfer since the vLLM model uses bf16
+        and individual fp32 tensors (e.g. embed_tokens) can exceed the IPC bucket size.
+
+        The IPC buffer and handle are pre-created in the main thread because
+        reduce_tensor() (CUDA IPC handle creation) is not thread-safe — calling it
+        repeatedly from the background event loop thread causes SIGSEGV in
+        torch::GetNewRefCountedSentData after several syncs.
+        """
+        import asyncio
+        import queue as queue_module
+
+        from ray.util.collective import collective
+
+        # Pre-create IPC buffer and handle in the main thread where CUDA IPC is safe.
+        ipc_buffer = None
+        ipc_handle = None
+        if self._is_rollout and not self.rollout.use_shm:
+            from torch.multiprocessing.reductions import reduce_tensor
+
+            bucket_size = int(self.rollout.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+            ipc_buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{device_name}:0")
+            ipc_handle = reduce_tensor(ipc_buffer)
+
+        weight_queue = queue_module.Queue(maxsize=2)
+
+        def streaming_weight_generator():
+            while True:
+                item = weight_queue.get()
+                if item is None:
+                    return
+                yield item
+
+        async def run_ipc_update():
+            await self.rollout.update_weights(
+                streaming_weight_generator(),
+                ipc_buffer=ipc_buffer,
+                ipc_handle=ipc_handle,
+            )
+
+        if self._is_rollout:
+            ipc_future = asyncio.run_coroutine_threadsafe(run_ipc_update(), self._bg_loop)
+
+        for key, shape, dtype in self._weights_info:
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            if self._is_actor:
+                assert key in params
+                origin_data = params[key]
+                if hasattr(origin_data, "full_tensor"):
+                    origin_data = origin_data.full_tensor()
+                if torch.distributed.get_rank() == 0:
+                    tensor.copy_(origin_data)
+            collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
+            if self._is_rollout:
+                if tensor.dtype == torch.float32:
+                    tensor = tensor.to(torch.bfloat16)
+                weight_queue.put((key, tensor))
+
+        if self._is_rollout:
+            weight_queue.put(None)
+            ipc_future.result()
 
     def cache_actor_weights_to_cpu(self):
         self.cpu_named_params = {}

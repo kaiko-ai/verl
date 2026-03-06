@@ -201,27 +201,28 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             flush=True,
         )
 
-        # Collect samples using a simple loop calling get_sample
+        # Collect samples in bulk RPCs (with timeout fallback for slow rollouts)
         consumer_start = time.time()
         queue_samples = []
         queue_len = 0
         while len(queue_samples) < self.required_samples:
-            # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = self.message_queue_client.get_sample_sync()
+            remaining = self.required_samples - len(queue_samples)
+            result = self.message_queue_client.get_samples_sync(remaining, timeout=5.0)
 
-            if sample is None:
+            if result is None:
                 print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
+                    f"[FullyAsyncTrainer] Detected termination signal, stopping sample collection. "
                     f"Collected {len(queue_samples)}/{self.required_samples} samples"
                 )
                 break
 
-            queue_samples.append(sample)
+            batch, queue_len = result
+            queue_samples.extend(batch)
 
-            if len(queue_samples) % 64 == 0:
+            if len(queue_samples) < self.required_samples:
                 print(
-                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
-                    f"mq_len: {queue_len}"
+                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples, "
+                    f"waiting... mq_len: {queue_len}"
                 )
 
         consumer_end = time.time()
@@ -237,7 +238,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"mq_len: {queue_len}"
         )
 
-        queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
+        queue_samples = ray.get([ray.cloudpickle.loads(b) for b in queue_samples])
         # Assemble batch - now working directly with RolloutSample objects
         if self.config.trainer.balance_batch:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
