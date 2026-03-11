@@ -63,7 +63,10 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
         rollout_name = self.config.rollout.name
 
         inference_model = None
-        if self._is_rollout:
+        # Only pure rollout workers (not actor+rollout) should load weights into inference engine.
+        # Actor+rollout workers (trainer with use_trainer_do_validate) already have weights in FSDP
+        # and only participate in the NCCL broadcast as the source.
+        if self._is_rollout and not self._is_actor:
             if rollout_name == "vllm":
                 from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter as VllmServerAdapter
 
@@ -116,9 +119,9 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
             else:
                 raise NotImplementedError(f"Unknown rollout name: {rollout_name}")
 
-        if rollout_name == "sglang" and self._is_rollout:
+        if rollout_name == "sglang" and self._is_rollout and not self._is_actor:
             self._sync_sglang_weights(inference_model, params, sync_group_name)
-        elif rollout_name == "vllm" and self._is_rollout and inference_model is None:
+        elif rollout_name == "vllm" and self._is_rollout and not self._is_actor and inference_model is None:
             self._sync_vllm_weights_via_server_adapter(params, sync_group_name)
         else:
             self._sync_vllm_weights(inference_model, params, sync_group_name)
@@ -238,7 +241,7 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
         update_start_time = time.time()
 
         inference_model = None
-        if self._is_rollout:
+        if self._is_rollout and not self._is_actor:
             inference_model = BaseDetachNcclSync.get_inference_model(self.rollout)
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
