@@ -129,9 +129,19 @@ class ServerAdapter(BaseRollout):
         if self.rollout_rank != 0:
             return None
 
-        # Lazy init http server adapter because http server is launched after hybrid engine.
+        # Lazy init: find the vLLM server actor by prefix match.
+        # Server names include a uuid4 suffix for uniqueness (e.g. vllm_server_0_0_a3f8b1c2),
+        # so we search by prefix rather than exact name.
         if self.server_handle is None:
-            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+            prefix = f"vllm_server_{self.replica_rank}_{self.node_rank}"
+            matching = [name for name in ray.util.list_named_actors() if name.startswith(prefix)]
+            if not matching:
+                raise RuntimeError(
+                    f"No vLLM server actor found with prefix '{prefix}'. "
+                    f"Available actors: {ray.util.list_named_actors()}"
+                )
+            self.server_handle = ray.get_actor(matching[0])
+            logger.info(f"Resolved server actor: {matching[0]}")
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
