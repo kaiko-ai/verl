@@ -287,7 +287,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+        self._init_reward_loop()
         await self._init_async_rollout_manager()
+
+    def _init_reward_loop(self):
+        if self.config.async_training.use_trainer_do_validate:
+            # Reuse the reward loop workers already created by the rollouter
+            # (which inits first). Creating new ones would fail with duplicate
+            # actor names. This is safe because RewardLoopWorkers are stateless.
+            from verl.experimental.reward_loop import RewardLoopManager
+
+            num_workers = self.config.reward.num_workers
+            workers = [ray.get_actor(f"reward_loop_worker_{i}") for i in range(num_workers)]
+            self.reward_loop_manager = RewardLoopManager.__new__(RewardLoopManager)
+            self.reward_loop_manager.reward_loop_workers = workers
+            print(f"[FullyAsyncTrainer] Reusing {len(workers)} reward loop workers from rollouter")
 
     async def _init_async_rollout_manager(self):
         # use async rollout do validate

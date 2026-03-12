@@ -72,9 +72,10 @@ class ServerAdapter(BaseRollout):
         config: RolloutConfig,
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
+        server_handle: Optional[ray.actor.ActorHandle] = None,
     ):
         super().__init__(config, model_config, device_mesh)
-        self.server_handle: ray.actor.ActorHandle = None
+        self.server_handle: ray.actor.ActorHandle = server_handle
 
         rank = int(os.environ["RANK"])
         local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
@@ -129,19 +130,32 @@ class ServerAdapter(BaseRollout):
         if self.rollout_rank != 0:
             return None
 
-        # Lazy init: find the vLLM server actor by prefix match.
-        # Server names include a uuid4 suffix for uniqueness (e.g. vllm_server_0_0_a3f8b1c2),
-        # so we search by prefix rather than exact name.
+        # Resolve server handle: prefer direct handle passed at init,
+        # fall back to prefix search for backward compatibility.
         if self.server_handle is None:
             prefix = f"vllm_server_{self.replica_rank}_{self.node_rank}"
-            matching = [name for name in ray.util.list_named_actors() if name.startswith(prefix)]
+            all_actors = ray.util.list_named_actors()
+            matching = [name for name in all_actors if name.startswith(prefix)]
+            _all_vllm = [name for name in all_actors if name.startswith("vllm_server_")]
+            print(
+                f"[ServerAdapter pid={os.getpid()}] FALLBACK prefix search: prefix='{prefix}' "
+                f"matching={matching} all_vllm={_all_vllm}"
+            )
             if not matching:
                 raise RuntimeError(
                     f"No vLLM server actor found with prefix '{prefix}'. "
-                    f"Available actors: {ray.util.list_named_actors()}"
+                    f"Available actors: {all_actors}"
+                )
+            if len(matching) > 1:
+                print(
+                    f"[ServerAdapter pid={os.getpid()}] WARNING AMBIGUOUS: {len(matching)} servers "
+                    f"match prefix '{prefix}': {matching}. Picking {matching[0]}. "
+                    f"This may cause cross-node IPC failures!"
                 )
             self.server_handle = ray.get_actor(matching[0])
-            logger.info(f"Resolved server actor: {matching[0]}")
+            print(f"[ServerAdapter pid={os.getpid()}] Resolved via prefix search: {matching[0]}")
+        else:
+            print(f"[ServerAdapter pid={os.getpid()}] Using pre-assigned server handle (injected)")
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future

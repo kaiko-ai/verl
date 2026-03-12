@@ -57,10 +57,18 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
         assert (self._is_actor or self._is_rollout) and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
 
+        import os
+        _dbg_rank = os.environ.get("RANK", "?")
+        _dbg_pid = os.getpid()
+        _dbg_tag = f"[sync_rollout_weights rank={_dbg_rank} pid={_dbg_pid}]"
+        print(f"{_dbg_tag} START is_actor={self._is_actor} is_rollout={self._is_rollout} "
+              f"offload_param={self._is_offload_param} num_weights={len(self._weights_info)}")
+
         if self._is_actor and self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         params = self._get_actor_params() if self._is_actor else None
         rollout_name = self.config.rollout.name
+        print(f"{_dbg_tag} got params={'yes' if params else 'no'} rollout_name={rollout_name}")
 
         inference_model = None
         # Determine inference model for direct weight loading (non-ServerAdapter rollouts).
@@ -69,7 +77,9 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
             if rollout_name == "vllm":
                 from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter as VllmServerAdapter
 
-                if isinstance(self.rollout, VllmServerAdapter):
+                is_server_adapter = isinstance(self.rollout, VllmServerAdapter)
+                print(f"{_dbg_tag} rollout type={type(self.rollout).__name__} is_ServerAdapter={is_server_adapter}")
+                if is_server_adapter:
                     # ServerAdapter — use IPC-based weight sync (works for both pure rollout and actor+rollout)
                     inference_model = None
                 elif not self._is_actor:
@@ -118,15 +128,20 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
                         )
 
         if rollout_name == "sglang" and self._is_rollout and not self._is_actor:
+            print(f"{_dbg_tag} dispatching to _sync_sglang_weights")
             self._sync_sglang_weights(inference_model, params, sync_group_name)
         elif rollout_name == "vllm" and self._is_rollout and inference_model is None:
+            print(f"{_dbg_tag} dispatching to _sync_vllm_weights_via_server_adapter")
             self._sync_vllm_weights_via_server_adapter(params, sync_group_name)
         else:
+            print(f"{_dbg_tag} dispatching to _sync_vllm_weights (inference_model={'yes' if inference_model else 'no'})")
             self._sync_vllm_weights(inference_model, params, sync_group_name)
 
+        print(f"{_dbg_tag} sync dispatch DONE, cleaning up")
         if self._is_actor and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         get_torch_device().empty_cache()
+        print(f"{_dbg_tag} COMPLETE")
 
     def _sync_vllm_weights_via_server_adapter(self, params, sync_group_name):
         """Sync weights when rollout uses ServerAdapter (async disaggregated mode).
@@ -142,9 +157,21 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
         torch::GetNewRefCountedSentData after several syncs.
         """
         import asyncio
+        import os
         import queue as queue_module
+        import time as _time
 
         from ray.util.collective import collective
+
+        _dbg_rank = os.environ.get("RANK", "?")
+        _dbg_pid = os.getpid()
+        _dbg_tag = f"[server_adapter_sync rank={_dbg_rank} pid={_dbg_pid}]"
+        _t0 = _time.time()
+
+        print(f"{_dbg_tag} ENTER is_actor={self._is_actor} is_rollout={self._is_rollout} "
+              f"use_shm={getattr(self.rollout, 'use_shm', 'N/A')} "
+              f"server_handle={getattr(self.rollout, 'server_handle', 'N/A')} "
+              f"has_bg_loop={hasattr(self, '_bg_loop')}")
 
         # Pre-create IPC buffer and handle in the main thread where CUDA IPC is safe.
         ipc_buffer = None
@@ -153,28 +180,52 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
             from torch.multiprocessing.reductions import reduce_tensor
 
             bucket_size = int(self.rollout.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+            print(f"{_dbg_tag} allocating IPC buffer: {bucket_size >> 20}MB on {device_name}:0")
             ipc_buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{device_name}:0")
+            print(f"{_dbg_tag} IPC buffer allocated, creating IPC handle...")
             ipc_handle = reduce_tensor(ipc_buffer)
+            print(f"{_dbg_tag} IPC handle created (+{_time.time()-_t0:.2f}s)")
+        else:
+            print(f"{_dbg_tag} skipping IPC buffer (is_rollout={self._is_rollout} "
+                  f"use_shm={getattr(self.rollout, 'use_shm', 'N/A')})")
 
         weight_queue = queue_module.Queue(maxsize=2)
+        _consumer_started = [False]
+        _consumer_error = [None]
 
         def streaming_weight_generator():
+            _consumer_started[0] = True
+            print(f"{_dbg_tag} consumer generator STARTED")
+            _count = 0
             while True:
                 item = weight_queue.get()
                 if item is None:
+                    print(f"{_dbg_tag} consumer generator DONE after {_count} items")
                     return
+                _count += 1
                 yield item
 
         async def run_ipc_update():
-            await self.rollout.update_weights(
-                streaming_weight_generator(),
-                ipc_buffer=ipc_buffer,
-                ipc_handle=ipc_handle,
-            )
+            try:
+                print(f"{_dbg_tag} run_ipc_update coroutine STARTED")
+                await self.rollout.update_weights(
+                    streaming_weight_generator(),
+                    ipc_buffer=ipc_buffer,
+                    ipc_handle=ipc_handle,
+                )
+                print(f"{_dbg_tag} run_ipc_update coroutine COMPLETED")
+            except Exception as e:
+                _consumer_error[0] = e
+                print(f"{_dbg_tag} run_ipc_update coroutine FAILED: {type(e).__name__}: {e}")
+                raise
 
         if self._is_rollout:
+            print(f"{_dbg_tag} submitting run_ipc_update to bg_loop...")
             ipc_future = asyncio.run_coroutine_threadsafe(run_ipc_update(), self._bg_loop)
+            print(f"{_dbg_tag} run_ipc_update submitted (+{_time.time()-_t0:.2f}s)")
 
+        print(f"{_dbg_tag} entering weight loop ({len(self._weights_info)} weights) (+{_time.time()-_t0:.2f}s)")
+        _loop_count = 0
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
@@ -189,10 +240,20 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
                 if tensor.dtype == torch.float32:
                     tensor = tensor.to(torch.bfloat16)
                 weight_queue.put((key, tensor))
+            _loop_count += 1
+            if _loop_count <= 3 or _loop_count % 50 == 0:
+                print(f"{_dbg_tag} weight {_loop_count}/{len(self._weights_info)} "
+                      f"key={key[:50]} consumer_started={_consumer_started[0]} "
+                      f"consumer_error={_consumer_error[0]} qsize={weight_queue.qsize()} "
+                      f"(+{_time.time()-_t0:.2f}s)")
+
+        print(f"{_dbg_tag} weight loop DONE ({_loop_count} weights, +{_time.time()-_t0:.2f}s)")
 
         if self._is_rollout:
             weight_queue.put(None)
+            print(f"{_dbg_tag} waiting for ipc_future.result()...")
             ipc_future.result()
+            print(f"{_dbg_tag} ipc_future DONE (+{_time.time()-_t0:.2f}s)")
 
     def cache_actor_weights_to_cpu(self):
         self.cpu_named_params = {}

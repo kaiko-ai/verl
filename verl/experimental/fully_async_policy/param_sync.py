@@ -100,6 +100,9 @@ class ParameterSynchronizer:
         start_time = time.time()
 
         self.current_version = version
+        print(f"[ParameterSynchronizer] sync_weights v={version} validate={validate} "
+              f"use_trainer_do_validate={use_trainer_do_validate} "
+              f"actor_wg_workers={len(self.actor_wg.workers)} rollout_wg_workers={len(self.rollout_wg.workers)}")
         ray.get(self.rollouter.pause.remote())
 
         print(f"[ParameterSynchronizer] rollout paused. cost {time.time() - start_time:.2f} seconds")
@@ -109,8 +112,12 @@ class ParameterSynchronizer:
         pause_time = time.time()
 
         # sync weights via NCCL broadcast + ServerAdapter IPC
-        self.actor_wg.sync_rollout_weights(self.sync_group_name)
+        print(f"[ParameterSynchronizer] dispatching sync_rollout_weights to actor_wg (async)...")
+        actor_sync_refs = self.actor_wg.sync_rollout_weights(self.sync_group_name)
+        print(f"[ParameterSynchronizer] dispatching sync_rollout_weights to rollout_wg (blocking)...")
         ray.get(self.rollout_wg.sync_rollout_weights(self.sync_group_name))
+        ray.get(actor_sync_refs)
+        print(f"[ParameterSynchronizer] both wg sync done")
 
         end_time = time.time()
         print(
