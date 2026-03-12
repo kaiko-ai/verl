@@ -878,40 +878,22 @@ class vLLMReplica(RolloutReplica):
 
         # Inject server handle into rank-0 worker's ServerAdapter to avoid
         # ambiguous prefix search (which can match servers from other replicas).
-        # The worker may be:
-        #   - A standalone ServerAdapter (has server_handle directly)
-        #   - A WorkerDict with inner workers in self.worker_dict[key],
-        #     where the inner worker has self.rollout = ServerAdapter
         handle = self._server_handle
-        print(
-            f"[vLLMReplica] Injecting server handle into rank-0 worker "
-            f"(replica_rank={self.replica_rank}, server_name={name}, "
-            f"num_workers={len(self.workers)}, num_servers={len(self.servers)})"
-        )
 
         def _inject_server_handle(worker, h):
-            import os
-            pid = os.getpid()
             # Case 1: worker IS a ServerAdapter (standalone mode)
             if hasattr(worker, "server_handle") and hasattr(worker, "rollout_rank"):
                 worker.server_handle = h
-                print(f"[vLLMReplica] Injected handle directly on ServerAdapter (pid={pid})")
                 return
             # Case 2: WorkerDict — inner workers in worker_dict
             for key, inner in getattr(worker, "worker_dict", {}).items():
-                # Inner worker has self.rollout = ServerAdapter
                 rollout = getattr(inner, "rollout", None)
                 if rollout is not None and hasattr(rollout, "server_handle"):
                     rollout.server_handle = h
-                    print(f"[vLLMReplica] Injected handle via worker_dict['{key}'].rollout (pid={pid})")
                     return
-                # Inner worker IS a ServerAdapter
                 if hasattr(inner, "server_handle") and hasattr(inner, "rollout_rank"):
                     inner.server_handle = h
-                    print(f"[vLLMReplica] Injected handle via worker_dict['{key}'] (pid={pid})")
                     return
-            print(f"[vLLMReplica] WARNING: could not find ServerAdapter to inject handle (pid={pid}, "
-                  f"type={type(worker).__name__}, worker_dict_keys={list(getattr(worker, 'worker_dict', {}).keys())})")
 
         await self.workers[0].__ray_call__.remote(
             lambda self, h=handle: _inject_server_handle(self, h)

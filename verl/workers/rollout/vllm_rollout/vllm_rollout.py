@@ -136,26 +136,18 @@ class ServerAdapter(BaseRollout):
             prefix = f"vllm_server_{self.replica_rank}_{self.node_rank}"
             all_actors = ray.util.list_named_actors()
             matching = [name for name in all_actors if name.startswith(prefix)]
-            _all_vllm = [name for name in all_actors if name.startswith("vllm_server_")]
-            print(
-                f"[ServerAdapter pid={os.getpid()}] FALLBACK prefix search: prefix='{prefix}' "
-                f"matching={matching} all_vllm={_all_vllm}"
-            )
             if not matching:
                 raise RuntimeError(
                     f"No vLLM server actor found with prefix '{prefix}'. "
                     f"Available actors: {all_actors}"
                 )
             if len(matching) > 1:
-                print(
-                    f"[ServerAdapter pid={os.getpid()}] WARNING AMBIGUOUS: {len(matching)} servers "
-                    f"match prefix '{prefix}': {matching}. Picking {matching[0]}. "
-                    f"This may cause cross-node IPC failures!"
+                logger.warning(
+                    f"Ambiguous server match: {len(matching)} servers match prefix '{prefix}': "
+                    f"{matching}. Picking {matching[0]}."
                 )
             self.server_handle = ray.get_actor(matching[0])
-            print(f"[ServerAdapter pid={os.getpid()}] Resolved via prefix search: {matching[0]}")
-        else:
-            print(f"[ServerAdapter pid={os.getpid()}] Using pre-assigned server handle (injected)")
+            logger.info(f"Resolved server actor: {matching[0]}")
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
