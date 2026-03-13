@@ -616,7 +616,7 @@ class AgentLoopWorker:
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        multi_modal_inputs = await asyncio.to_thread(self._compute_multi_modal_inputs, output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
         await self._compute_score(
             output,
