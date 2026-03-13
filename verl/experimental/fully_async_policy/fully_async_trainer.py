@@ -508,6 +508,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 # wake replicas to avoid OOM during checkpoint saving
                 # self.checkpoint_manager.update_weights()
 
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
+        # In async, generation logging is handled via the MQ path — the rollouter
+        # captures samples and the trainer logs them at param_version. The base
+        # class logs at global_steps which breaks wandb step monotonicity.
+        pass
+
     def _fit_postprocess_step(self):
         self.global_steps += 1
 
