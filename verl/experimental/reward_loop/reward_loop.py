@@ -274,10 +274,13 @@ class RewardLoopManager:
     This class will create reward loop workers and manage them.
     """
 
-    def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
+    def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None, reward_router_address: str = None):
         self.config = config
         self.num_examine = config.get("reward", {}).get("reward_model", {}).get('num_examine', 0)
-        if self.config.reward.reward_model.enable:
+        if reward_router_address is not None:
+            self.reward_model_manager = None
+            self.reward_router_address = reward_router_address
+        elif self.config.reward.reward_model.enable:
             self.reward_model_manager = RewardModelManager(config.reward.reward_model, rm_resource_pool)
             self.reward_router_address = self.reward_model_manager.get_router_address()
         else:
