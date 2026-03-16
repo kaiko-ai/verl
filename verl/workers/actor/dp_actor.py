@@ -70,9 +70,7 @@ class DataParallelPPOActor(BasePPOActor):
         # Sync micro-batch counts across all ranks when using dynamic bsz.
         # Without this, prepare_dynamic_batch can produce different micro-batch
         # counts per rank, causing NCCL deadlock during FSDP collectives.
-        import torch.distributed as dist
-
-        self.fsdp_group = dist.group.WORLD if dist.is_initialized() else None
+        self.fsdp_group = torch.distributed.group.WORLD if torch.distributed.is_initialized() else None
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         if torch.distributed.get_rank() == 0:

@@ -282,7 +282,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
-        # self._init_async_objects()
         self._init_resource_pools()
         self._create_worker_classes()
         self._init_worker_groups()
@@ -469,9 +468,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._log_validation_data()
 
     async def _fit_update_weights(self):
-        # with marked_timer("update_weights", self.timing_raw, color="red"):
-        #     self.checkpoint_manager.update_weights()
-
         # Trigger parameter synchronization after training step
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
@@ -502,11 +498,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
             with marked_timer("save_checkpoint", timing_raw, color="green"):
-                # sleep replicas to avoid OOM during checkpoint saving
-                # self.checkpoint_manager.sleep_replicas()
                 self._save_checkpoint()
-                # wake replicas to avoid OOM during checkpoint saving
-                # self.checkpoint_manager.update_weights()
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         # In async, generation logging is handled via the MQ path — the rollouter

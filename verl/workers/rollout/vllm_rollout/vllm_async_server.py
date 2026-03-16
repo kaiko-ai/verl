@@ -894,6 +894,12 @@ class vLLMReplica(RolloutReplica):
                 if hasattr(inner, "server_handle") and hasattr(inner, "rollout_rank"):
                     inner.server_handle = h
                     return
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Failed to inject server handle — no ServerAdapter found in worker. "
+                "Falling back to prefix-based actor lookup."
+            )
 
         await self.workers[0].__ray_call__.remote(
             lambda self, h=handle: _inject_server_handle(self, h)
