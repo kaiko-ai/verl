@@ -34,7 +34,13 @@ from verl.utils.fsdp_utils import (
     load_fsdp_model_to_gpu,
     offload_fsdp_model_to_cpu,
 )
+from verl.utils.import_utils import import_external_libs
+from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.profiler import log_gpu_memory_usage
+from verl.utils.config import omega_conf_to_dataclass
+from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker, CriticWorker
+from verl.workers.rollout import get_rollout_class
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -341,17 +347,11 @@ class DetachAsyncRolloutWorker(DetachNcclSync):
     # is created for the rollout worker, which takes up gpu unnecessarily
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        from verl.workers.actor import DataParallelPPOActor
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
         # Initialize QAT config before _build_model_optimizer
         self._init_qat_config()
-
-        override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
-        use_remove_padding = self.config.model.get("use_remove_padding", False)
-        use_shm = self.config.model.get("use_shm", False)
-        use_fused_kernels = self.config.model.get("use_fused_kernels", False)
         self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
         # Free PyTorch's cached-but-unused CUDA memory after init so that
         # vLLM MP Executor workers (separate processes) see it as available.
@@ -397,6 +397,6 @@ class DetachAsyncRolloutWorker(DetachNcclSync):
             config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
-                # used for LoRA
+        # used for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
         self.layered_summon = self.config.rollout.get("layered_summon", False)
