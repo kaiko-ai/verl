@@ -25,11 +25,13 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl.experimental.fully_async_policy.base_detach_sync import BaseDetachNcclSync
 from verl.experimental.fully_async_policy.fsdp2_utils import fsdp2_sharded_load_from_cpu, fsdp2_sharded_save_to_cpu
 from verl.single_controller.base.decorator import Dispatch, register
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
     get_device_name,
     get_torch_device,
 )
 from verl.utils.fsdp_utils import (
+    collect_lora_params,
     fsdp_version,
     load_fsdp_model_to_gpu,
     offload_fsdp_model_to_cpu,
@@ -37,7 +39,6 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import log_gpu_memory_usage
-from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker, CriticWorker
 from verl.workers.rollout import get_rollout_class
@@ -172,10 +173,13 @@ class DetachNcclSync(BaseDetachNcclSync, AsyncActorRolloutRefWorker):
                 yield item
 
         async def run_ipc_update():
+            peft_config = getattr(self, "_peft_config", None)
             await self.rollout.update_weights(
                 streaming_weight_generator(),
                 ipc_buffer=ipc_buffer,
                 ipc_handle=ipc_handle,
+                peft_config=peft_config,
+                base_sync_done=bool(peft_config),
             )
 
         if self._is_rollout:
@@ -287,8 +291,22 @@ class DetachActorWorker(DetachNcclSync):
 
     def _get_actor_params(self):
         assert self._is_actor
-        params = self.actor_module_fsdp.state_dict()
         from verl.utils.model import convert_weight_keys
+
+        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        if hasattr(peft_model, "peft_config"):
+            from dataclasses import asdict
+
+            peft_cfg = peft_model.peft_config.get("default", None)
+            self._peft_config = asdict(peft_cfg) if peft_cfg else None
+            params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=False,
+                base_sync_done=True,
+            )
+        else:
+            self._peft_config = None
+            params = self.actor_module_fsdp.state_dict()
 
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
@@ -299,7 +317,7 @@ class DetachActorWorker(DetachNcclSync):
     def get_actor_weights_info(self):
         assert self._is_actor
         if hasattr(self, "_weights_info"):
-            return self._weights_info
+            return self._weights_info, getattr(self, "_peft_config", None)
         if fsdp_version(self.actor_module_fsdp) == 1:
             from torch.distributed.fsdp.api import ShardedStateDictConfig, StateDictType
 
@@ -313,7 +331,7 @@ class DetachActorWorker(DetachNcclSync):
         for key, tensor in params.items():
             ret.append((key, tensor.size(), tensor.dtype))
         self._weights_info = ret
-        return ret
+        return ret, self._peft_config
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_model_to_cpu(self, n):
@@ -339,9 +357,10 @@ class DetachAsyncRolloutWorker(DetachNcclSync):
         DetachNcclSync.__init__(self, config, role)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def set_actor_weights_info(self, weights_info):
+    def set_actor_weights_info(self, weights_info, peft_config=None):
         assert self._is_rollout
         self._weights_info = weights_info
+        self._peft_config = peft_config
 
     # overwrite the following two functions in AsyncActorRolloutRefWorker so that no FSDP module
     # is created for the rollout worker, which takes up gpu unnecessarily

@@ -62,8 +62,8 @@ class ParameterSynchronizer:
         return self.weights_info
 
     def _init_weights_info(self):
-        self.weights_info = self.actor_wg.get_actor_weights_info()[0]
-        self.rollout_wg.set_actor_weights_info(self.weights_info)
+        self.weights_info, peft_config = self.actor_wg.get_actor_weights_info()[0]
+        self.rollout_wg.set_actor_weights_info(self.weights_info, peft_config)
 
     def _init_sync_group(self):
         print("[ParameterSynchronizer] Initializing parameter synchronization group...")
