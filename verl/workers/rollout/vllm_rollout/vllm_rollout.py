@@ -72,9 +72,10 @@ class ServerAdapter(BaseRollout):
         config: RolloutConfig,
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
+        server_handle: Optional[ray.actor.ActorHandle] = None,
     ):
         super().__init__(config, model_config, device_mesh)
-        self.server_handle: ray.actor.ActorHandle = None
+        self.server_handle: ray.actor.ActorHandle = server_handle
 
         rank = int(os.environ["RANK"])
         local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
@@ -129,9 +130,24 @@ class ServerAdapter(BaseRollout):
         if self.rollout_rank != 0:
             return None
 
-        # Lazy init http server adapter because http server is launched after hybrid engine.
+        # Resolve server handle: prefer direct handle passed at init,
+        # fall back to prefix search for backward compatibility.
         if self.server_handle is None:
-            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+            prefix = f"vllm_server_{self.replica_rank}_{self.node_rank}"
+            all_actors = ray.util.list_named_actors()
+            matching = [name for name in all_actors if name.startswith(prefix)]
+            if not matching:
+                raise RuntimeError(
+                    f"No vLLM server actor found with prefix '{prefix}'. "
+                    f"Available actors: {all_actors}"
+                )
+            if len(matching) > 1:
+                logger.warning(
+                    f"Ambiguous server match: {len(matching)} servers match prefix '{prefix}': "
+                    f"{matching}. Picking {matching[0]}."
+                )
+            self.server_handle = ray.get_actor(matching[0])
+            logger.info(f"Resolved server actor: {matching[0]}")
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
@@ -151,8 +167,25 @@ class ServerAdapter(BaseRollout):
             await self._execute_method("sleep", kwargs={"level": self.sleep_level})
 
     @torch.no_grad()
-    async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
-        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
+    async def update_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        *,
+        ipc_buffer: Optional[torch.Tensor] = None,
+        ipc_handle=None,
+        **kwargs,
+    ):
+        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers.
+
+        Args:
+            weights: Generator of (name, tensor) pairs.
+            ipc_buffer: Optional pre-allocated CUDA IPC buffer. When provided with
+                ipc_handle, skips buffer allocation and reduce_tensor() call. This is
+                needed when update_weights runs in a background thread, since
+                reduce_tensor (CUDA IPC handle creation) is not thread-safe and causes
+                SIGSEGV after repeated calls from non-main threads.
+            ipc_handle: Pre-computed IPC handle from reduce_tensor(ipc_buffer).
+        """
         start_time = time.time()
 
         future = await self._execute_method(
@@ -169,8 +202,12 @@ class ServerAdapter(BaseRollout):
 
         buffer, shm = None, None
         if not self.use_shm:
-            buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:0")
-            handle = reduce_tensor(buffer)
+            if ipc_buffer is not None and ipc_handle is not None:
+                buffer = ipc_buffer
+                handle = ipc_handle
+            else:
+                buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:0")
+                handle = reduce_tensor(buffer)
             s.send_pyobj(handle)
         else:
             import uuid
