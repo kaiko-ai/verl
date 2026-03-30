@@ -267,7 +267,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     timing_raw=timing_raw, metrics=None, global_steps=global_steps, param_version=version
                 )
             elif need_validate and not self.parallel_validate_and_rollout:
+                if self.config.async_training.partial_rollout:
+                    await self.async_rollout_manager.resume()
                 data = self._validate_wrapper(timing_raw, version, global_steps, use_trainer_do_validate)
+                if self.config.async_training.partial_rollout:
+                    await self.async_rollout_manager.cancel()
 
             if not need_validate or not self.parallel_validate_and_rollout:
                 await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
@@ -300,6 +304,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         global_steps: int = 0,
         use_trainer_do_validate: bool = False,
     ):
+        if self.config.async_training.partial_rollout:
+            await self.async_rollout_manager.resume()
         loop = asyncio.get_running_loop()
 
         data = await loop.run_in_executor(
@@ -312,6 +318,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 use_trainer_do_validate=use_trainer_do_validate,
             ),
         )
+        if self.config.async_training.partial_rollout:
+            await self.async_rollout_manager.cancel()
         await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
 
     async def save_checkpoint(self, local_global_step_folder: str):
@@ -587,8 +595,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             rollout_sample.rollout_status = await self.get_statistics()
             rollout_sample.agent_loop_output_list = []
 
+            ref = ray.put(rollout_sample)
             success = await self.message_queue_client.put_sample(
-                sample=ray.cloudpickle.dumps(rollout_sample),
+                sample=ray.cloudpickle.dumps(ref),
                 param_version=rollout_sample.param_version,
             )
             if success:

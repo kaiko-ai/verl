@@ -19,6 +19,7 @@ import logging
 import os
 from pprint import pprint
 from typing import Any, Callable, Optional
+from uuid import uuid4
 
 import numpy as np
 import ray
@@ -599,12 +600,14 @@ class vLLMHttpServer:
         )
 
     async def wake_up(self):
-        if self.node_rank != 0:
+        if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # In hybrid mode, rollout is wake up in `update_weights`
-            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
+            # Wake up weights and kv_cache that were released by sleep(level=2).
+            # Use collective_rpc to broadcast to all TP workers (mirrors sleep pattern).
+            await self.engine.collective_rpc("wake_up", kwargs={"tags": ["weights", "kv_cache"]})
+            await self.engine.reset_prefix_cache()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=["kv_cache", "weights"])
@@ -787,6 +790,7 @@ class vLLMReplica(RolloutReplica):
             config=self.config,
             model_config=self.model_config,
             device_mesh=None,
+            server_handle=self._server_handle,
         )
         return worker_dict_cls
 
@@ -831,6 +835,7 @@ class vLLMReplica(RolloutReplica):
                 if not self.is_reward_model
                 else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
             )
+            name = name + f"_{uuid4().hex[:8]}"
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
@@ -869,6 +874,35 @@ class vLLMReplica(RolloutReplica):
             f"[{server_address}]:{server_port}"
             if is_valid_ipv6_address(server_address)
             else f"{server_address}:{server_port}"
+        )
+
+        # Inject server handle into rank-0 worker's ServerAdapter to avoid
+        # ambiguous prefix search (which can match servers from other replicas).
+        handle = self._server_handle
+
+        def _inject_server_handle(worker, h):
+            # Case 1: worker IS a ServerAdapter (standalone mode)
+            if hasattr(worker, "server_handle") and hasattr(worker, "rollout_rank"):
+                worker.server_handle = h
+                return
+            # Case 2: WorkerDict — inner workers in worker_dict
+            for key, inner in getattr(worker, "worker_dict", {}).items():
+                rollout = getattr(inner, "rollout", None)
+                if rollout is not None and hasattr(rollout, "server_handle"):
+                    rollout.server_handle = h
+                    return
+                if hasattr(inner, "server_handle") and hasattr(inner, "rollout_rank"):
+                    inner.server_handle = h
+                    return
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Failed to inject server handle — no ServerAdapter found in worker. "
+                "Falling back to prefix-based actor lookup."
+            )
+
+        await self.workers[0].__ray_call__.remote(
+            lambda self, h=handle: _inject_server_handle(self, h)
         )
 
     async def sleep(self):

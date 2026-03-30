@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import warnings
+from contextlib import contextmanager
 from dataclasses import asdict
 
 import psutil
@@ -124,6 +125,30 @@ def get_sharding_strategy(device_mesh, zero3_enable=True):
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy
+
+
+@contextmanager
+def _zero_lora_scaling(model):
+    """Zero LoRA scaling factors to compute base-model-only output.
+
+    Unlike PEFT's disable_adapter(), this does not toggle requires_grad on any parameter,
+    avoiding FSDP2 mixed-precision hook corruption and FSDP1 FlatParameter requires_grad leaks.
+    """
+    from peft.tuners.lora.layer import LoraLayer
+
+    saved = []
+    for module in model.modules():
+        if isinstance(module, LoraLayer):
+            saved.append((module, {k: v for k, v in module.scaling.items()}))
+    try:
+        for module, _ in saved:
+            for adapter in module.scaling:
+                module.scaling[adapter] = 0.0
+        yield
+    finally:
+        for module, orig in saved:
+            for adapter, scale in orig.items():
+                module.scaling[adapter] = scale
 
 
 def get_vl_model_vision_tower(vl_model_instance):
@@ -464,11 +489,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 attn_implementation=attn_implementation,
             )
 
-            # Apply Liger kernel to the model if use_liger is set to True
+            # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
-                _apply_liger_kernel_to_instance(model=actor_module)
+                _apply_liger_kernel_to_instance(
+                    model=actor_module,
+                    fused_linear_cross_entropy=False,
+                    swiglu=True,
+                )
 
             fused_kernel_options = self.config.model.get("fused_kernel_options", None)
             fused_kernels_backend = (
@@ -1092,31 +1121,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        # Support all hardwares
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
-        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
-        # we should always recompute old_log_probs when it is HybridEngine
+        # Zero LoRA scaling instead of disable_adapter() to avoid FSDP dtype/requires_grad issues.
+        # Setting scaling=0 makes the forward output identical to the base model without
+        # toggling requires_grad, which would corrupt FSDP2 mixed-precision hooks or
+        # leak requires_grad state on FSDP1 FlatParameters.
+        adapter_ctx = _zero_lora_scaling(self.actor.actor_module) if is_lora else nullcontext()
+
         config_source = self.config.ref if is_lora else self.config.rollout
         data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-        # perform recompute log_prob
         calculate_entropy = not is_lora
+        grad_ctx = torch.no_grad() if is_lora else nullcontext()
+
         with self.ulysses_sharding_manager:
-            with adapter_ctx:
+            with adapter_ctx, grad_ctx:
                 outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
-            if not is_lora:
-                tensors = {"old_log_probs": outputs["log_probs"]}
+
+            if is_lora:
+                tensors = {"ref_log_prob": outputs["log_probs"].detach()}
+                del outputs
+                aggressive_empty_cache(force_sync=True)
             else:
-                tensors = {"ref_log_prob": outputs["log_probs"]}
-            if calculate_entropy:
-                tensors["entropys"] = outputs["entropys"]
-            if "sum_pi_squared" in outputs:
-                tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+                tensors = {"old_log_probs": outputs["log_probs"]}
+                if calculate_entropy:
+                    tensors["entropys"] = outputs["entropys"]
+                if "sum_pi_squared" in outputs:
+                    tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
@@ -1133,6 +1170,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
+        aggressive_empty_cache(force_sync=True)
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

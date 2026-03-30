@@ -221,7 +221,7 @@ class BaseDetachNcclSync:
                 self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
             else:
                 collective.broadcast(tensor, src_rank=0, group_name=sync_group_name)
-            if self._is_rollout:
+            if self._is_rollout and not self._is_actor:
                 inference_model.load_weights([(key, tensor)])
 
     async def update_weights(self, inference_engine, params):

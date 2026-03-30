@@ -19,10 +19,12 @@ import ray
 from ray.actor import ActorHandle
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
+from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode
+from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
     _qwen2_5_vl_dedup_image_tokens,
     vLLMHttpServer,
@@ -64,6 +66,15 @@ class vLLMHttpServerForPartial(vLLMHttpServer):
         self.cancel_event: dict[str, asyncio.Event] = {}
         self.req_output: dict[str, Optional[RequestOutput]] = {}
 
+        # Cache LoRA request for generation (adapter weights swapped in-place by ID during sync)
+        self._lora_request = None
+        lora_rank = getattr(model_config, "lora_rank", 0) or 0
+        if lora_rank > 0:
+            self._lora_request = LoRARequest(
+                lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+            )
+
+
     async def _generate_step(
         self,
         prompt_ids: list[int],
@@ -83,7 +94,11 @@ class vLLMHttpServerForPartial(vLLMHttpServer):
         if video_data is not None:
             multi_modal_data["video"] = video_data
         prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
-        generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
+
+        generator = self.engine.generate(
+            prompt=prompt, sampling_params=sampling_params, request_id=request_id,
+            lora_request=self._lora_request,
+        )
 
         # Get final response
         async for output in generator:

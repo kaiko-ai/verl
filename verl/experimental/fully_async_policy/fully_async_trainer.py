@@ -201,27 +201,28 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             flush=True,
         )
 
-        # Collect samples using a simple loop calling get_sample
+        # Collect samples in bulk RPCs (with timeout fallback for slow rollouts)
         consumer_start = time.time()
         queue_samples = []
         queue_len = 0
         while len(queue_samples) < self.required_samples:
-            # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = self.message_queue_client.get_sample_sync()
+            remaining = self.required_samples - len(queue_samples)
+            result = self.message_queue_client.get_samples_sync(remaining, timeout=5.0)
 
-            if sample is None:
+            if result is None:
                 print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
+                    f"[FullyAsyncTrainer] Detected termination signal, stopping sample collection. "
                     f"Collected {len(queue_samples)}/{self.required_samples} samples"
                 )
                 break
 
-            queue_samples.append(sample)
+            batch, queue_len = result
+            queue_samples.extend(batch)
 
-            if len(queue_samples) % 64 == 0:
+            if len(queue_samples) < self.required_samples:
                 print(
-                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
-                    f"mq_len: {queue_len}"
+                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples, "
+                    f"waiting... mq_len: {queue_len}"
                 )
 
         consumer_end = time.time()
@@ -237,7 +238,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"mq_len: {queue_len}"
         )
 
-        queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
+        queue_samples = ray.get([ray.cloudpickle.loads(b) for b in queue_samples])
         # Assemble batch - now working directly with RolloutSample objects
         if self.config.trainer.balance_batch:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
@@ -281,12 +282,25 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
-        # self._init_async_objects()
         self._init_resource_pools()
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+        self._init_reward_loop()
         await self._init_async_rollout_manager()
+
+    def _init_reward_loop(self):
+        if self.config.async_training.use_trainer_do_validate:
+            # Reuse the reward loop workers already created by the rollouter
+            # (which inits first). Creating new ones would fail with duplicate
+            # actor names. This is safe because RewardLoopWorkers are stateless.
+            from verl.experimental.reward_loop import RewardLoopManager
+
+            num_workers = self.config.reward.num_workers
+            workers = [ray.get_actor(f"reward_loop_worker_{i}") for i in range(num_workers)]
+            self.reward_loop_manager = RewardLoopManager.__new__(RewardLoopManager)
+            self.reward_loop_manager.reward_loop_workers = workers
+            print(f"[FullyAsyncTrainer] Reusing {len(workers)} reward loop workers from rollouter")
 
     async def _init_async_rollout_manager(self):
         # use async rollout do validate
@@ -454,9 +468,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._log_validation_data()
 
     async def _fit_update_weights(self):
-        # with marked_timer("update_weights", self.timing_raw, color="red"):
-        #     self.checkpoint_manager.update_weights()
-
         # Trigger parameter synchronization after training step
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
@@ -487,11 +498,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
             with marked_timer("save_checkpoint", timing_raw, color="green"):
-                # sleep replicas to avoid OOM during checkpoint saving
-                # self.checkpoint_manager.sleep_replicas()
                 self._save_checkpoint()
-                # wake replicas to avoid OOM during checkpoint saving
-                # self.checkpoint_manager.update_weights()
+
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
+        # In async, generation logging is handled via the MQ path — the rollouter
+        # captures samples and the trainer logs them at param_version. The base
+        # class logs at global_steps which breaks wandb step monotonicity.
+        pass
 
     def _fit_postprocess_step(self):
         self.global_steps += 1

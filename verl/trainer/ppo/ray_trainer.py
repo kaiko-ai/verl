@@ -1119,7 +1119,11 @@ class RayPPOTrainer:
             ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
             ref_log_prob = DataProto.from_tensordict(ref_log_prob)
         else:
-            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+            if self.ref_in_actor:
+                batch.meta_info["is_lora"] = True
+                ref_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            else:
+                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
 
         return ref_log_prob
 

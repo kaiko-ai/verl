@@ -21,13 +21,13 @@ import numpy as np
 import ray
 from omegaconf import DictConfig
 
+import verl.experimental.agent_loop.agent_loop as _base_agent_loop
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
     AgentLoopWorker,
     AsyncLLMServerManager,
     DictConfigWrap,
-    _agent_loop_registry,
     get_trajectory_info,
 )
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
@@ -179,11 +179,15 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
                 validate=trajectory["validate"],
                 name="agent_loop",
             ):
-                assert agent_name in _agent_loop_registry, (
-                    f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+                # Always access the registry through the base module attribute to avoid
+                # stale references from `from ... import` when the module is re-loaded
+                # in Ray worker processes (e.g. dual sys.path entries).
+                registry = _base_agent_loop._agent_loop_registry
+                assert agent_name in registry, (
+                    f"Agent loop {agent_name} not registered, registered agent loops: {registry.keys()}"
                 )
 
-                agent_loop_config = _agent_loop_registry[agent_name]
+                agent_loop_config = registry[agent_name]
                 agent_loop = hydra.utils.instantiate(
                     config=agent_loop_config,
                     trainer_config=DictConfigWrap(config=self.config),

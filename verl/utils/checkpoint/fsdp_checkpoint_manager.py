@@ -284,9 +284,17 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             )
 
             # If we have a custom model, we copy the file defining it in the folder and set the attributes so it can be
-            # loaded from the Hub.
+            # loaded from the Hub.  May fail when packages (e.g. peft) are installed without .py sources.
             if hasattr(model_config, "auto_map"):
-                custom_object_save(unwrap_model, hf_config_tokenizer_path, config=model_config)
+                try:
+                    custom_object_save(unwrap_model, hf_config_tokenizer_path, config=model_config)
+                except FileNotFoundError:
+                    log_with_rank(
+                        "custom_object_save failed (source .py not found), skipping auto_map copy",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
 
             # Also save runtime FSDP config
             fsdp_config_path = os.path.join(local_path, "fsdp_config.json")

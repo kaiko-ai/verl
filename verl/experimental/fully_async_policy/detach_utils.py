@@ -82,13 +82,16 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
 
     # Setting selected agent, that supports partial
     if config.actor_rollout_ref.rollout.multi_turn.enable:
-        full_batch.non_tensor_batch["agent_name"] = np.array(
-            ["async_partial_tool_agent"] * len(full_batch), dtype=object
+        agent_name = config.actor_rollout_ref.rollout.agent.get(
+            "default_agent_loop", "async_partial_tool_agent"
         )
     else:
-        full_batch.non_tensor_batch["agent_name"] = np.array(
-            ["partial_single_turn_agent"] * len(full_batch), dtype=object
+        agent_name = config.actor_rollout_ref.rollout.agent.get(
+            "default_agent_loop", "partial_single_turn_agent"
         )
+    full_batch.non_tensor_batch["agent_name"] = np.array(
+        [agent_name] * len(full_batch), dtype=object
+    )
 
     # Add global step count to generated data
     full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
