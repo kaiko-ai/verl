@@ -147,7 +147,7 @@ def hf_processor(name_or_path, **kwargs):
             case "MllamaProcessor":
                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
             case _:
-                raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
+                pass  # Unknown processor — skip get_rope_index binding
 
         if model_class is not None:
             processor.get_rope_index = types.MethodType(model_class.get_rope_index, processor)

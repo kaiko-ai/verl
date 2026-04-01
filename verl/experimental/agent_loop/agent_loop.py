@@ -270,7 +270,7 @@ class AgentLoopBase(ABC):
         **kwargs,
     ):
         self.config = trainer_config.config
-        self.rollout_config, _ = _get_rollout_and_model_config(self.config)
+        self.rollout_config, self._model_config_raw = _get_rollout_and_model_config(self.config)
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
@@ -278,6 +278,7 @@ class AgentLoopBase(ABC):
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
         self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
+        self.processor_kwargs = self._model_config_raw.get("processor_kwargs", {})
         self.loop = get_event_loop()
 
     async def process_vision_info(self, messages: list[dict]) -> dict:
@@ -291,8 +292,10 @@ class AgentLoopBase(ABC):
         """
         multi_modal_data = {}
         if self.processor is not None:
+            image_processor = getattr(self.processor, "image_processor", None)
+            image_patch_size = getattr(image_processor, "patch_size", None) if image_processor else None
             images, videos = await self.dataset_cls.process_vision_info(
-                messages, image_patch_size=self.processor.image_processor.patch_size, config=self.data_config
+                messages, image_patch_size=image_patch_size, config=self.data_config
             )
             if images is not None:
                 multi_modal_data["images"] = images
@@ -348,6 +351,7 @@ class AgentLoopBase(ABC):
                 video_metadata=video_metadatas,
                 return_tensors="pt",
                 do_sample_frames=False,
+                **self.processor_kwargs,
             )
             prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
         else:
@@ -435,6 +439,11 @@ class AgentLoopWorker:
         rollout_config, model_config = _get_rollout_and_model_config(config)
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
+        # external_lib is already loaded by HFModelConfig.__post_init__ above,
+        # but import again to ensure custom agent @register() decorators are available
+        from verl.utils.import_utils import import_external_libs
+
+        import_external_libs(self.model_config.external_lib)
         self.distillation_config = config.get("distillation", None)
         self.distillation_enabled = is_distillation_enabled(self.distillation_config)
         if self.distillation_enabled:
@@ -776,6 +785,7 @@ class AgentLoopWorker:
         else:
             video_metadatas = None
         current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+        current_text = current_text.replace("<image>", "")
         multi_modal_inputs = self.processor(
             text=[current_text],
             images=images,
@@ -783,6 +793,7 @@ class AgentLoopWorker:
             video_metadata=video_metadatas,
             return_tensors="pt",
             do_sample_frames=False,
+            **self.processor_kwargs,
         )
         multi_modal_inputs.pop("input_ids", None)
         multi_modal_inputs.pop("attention_mask", None)
@@ -798,7 +809,7 @@ class AgentLoopWorker:
 
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
         """Compute position ids for multi-modal inputs."""
-        if self.processor is None:
+        if self.processor is None or not hasattr(self.processor, "get_rope_index"):
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
 
         multi_modal_kwargs = {
