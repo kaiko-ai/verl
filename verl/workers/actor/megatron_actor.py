@@ -39,6 +39,7 @@ from torch import nn
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
+from verl.utils.import_utils import deprecated
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 from verl.utils.megatron.router_replay_utils import (
@@ -64,6 +65,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+@deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
 class MegatronPPOActor(BasePPOActor):
     def __init__(
         self,
@@ -139,6 +141,11 @@ class MegatronPPOActor(BasePPOActor):
             assert self.mtp_config.enable, "MTP requires mtp_config.enable to be True"
 
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
+        if getattr(self.mtp_config, "enable", False) and self.use_fused_kernels:
+            self.use_fused_kernels = False
+            logger.warning_once(
+                "MTP is not compatible with fused kernels for now. Automatically disable use_fused_kernels."
+            )
         if self.use_fused_kernels and not getattr(self.config, "overlap_moe_expert_parallel_comm", False):
             # do not patch if overlap_moe_expert_parallel_comm is enabled
             logger.warning_once(
@@ -434,6 +441,7 @@ class MegatronPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]
         if use_dynamic_bsz:
             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
+            dp_group = mpu.get_data_parallel_group()
             vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
             if vpp_size is not None and vpp_size > 1:
                 microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
@@ -441,13 +449,16 @@ class MegatronPPOActor(BasePPOActor):
                     batch=mini_batch.batch,
                     num_batches_divided_by=microbatch_group_size_per_vp_stage,
                     max_token_len=max_token_len,
+                    dp_group=dp_group,
                 )
                 assert len(micro_batches) % self.tf_config.microbatch_group_size_per_vp_stage == 0, (
                     f"micro_batches {micro_batches} must be divisible by microbatch_group_size_per_vp_stage "
                     f"{microbatch_group_size_per_vp_stage} for megatron backend"
                 )
             else:
-                micro_batches, indices = rearrange_micro_batches(batch=mini_batch.batch, max_token_len=max_token_len)
+                micro_batches, indices = rearrange_micro_batches(
+                    batch=mini_batch.batch, max_token_len=max_token_len, dp_group=dp_group
+                )
             total_seqlen = max_token_len
         else:
             assert micro_batch_size is not None, (
