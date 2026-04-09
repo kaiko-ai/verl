@@ -484,6 +484,7 @@ class AgentLoopWorker:
 
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
+        self.processor_kwargs = getattr(self.model_config, "processor_kwargs", {})
 
         agent_loop_config_path = self.rollout_config.agent.agent_loop_config_path
         if agent_loop_config_path:
