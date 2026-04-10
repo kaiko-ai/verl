@@ -19,9 +19,7 @@ import logging
 import os
 from pprint import pprint
 from typing import Any, Callable, Optional
-from uuid import uuid4
 
-import numpy as np
 import ray
 import vllm.entrypoints.cli.serve
 from packaging import version
@@ -36,22 +34,22 @@ from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
-from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_resource_name, get_visible_devices_keyword
+from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
+from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
-from verl.workers.rollout.vllm_rollout import ServerAdapter
+from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
     VLLM_LORA_PATH,
     SuppressSignalInThread,
     build_cli_args_from_config,
+    extract_prompt_logprobs,
     get_vllm_max_lora_rank,
 )
 
@@ -88,8 +86,8 @@ class vLLMHttpServer:
 
     def __init__(
         self,
-        config: RolloutConfig,
-        model_config: HFModelConfig,
+        config,
+        model_config,
         rollout_mode: RolloutMode,
         workers: list[ActorHandle],
         replica_rank: int,
@@ -111,17 +109,9 @@ class vLLMHttpServer:
         """
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
 
-        self.config: RolloutConfig = omega_conf_to_dataclass(config)
-        self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
-        if self.config.max_model_len is None:
-            self.config.max_model_len = max_position_embeddings
-        else:
-            if self.config.max_model_len > max_position_embeddings:
-                raise ValueError(
-                    f"max_model_len ({self.config.max_model_len}) should be less than or equal to "
-                    f"max_position_embeddings ({max_position_embeddings})"
-                )
+        self.config = self._init_config(config)
+        self.model_config = self._init_model_config(model_config)
+        self._validate_configs()
 
         self.rollout_mode = rollout_mode
         self.workers = workers
@@ -130,6 +120,8 @@ class vLLMHttpServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
+        # model weights version, set by ServerAdapter when update weights.
+        self.global_steps = None
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -154,22 +146,17 @@ class vLLMHttpServer:
         if self.node_rank == 0:
             self._master_address = self._server_address
             # used for torch.distributed.init_process_group
-            self._master_port, self._master_sock = get_free_port(self._server_address)
+            self._master_port, self._master_sock = get_free_port(self._server_address, with_alive_sock=True)
             # used for data parallel: --data-parallel-address, --data-parallel-rpc-port
-            self._dp_rpc_port, self._dp_rpc_sock = get_free_port(self._server_address)
-            self._dp_master_port, self._dp_master_sock = get_free_port(self._server_address)
+            self._dp_rpc_port, self._dp_rpc_sock = get_free_port(self._server_address, with_alive_sock=True)
+            self._dp_master_port, self._dp_master_sock = get_free_port(self._server_address, with_alive_sock=True)
         else:
             self._master_address = None
             self._master_port = None
             self._dp_rpc_port = None
             self._dp_master_port = None
 
-        logger.info(
-            f"vLLMHttpServer, replica_rank: {self.replica_rank}, node_rank: {self.node_rank}, "
-            f"{get_visible_devices_keyword()}: {cuda_visible_devices}, "
-            f"master_address: {self._master_address}, master_port: {self._master_port}, "
-            f"data_parallel_rpc_port: {self._dp_rpc_port}, data_parallel_master_port: {self._dp_master_port}"
-        )
+        self._post_init(cuda_visible_devices)
 
     def get_master_address(self):
         """Get master address and port for data parallel.
@@ -182,6 +169,12 @@ class vLLMHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    @property
+    def lora_as_adapter(self) -> bool:
+        return (
+            self.model_config.lora_rank > 0 or self.model_config.lora.get("rank", 0) > 0
+        ) and not self.model_config.lora.get("merge", False)
 
     async def collective_rpc(
         self,
@@ -207,22 +200,18 @@ class vLLMHttpServer:
             self._dp_rpc_port = dp_rpc_port
 
         # 1. setup vllm serve cli args
-        engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
+        engine_kwargs = self.config.get("engine_kwargs", {}).get(self._get_engine_kwargs_key(), {}) or {}
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
         if self.config.cudagraph_capture_sizes:
             engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
+        self._preprocess_engine_kwargs(engine_kwargs)
+
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
-        override_generation_config = dict(
-            temperature=self.config.temperature,
-            top_k=self.config.top_k,
-            top_p=self.config.top_p,
-            repetition_penalty=1.0,
-            max_new_tokens=self.config.response_length,
-        )
+        override_generation_config = self._get_override_generation_config()
         logger.info(f"override_generation_config: {override_generation_config}")
 
         logger.info(f"enable_sleep_mode: {self.config.enable_sleep_mode}")
@@ -231,52 +220,7 @@ class vLLMHttpServer:
 
             set_expandable_segments(True)
 
-        quantization = self.config.quantization
-        hf_overrides = self.model_config.get("override_config", {})
-
-        # Handle QAT (Quantization-Aware Training) configuration
-        qat_config_dict = getattr(self.config, "qat", {}) or {}
-        if qat_config_dict.get("enable", False):
-            # QAT uses compressed-tensors quantization, apply patches for dynamic weight loading
-            from verl.utils.qat import QATConfig, apply_qat_patches, load_quantization_config
-
-            apply_qat_patches()
-
-            # Load quantization config from JSON file
-            qat_config = QATConfig(**qat_config_dict)
-            quantization_config_dict = load_quantization_config(qat_config)
-            hf_overrides["quantization_config"] = quantization_config_dict
-            quantization = "compressed-tensors"
-
-            logger.info("QAT quantization config injected to vLLM async server")
-        elif quantization is not None:
-            # Handle other quantization methods (fp8, torchao)
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao"]
-            if quantization not in _SUPPORTED_QUANTIZATION:
-                raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
-
-            if quantization == "fp8":
-                # Ignore MoE router layers for FP8 quantization
-                all_mlp_gate_layers = []
-                for layer in range(self.model_config.hf_config.num_hidden_layers):
-                    all_mlp_gate_layers.append(f"model.layers.{layer}.mlp.gate")
-
-                FP8_BLOCK_QUANT_KWARGS = {
-                    "activation_scheme": "dynamic",
-                    "fmt": "e4m3",
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
-                    "ignored_layers": all_mlp_gate_layers,
-                }
-                hf_overrides["quantization_config"] = dict(FP8_BLOCK_QUANT_KWARGS)
-                # Apply vllm fp8 patches
-                # Will remove the patch after vllm support on-the-fly quant for rollout natively.
-                apply_vllm_fp8_patches()
-                # for subprocesses patching
-                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
-
-        if quantization is not None and self.config.quantization_config_file is not None:
-            hf_overrides["quantization_config_file"] = self.config.quantization_config_file
+        quantization, hf_overrides = self._apply_quantization()
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -299,7 +243,7 @@ class vLLMHttpServer:
             "load_format": self.config.load_format,
             "skip_tokenizer_init": False,
             "distributed_executor_backend": "mp",
-            "worker_extension_cls": "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension",
+            "worker_extension_cls": self._get_worker_extension_cls(),
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_model_len": self.config.max_model_len,
             "max_num_seqs": self.config.max_num_seqs,
@@ -338,34 +282,33 @@ class vLLMHttpServer:
                     served_model_name = served_model_name.split("/")[-1]
                 args["served_model_name"] = served_model_name
 
-        # mtp
-        if self.config.mtp.enable and self.config.mtp.enable_rollout:
+        # mtp (None for diffusion models; only LLM models use speculative decoding)
+        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             speculative_config = {
                 "method": self.config.mtp.method,
                 "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
             }
             args["speculative_config"] = speculative_config
 
-        if self.config.expert_parallel_size > 1:
+        if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
                 "gpus_per_node should be divisible by tensor_model_parallel_size"
             )
             data_parallel_size_local = self.gpus_per_node // self.config.tensor_model_parallel_size
             assert len(self.workers) == data_parallel_size_local * self.config.tensor_model_parallel_size, (
-                f"num workers ({len(self.workers)}) should be equal to dp_size_local "
+                f"num workers ({len(self.workers)}) should be equal to "
+                f"dp_size_local ({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
             )
-            f"({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
+            dp_args = {
+                "data_parallel_size": self.config.data_parallel_size,
+                "data_parallel_size_local": data_parallel_size_local,
+                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
+                "data_parallel_address": self._master_address,
+                "data_parallel_rpc_port": self._dp_rpc_port,
+            }
+            args.update(dp_args)
 
-            args.update(
-                {
-                    "enable_expert_parallel": self.config.expert_parallel_size > 1,
-                    "data_parallel_size": self.config.data_parallel_size,
-                    "data_parallel_size_local": data_parallel_size_local,
-                    "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
-                    "data_parallel_address": self._master_address,
-                    "data_parallel_rpc_port": self._dp_rpc_port,
-                }
-            )
+        args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
 
         # used for torch.distributed.init_process_group
         if self.nnodes > 1:
@@ -408,8 +351,8 @@ class vLLMHttpServer:
         if self.replica_rank == 0:
             pprint(server_args)
 
-        CMD_MODULES = [vllm.entrypoints.cli.serve]
-        parser = FlexibleArgumentParser(description="vLLM CLI")
+        CMD_MODULES = self._get_cli_modules()
+        parser = FlexibleArgumentParser(description=self._get_cli_description())
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}
         for cmd_module in CMD_MODULES:
@@ -424,11 +367,8 @@ class vLLMHttpServer:
 
         # 3. launch server
         if self.node_rank == 0:
-            self._master_sock.close()
             await self.run_server(server_args)
         else:
-            # TODO: avoid connect before master_sock close
-            await asyncio.sleep(3)
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
@@ -475,6 +415,7 @@ class vLLMHttpServer:
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
+        args.api_server_count = 0
 
         def run_headless_wrapper():
             with SuppressSignalInThread():
@@ -505,6 +446,8 @@ class vLLMHttpServer:
         priority: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        prompt_ids = normalize_token_ids(prompt_ids)
+
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)
@@ -522,7 +465,11 @@ class vLLMHttpServer:
             max_tokens = sampling_params.pop("max_new_tokens")
         else:
             # Default to a calculation that considers configured lengths
-            max_tokens = self.config.response_length + self.config.prompt_length - len(prompt_ids)
+            # Cap max_tokens by response_length to ensure tensor alignment,
+            # and by remaining budget to prevent OOM in multi-turn rollouts.
+            max_tokens = min(
+                self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
+            )
 
         # Clamp max_tokens to the valid range [0, max_possible_tokens]
         max_tokens = max(0, min(max_tokens, max_possible_tokens))
@@ -533,7 +480,7 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
@@ -544,9 +491,7 @@ class vLLMHttpServer:
 
         # Add lora request
         lora_request = None
-        if (
-            self.model_config.lora_rank > 0 or self.model_config.lora.get("rank", 0) > 0
-        ) and not self.model_config.lora.get("merge", False):
+        if self.lora_as_adapter:
             # Make sure we also check that the lora is already loaded in the engine
             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
             if lora_loaded:
@@ -568,6 +513,12 @@ class vLLMHttpServer:
             final_res = output
         assert final_res is not None
 
+        extra_fields = {"global_steps": self.global_steps}
+        extract_prompt_logprobs(
+            output=final_res,
+            num_prompt_logprobs=sampling_params.prompt_logprobs,
+            result_dict=extra_fields,
+        )
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
@@ -597,20 +548,19 @@ class vLLMHttpServer:
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
+            extra_fields=extra_fields,
         )
 
     async def wake_up(self):
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+        if self.node_rank != 0:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # Wake up weights and kv_cache that were released by sleep(level=2).
-            # Use collective_rpc to broadcast to all TP workers (mirrors sleep pattern).
-            await self.engine.collective_rpc("wake_up", kwargs={"tags": ["weights", "kv_cache"]})
-            await self.engine.reset_prefix_cache()
+            # In hybrid mode, rollout is wake up in `update_weights`
+            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            await self.engine.wake_up(tags=["kv_cache", "weights"])
+            await self.engine.wake_up(tags=self._get_wake_up_tags())
             await self.engine.reset_prefix_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
@@ -620,11 +570,7 @@ class vLLMHttpServer:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # Don't use engine.sleep(level=2) here
-            await self.engine.collective_rpc("sleep", kwargs={"level": 2})
-
-            # clear encoder cache: https://github.com/vllm-project/vllm/pull/33452
-            # await self.engine.reset_encoder_cache()
+            await self._sleep_hybrid()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
@@ -649,6 +595,10 @@ class vLLMHttpServer:
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             await self.engine.reset_prefix_cache()
+
+    async def set_global_steps(self, global_steps: int):
+        """Set the global steps of the model weights."""
+        self.global_steps = global_steps
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
@@ -767,8 +717,152 @@ class vLLMHttpServer:
             logger.error(f"Error aborting request {request_id}: {e}")
             return {"aborted": False, "request_id": request_id, "error": str(e)}
 
+    # -----------------------------------------------------------------------
+    # Hook methods for subclass overrides
+    # -----------------------------------------------------------------------
 
-_rollout_worker_actor_cls = ray.remote(ServerAdapter)
+    def _init_config(self, config):
+        """Initialise config. Override when a specific dataclass_type is needed."""
+        return omega_conf_to_dataclass(config)
+
+    def _init_model_config(self, model_config):
+        """Initialise model_config. Override when a specific dataclass_type is needed."""
+        return omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+
+    def _validate_configs(self) -> None:
+        """Validate config/model_config after initialisation."""
+        max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
+        if self.config.max_model_len is None:
+            self.config.max_model_len = max_position_embeddings
+        else:
+            if self.config.max_model_len > max_position_embeddings:
+                raise ValueError(
+                    f"max_model_len ({self.config.max_model_len}) should be less than or equal to "
+                    f"max_position_embeddings ({max_position_embeddings})"
+                )
+
+    def _post_init(self, cuda_visible_devices: str) -> None:
+        """Called at the end of __init__. Default logs server metadata."""
+        logger.info(
+            f"{self.__class__.__name__}, replica_rank: {self.replica_rank}, node_rank: {self.node_rank}, "
+            f"{get_visible_devices_keyword()}: {cuda_visible_devices}, "
+            f"master_address: {self._master_address}, master_port: {self._master_port}, "
+            f"data_parallel_rpc_port: {self._dp_rpc_port}, data_parallel_master_port: {self._dp_master_port}"
+        )
+
+    def _get_engine_kwargs_key(self) -> str:
+        """Return the key under config.engine_kwargs for this engine (e.g. 'vllm')."""
+        return "vllm"
+
+    def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
+        """Mutate engine_kwargs in-place before the CLI args dict is built. No-op by default."""
+        pass
+
+    def _get_override_generation_config(self) -> dict:
+        """Return the override_generation_config dict."""
+        # Override default generation config from hugging face model config,
+        # user can still override them by passing kwargs in each request.
+        return dict(
+            temperature=self.config.temperature,
+            top_k=self.config.top_k,
+            top_p=self.config.top_p,
+            repetition_penalty=1.0,
+            max_new_tokens=self.config.response_length,
+        )
+
+    def _apply_quantization(self) -> tuple[Optional[str], dict]:
+        """Process quantization config. Returns (quantization_str, hf_overrides)."""
+        quantization = self.config.quantization
+        hf_overrides = self.model_config.get("override_config", {})
+
+        if is_torch_npu_available(check_device=False):
+            from verl.utils.vllm.npu_vllm_patch import check_vllm_ascend_before_server_launch
+
+            check_vllm_ascend_before_server_launch()
+
+        # Handle QAT (Quantization-Aware Training) configuration
+        qat_config_dict = getattr(self.config, "qat", {}) or {}
+        if qat_config_dict.get("enable", False):
+            from verl.utils.qat import QATConfig, load_quantization_config
+
+            qat_config = QATConfig(**qat_config_dict)
+            quantization_config_dict = load_quantization_config(qat_config)
+            quant_method = quantization_config_dict.get("quant_method", None)
+
+            if quant_method == "modelopt":
+                from verl.utils.modelopt import apply_modelopt_nvfp4_patches
+
+                apply_modelopt_nvfp4_patches()
+                quantization = "modelopt"
+            elif quant_method == "compressed-tensors":
+                from verl.utils.qat import apply_qat_patches
+
+                apply_qat_patches()
+                quantization = "compressed-tensors"
+            else:
+                raise ValueError(f"Unsupported quant_method: {quant_method}")
+
+            logger.info(f"QAT quantization config injected (quant_method={quant_method})")
+            hf_overrides["quantization_config"] = quantization_config_dict
+        elif quantization is not None:
+            # Handle other quantization methods (fp8, torchao)
+            _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
+            if quantization not in _SUPPORTED_QUANTIZATION:
+                raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
+
+            if quantization == "fp8":
+                # Ignore MoE router layers for FP8 quantization
+                all_mlp_gate_layers = []
+                for layer in range(self.model_config.hf_config.num_hidden_layers):
+                    all_mlp_gate_layers.append(f"model.layers.{layer}.mlp.gate")
+
+                FP8_BLOCK_QUANT_KWARGS = {
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                    "ignored_layers": all_mlp_gate_layers,
+                }
+                hf_overrides["quantization_config"] = dict(FP8_BLOCK_QUANT_KWARGS)
+                # Apply vllm fp8 patches
+                # Will remove the patch after vllm support on-the-fly quant for rollout natively.
+                apply_vllm_fp8_patches()
+                # for subprocesses patching
+                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
+
+        if quantization is not None and self.config.quantization_config_file is not None:
+            hf_overrides["quantization_config_file"] = self.config.quantization_config_file
+
+        return quantization, hf_overrides
+
+    def _get_worker_extension_cls(self) -> str:
+        """Return the fully-qualified colocate worker extension class name."""
+        return "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
+
+    def _get_cli_modules(self) -> list:
+        """Return the list of CLI command modules used for argument parsing."""
+        return [vllm.entrypoints.cli.serve]
+
+    def _get_cli_description(self) -> str:
+        """Return the description string for the CLI argument parser."""
+        return "vLLM CLI"
+
+    def _get_wake_up_tags(self) -> list[str]:
+        """Return the tags passed to engine.wake_up(). Default includes kv_cache."""
+        return ["kv_cache", "weights"]
+
+    async def _sleep_hybrid(self):
+        """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
+        # Don't use engine.sleep(level=2) here
+        # lora only update adapter weights, so set sleep level to 1
+        if self.lora_as_adapter:
+            sleep_level = 1
+        else:
+            sleep_level = 2
+        await self.engine.collective_rpc("sleep", kwargs={"level": sleep_level})
+
+        # clear encoder cache: https://github.com/vllm-project/vllm/pull/33452
+        # await self.engine.reset_encoder_cache()
 
 
 class vLLMReplica(RolloutReplica):
@@ -779,20 +873,10 @@ class vLLMReplica(RolloutReplica):
         model_config: HFModelConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
+        is_teacher_model: bool = False,
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model)
         self.server_class = ray.remote(vLLMHttpServer)
-
-    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
-        """Get rollout worker actor class for colocated and standalone mode."""
-        worker_dict_cls = RayClassWithInitArgs(
-            cls=_rollout_worker_actor_cls,
-            config=self.config,
-            model_config=self.model_config,
-            device_mesh=None,
-            server_handle=self._server_handle,
-        )
-        return worker_dict_cls
 
     async def launch_servers(self):
         """Launch http server in each node."""
@@ -800,12 +884,7 @@ class vLLMReplica(RolloutReplica):
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
 
-        # NOTE: We always use MP Executor backend whether it's single-node or multi-node.
-        # For multi-node without DP (e.g TP=16), need vllm>=0.11.1, https://github.com/vllm-project/vllm/pull/23691
-        if self.config.data_parallel_size == 1 and self.nnodes > 1:
-            assert _VLLM_VERSION >= version.parse("0.11.1"), (
-                "For multi-node MP Executor, either (1) set data_parallel_size > 1 or (2) upgrade vLLM to >= 0.11.1"
-            )
+        self._validate_launch_requirements()
 
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
@@ -830,19 +909,31 @@ class vLLMReplica(RolloutReplica):
                 worker_cuda_visible_devices[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
             )
             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
-            name = (
-                f"vllm_server_{self.replica_rank}_{node_rank}"
-                if not self.is_reward_model
-                else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
-            )
-            name = name + f"_{uuid4().hex[:8]}"
+            prefix = self._get_server_name_prefix()
+            if self.is_reward_model:
+                name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
+            elif self.is_teacher_model:
+                name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
+            else:
+                name = f"{prefix}server_{self.replica_rank}_{node_rank}"
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
+                runtime_env={
+                    "env_vars": {
+                        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                        "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                        # To prevent hanging or crash during synchronization of weights between actor and rollout
+                        # in disaggregated mode. See:
+                        # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
+                        # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+                        "NCCL_CUMEM_ENABLE": "0",
+                    }
+                },
                 name=name,
+                max_concurrency=self.max_concurrency,
             ).remote(
                 config=self.config,
                 model_config=self.model_config,
@@ -876,35 +967,6 @@ class vLLMReplica(RolloutReplica):
             else f"{server_address}:{server_port}"
         )
 
-        # Inject server handle into rank-0 worker's ServerAdapter to avoid
-        # ambiguous prefix search (which can match servers from other replicas).
-        handle = self._server_handle
-
-        def _inject_server_handle(worker, h):
-            # Case 1: worker IS a ServerAdapter (standalone mode)
-            if hasattr(worker, "server_handle") and hasattr(worker, "rollout_rank"):
-                worker.server_handle = h
-                return
-            # Case 2: WorkerDict — inner workers in worker_dict
-            for key, inner in getattr(worker, "worker_dict", {}).items():
-                rollout = getattr(inner, "rollout", None)
-                if rollout is not None and hasattr(rollout, "server_handle"):
-                    rollout.server_handle = h
-                    return
-                if hasattr(inner, "server_handle") and hasattr(inner, "rollout_rank"):
-                    inner.server_handle = h
-                    return
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "Failed to inject server handle — no ServerAdapter found in worker. "
-                "Falling back to prefix-based actor lookup."
-            )
-
-        await self.workers[0].__ray_call__.remote(
-            lambda self, h=handle: _inject_server_handle(self, h)
-        )
-
     async def sleep(self):
         """Sleep each rollout server."""
         # Drain DP engines for safe sleep.
@@ -934,11 +996,6 @@ class vLLMReplica(RolloutReplica):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
 
-    # TODO(petersh6): refact the checkpoint engine's update_weights and rename this method
-    async def resume_all_requests(self):
-        """Resume all requests on all servers."""
-        await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
-
     async def abort_request(self, request_id: str) -> dict[str, Any]:
         """Abort a specific request. Tries all servers since we don't know which one has it.
 
@@ -957,30 +1014,19 @@ class vLLMReplica(RolloutReplica):
 
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
 
+    # -----------------------------------------------------------------------
+    # Hook methods for subclass overrides
+    # -----------------------------------------------------------------------
 
-def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
-    """Deduplicate consecutive image tokens in prompt_ids for Qwen2.5-VL, since vLLM will replicate the
-    <|image_pad|> and <|video_pad|> token by image_data.
+    def _validate_launch_requirements(self) -> None:
+        """Validate requirements before launching. Override in subclasses."""
+        # NOTE: We always use MP Executor backend whether it's single-node or multi-node.
+        # For multi-node without DP (e.g TP=16), need vllm>=0.11.1, https://github.com/vllm-project/vllm/pull/23691
+        if self.config.data_parallel_size == 1 and self.nnodes > 1:
+            assert _VLLM_VERSION >= version.parse("0.11.1"), (
+                "For multi-node MP Executor, either (1) set data_parallel_size > 1 or (2) upgrade vLLM to >= 0.11.1"
+            )
 
-    For example,
-    ```
-    <|vision_start|><|image_pad|><|image_pad|>...<|image_pad|><|vision_end|>
-    =>
-    <|vision_start|><|image_pad|><|vision_end|>
-    ```
-    """
-    if processor is not None and "Qwen2VLImageProcessor" in processor.image_processor.__class__.__name__:
-        prompt_ids = np.array(prompt_ids)
-
-        # Create a mask where True indicates elements to keep
-        mask = np.ones(len(prompt_ids), dtype=bool)
-
-        # Find where the array equals the value
-        is_value = (prompt_ids == processor.image_token_id) | (prompt_ids == processor.video_token_id)
-
-        # Find consecutive duplicates by checking if previous element is also the value
-        mask[1:] &= ~(is_value[1:] & is_value[:-1])
-
-        return prompt_ids[mask].tolist()
-    else:
-        return prompt_ids
+    def _get_server_name_prefix(self) -> str:
+        """Return the Ray actor name prefix (e.g. 'vllm_' or 'vllm_omni_')."""
+        return "vllm_"
