@@ -262,6 +262,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
             )
             mini_batch_size_per_gpu = mini_batch_size // self.engine.get_data_parallel_size()
 
+        # Clamp to actual batch size: in async training with time budgets, the
+        # collected batch can be smaller than the configured mini_batch_size.
+        # Loss normalization uses actual batch_num_tokens (all-reduced), so this
+        # is gradient-correct. The old dp_actor path handled this via DataProto.split()
+        # which naturally produced smaller last chunks.
+        mini_batch_size_per_gpu = min(mini_batch_size_per_gpu, batch_size_per_dp)
+
         # make iterator
         dataloader = tu.make_iterator(
             data,

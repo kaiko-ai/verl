@@ -527,6 +527,19 @@ class FSDPEngine(BaseEngine):
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
 
+        # Freeze vision tower before FSDP wrapping so FSDP2 sees correct requires_grad state
+        if getattr(self.model_config, "freeze_vision_tower", False):
+            from verl.workers.fsdp_workers import get_vl_model_vision_tower
+
+            vision_tower = get_vl_model_vision_tower(module)
+            if vision_tower is not None:
+                vision_tower.requires_grad_(False)
+                if self.rank == 0:
+                    print("[FSDPEngine] Vision tower frozen (requires_grad=False)")
+            else:
+                if self.rank == 0:
+                    print("[FSDPEngine] freeze_vision_tower=True but no vision tower found")
+
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()
         if self.rank == 0:

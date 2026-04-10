@@ -274,7 +274,6 @@ class AgentLoopBase(ABC):
         self.config = trainer_config.config
         self.rollout_config, model_config = _get_rollout_and_model_config(self.config)
         self.processor_kwargs = OmegaConf.to_container(model_config.get("processor_kwargs", {}), resolve=True)
-        print(f"[kaiko] AgentLoopBase: processor_kwargs={self.processor_kwargs}")
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
@@ -482,6 +481,7 @@ class AgentLoopWorker:
 
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
+        self.processor_kwargs = self.model_config.get("processor_kwargs", {})
 
         agent_loop_config_path = self.rollout_config.agent.agent_loop_config_path
         if agent_loop_config_path:

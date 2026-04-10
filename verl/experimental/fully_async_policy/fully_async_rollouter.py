@@ -160,7 +160,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.processed_sample_count = 0
         # we start from step 1
         self.global_steps = 1
-        self.idle_start_time = time.time()
+        self.idle_start_time = None
         self.step_start_time = time.time()
 
         # Concurrency control
@@ -245,10 +245,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # every time param change, reset staleness_samples
             self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
             timing_raw = {}
-            rollout_active_time = self.idle_start_time - self.step_start_time
             rollout_version_time = time.time() - self.step_start_time
-            idle_ratio = 1 - rollout_active_time / rollout_version_time
-            timing_raw["fully_async/rollouter/active_time"] = rollout_active_time
+            if self.idle_start_time is not None:
+                rollout_active_time = self.idle_start_time - self.step_start_time
+                idle_ratio = 1 - rollout_active_time / rollout_version_time if rollout_version_time > 0 else 0.0
+                timing_raw["fully_async/rollouter/active_time"] = rollout_active_time
+                self.idle_start_time = None
+            else:
+                idle_ratio = 0.0
             timing_raw["fully_async/rollouter/version_time"] = rollout_version_time
             timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
 
@@ -510,7 +514,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         ref = ray.put(rollout_sample)
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(ref),
-            param_version=rollout_sample.param_version,
         )
         if success:
             self.total_generated_samples += 1

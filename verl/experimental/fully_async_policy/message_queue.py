@@ -53,13 +53,12 @@ class MessageQueue:
 
         print(f"[MessageQueue] initialized with max_queue_size={max_queue_size}")
 
-    async def put_sample(self, sample: Any, param_version: int = 0) -> bool:
+    async def put_sample(self, sample: Any) -> bool:
         """
         Put a batch sample into the queue
 
         Args:
             sample: Sample data (None triggers shutdown)
-            param_version: Parameter version number
 
         Returns:
             bool: Whether the sample was successfully put into the queue

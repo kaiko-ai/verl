@@ -20,7 +20,6 @@ import ray
 import torch
 from omegaconf import DictConfig
 
-import verl.experimental.agent_loop.agent_loop as _base_agent_loop
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopWorker,
