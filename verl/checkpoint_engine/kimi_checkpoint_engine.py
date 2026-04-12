@@ -318,12 +318,15 @@ class KIMICheckpointEngine(CheckpointEngine):
             self.initialized = True
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Not yet supported on KIMI backend.
         """
+        if extra_metadata is not None:
+            raise NotImplementedError("KIMI checkpoint engine does not support extra_metadata (LoRA adapter sync)")
 
         def offload_cpu(name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
             return name, tensor.to("cpu", non_blocking=True)

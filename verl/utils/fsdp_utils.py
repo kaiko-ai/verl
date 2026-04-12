@@ -981,6 +981,30 @@ def restore_base_model_weights(module, backup):
 
 
 @contextmanager
+def zero_lora_scaling(model):
+    """Zero LoRA scaling factors to compute base-model-only output.
+
+    Unlike PEFT's disable_adapter(), this does not toggle requires_grad on any parameter,
+    avoiding FSDP2 mixed-precision hook corruption and FSDP1 FlatParameter requires_grad leaks.
+    """
+    from peft.tuners.lora.layer import LoraLayer
+
+    saved = []
+    for module in model.modules():
+        if isinstance(module, LoraLayer):
+            saved.append((module, {k: v for k, v in module.scaling.items()}))
+    try:
+        for module, _ in saved:
+            for adapter in module.scaling:
+                module.scaling[adapter] = 0.0
+        yield
+    finally:
+        for module, orig in saved:
+            for adapter, scale in orig.items():
+                module.scaling[adapter] = scale
+
+
+@contextmanager
 def merged_lora_context(actor, backup_adapters=False):
     """Context manager to temporarily merge LoRA adapters.
 

@@ -131,28 +131,7 @@ def get_sharding_strategy(device_mesh, zero3_enable=True):
     return sharding_strategy
 
 
-@contextmanager
-def _zero_lora_scaling(model):
-    """Zero LoRA scaling factors to compute base-model-only output.
-
-    Unlike PEFT's disable_adapter(), this does not toggle requires_grad on any parameter,
-    avoiding FSDP2 mixed-precision hook corruption and FSDP1 FlatParameter requires_grad leaks.
-    """
-    from peft.tuners.lora.layer import LoraLayer
-
-    saved = []
-    for module in model.modules():
-        if isinstance(module, LoraLayer):
-            saved.append((module, {k: v for k, v in module.scaling.items()}))
-    try:
-        for module, _ in saved:
-            for adapter in module.scaling:
-                module.scaling[adapter] = 0.0
-        yield
-    finally:
-        for module, orig in saved:
-            for adapter, scale in orig.items():
-                module.scaling[adapter] = scale
+from verl.utils.fsdp_utils import zero_lora_scaling as _zero_lora_scaling
 
 
 def get_vl_model_vision_tower(vl_model_instance):

@@ -678,10 +678,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         peft_config=None, so the rollout receives a standard weight update.
         """
 
-        # 0. send_weights only for async training with disaggregated trainer and rollout
+        # 0. send_weights for async training with disaggregated trainer and rollout
         if self.config.rollout.checkpoint_engine.backend != "naive":
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-            await self.checkpoint_engine.send_weights(per_tensor_param)
+            layered_summon = getattr(self, "layered_summon", False)
+            peft_merge = getattr(self, "peft_merge", False)
+            base_sync_done = getattr(self, "base_sync_done", True)
+
+            per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+                layered_summon=layered_summon, base_sync_done=True
+            )
+
+            # LoRA adapter mode: two-phase sync (base weights first, then adapters)
+            do_lora_base_sync = False
+            if not peft_merge and peft_config is not None:
+                do_lora_base_sync = not base_sync_done
+
+            if do_lora_base_sync:
+                per_tensor_param_base, _ = self.actor.engine.get_per_tensor_param(
+                    layered_summon=layered_summon, base_sync_done=False
+                )
+                await self.checkpoint_engine.send_weights(
+                    per_tensor_param_base,
+                    extra_metadata={"peft_config": peft_config, "base_sync_done": False},
+                )
+                self.base_sync_done = True
+
+            extra_metadata = None
+            if peft_config is not None:
+                extra_metadata = {"peft_config": peft_config, "base_sync_done": True}
+            await self.checkpoint_engine.send_weights(per_tensor_param, extra_metadata=extra_metadata)
             return
 
         set_expandable_segments(False)

@@ -160,17 +160,22 @@ class CheckpointEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Optional metadata (e.g., peft_config, base_sync_done) piggybacked
+                on the first bucket's ZMQ message. Extracted by receive_weights into
+                self.last_extra_metadata before any tensors are yielded.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def receive_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Receive the weights of the model.
+
+        Sets self.last_extra_metadata (from the first bucket) before yielding any tensors.
 
         Yields:
             A tuple of the name of the weight tensor and the tensor itself.
@@ -224,13 +229,15 @@ class ColocatedCheckpointEngine(CheckpointEngine):
     def build_topology(cls, *args, **kwargs):
         raise NotImplementedError
 
-    def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Optional metadata piggybacked for the receiver.
         """
         self.weights = weights
+        self._extra_metadata = extra_metadata
 
     def receive_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Receive the weights of the model.
@@ -238,6 +245,7 @@ class ColocatedCheckpointEngine(CheckpointEngine):
         Yields:
             A tuple of the name of the weight tensor and the tensor itself.
         """
+        self.last_extra_metadata = getattr(self, "_extra_metadata", None)
         yield from self.weights
         self.weights = None
 
@@ -288,8 +296,34 @@ class CheckpointEngineWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
-        weights = self.checkpoint_engine.receive_weights()
-        await self.server_adapter.update_weights(weights, global_steps=global_steps)
+        await self._receive_and_load_weights(global_steps)
+        # If the last round was a base sync, expect adapter weights next
+        extra = self.checkpoint_engine.last_extra_metadata or {}
+        if extra.get("base_sync_done") is False:
+            await self._receive_and_load_weights(global_steps)
+
+    async def _receive_and_load_weights(self, global_steps: int = None):
+        weight_gen = self.checkpoint_engine.receive_weights()
+
+        # Prime the generator to trigger first-bucket receive and metadata extraction
+        first_pair = await anext(weight_gen)
+
+        # Read extra metadata (peft_config, base_sync_done) set by receive_weights
+        extra = self.checkpoint_engine.last_extra_metadata or {}
+        kwargs = {}
+        if extra.get("peft_config") is not None:
+            kwargs["peft_config"] = extra["peft_config"]
+            kwargs["base_sync_done"] = extra.get("base_sync_done", True)
+
+        # Chain first item back into the generator
+        async def chained(first, rest):
+            yield first
+            async for item in rest:
+                yield item
+
+        await self.server_adapter.update_weights(
+            chained(first_pair, weight_gen), global_steps=global_steps, **kwargs
+        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

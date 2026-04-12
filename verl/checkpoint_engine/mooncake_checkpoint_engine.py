@@ -147,8 +147,10 @@ class MooncakeCheckpointEngine(CheckpointEngine):
             await asyncio.sleep(0)
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
-        """Send weights using Mooncake TransferEngine"""
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
+        """Send weights using Mooncake TransferEngine. extra_metadata not yet supported."""
+        if extra_metadata is not None:
+            raise NotImplementedError("Mooncake checkpoint engine does not support extra_metadata (LoRA adapter sync)")
         if self.rank < 0:
             for name, weight in weights:
                 pass

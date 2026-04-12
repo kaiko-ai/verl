@@ -227,11 +227,12 @@ class HCCLCheckpointEngine(CheckpointEngine):
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Optional metadata included in first bucket's ZMQ message.
         """
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
 
@@ -243,6 +244,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
         broadcast_op = None
+        extra_metadata_sent = False
 
         start_time = time.time()
         bucket_meta: dict[str, TensorMeta] = {}
@@ -256,11 +258,16 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 if broadcast_op is not None:
                     await broadcast_op.wait_for_complete()
 
+                meta = {"bucket_meta": bucket_meta, "is_last": False}
+                if not extra_metadata_sent and extra_metadata is not None:
+                    meta["extra_metadata"] = extra_metadata
+                    extra_metadata_sent = True
+
                 broadcast_op = BroadcastOperation(
                     rank=self.rank,
                     process_group=self.pyhccl,
                     bucket=send_buf,
-                    metadata={"bucket_meta": bucket_meta, "is_last": False},
+                    metadata=meta,
                     socket=self.socket,
                     topic=self.topic,
                 )
@@ -288,11 +295,15 @@ class HCCLCheckpointEngine(CheckpointEngine):
         if broadcast_op is not None:
             await broadcast_op.wait_for_complete()
 
+        meta = {"bucket_meta": bucket_meta, "is_last": True}
+        if not extra_metadata_sent and extra_metadata is not None:
+            meta["extra_metadata"] = extra_metadata
+
         broadcast_op = BroadcastOperation(
             rank=self.rank,
             process_group=self.pyhccl,
             bucket=send_buf,
-            metadata={"bucket_meta": bucket_meta, "is_last": True},
+            metadata=meta,
             socket=self.socket,
             topic=self.topic,
         )
@@ -321,6 +332,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
             topic=self.topic,
         )
         metadata = await broadcast_op.wait_for_complete()
+        self.last_extra_metadata = metadata.get("extra_metadata")
         total_bytes += self.bucket_size
         total_params += len(metadata["bucket_meta"])
 

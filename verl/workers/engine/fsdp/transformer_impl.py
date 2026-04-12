@@ -834,6 +834,10 @@ class FSDPEngine(BaseEngine):
         return per_tensor_param, peft_config_dict
 
     def disable_adapter(self) -> ContextManager:
+        if self._is_lora:
+            from verl.utils.fsdp_utils import zero_lora_scaling
+
+            return zero_lora_scaling(self.module)
         return self.module.disable_adapter()
 
 
