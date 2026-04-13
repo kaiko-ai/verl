@@ -86,8 +86,6 @@ class SingleTurnAgentLoop(AgentLoopBase):
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
 
-        if self.processor is not None and len(prompt_ids_possibly_expanded) != len(prompt_ids):
-            print(f"[kaiko] prompt_ids split: expanded={len(prompt_ids_possibly_expanded)} unexpanded={len(prompt_ids)}")
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids_possibly_expanded,
             response_ids=output.token_ids[: self.response_length],

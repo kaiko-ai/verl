@@ -273,7 +273,10 @@ class AgentLoopBase(ABC):
     ):
         self.config = trainer_config.config
         self.rollout_config, model_config = _get_rollout_and_model_config(self.config)
-        self.processor_kwargs = OmegaConf.to_container(model_config.get("processor_kwargs", {}), resolve=True)
+        processor_kwargs_cfg = model_config.get("processor_kwargs", None)
+        self.processor_kwargs = (
+            OmegaConf.to_container(processor_kwargs_cfg, resolve=True) if processor_kwargs_cfg else {}
+        )
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
