@@ -148,6 +148,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.send_buf = None
         self.recv_buf = None
 
+        torch.cuda.empty_cache()
+
     @classmethod
     def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
         trainer_kwargs = {
@@ -164,7 +166,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     def _start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
-        self.listen_port, self.listen_sock = get_free_port(self.ip)
+        self.listen_port, _ = get_free_port(self.ip)
 
         context = zmq.Context()
         self.socket = context.socket(zmq.PUB)
@@ -219,11 +221,13 @@ class NCCLCheckpointEngine(CheckpointEngine):
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Optional metadata (e.g., peft_config) included in the first bucket's
+                ZMQ message. Extracted by receive_weights into self.last_extra_metadata.
         """
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
 
@@ -235,6 +239,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
         broadcast_op = None
+        extra_metadata_sent = False
 
         start_time = time.time()
         bucket_meta: dict[str, TensorMeta] = {}
@@ -248,11 +253,16 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 if broadcast_op is not None:
                     await broadcast_op.wait_for_complete()
 
+                meta = {"bucket_meta": bucket_meta, "is_last": False}
+                if not extra_metadata_sent and extra_metadata is not None:
+                    meta["extra_metadata"] = extra_metadata
+                    extra_metadata_sent = True
+
                 broadcast_op = BroadcastOperation(
                     rank=self.rank,
                     group_name=self.group_name,
                     bucket=send_buf,
-                    metadata={"bucket_meta": bucket_meta, "is_last": False},
+                    metadata=meta,
                     socket=self.socket,
                     topic=self.topic,
                 )
@@ -280,11 +290,15 @@ class NCCLCheckpointEngine(CheckpointEngine):
         if broadcast_op is not None:
             await broadcast_op.wait_for_complete()
 
+        meta = {"bucket_meta": bucket_meta, "is_last": True}
+        if not extra_metadata_sent and extra_metadata is not None:
+            meta["extra_metadata"] = extra_metadata
+
         broadcast_op = BroadcastOperation(
             rank=self.rank,
             group_name=self.group_name,
             bucket=send_buf,
-            metadata={"bucket_meta": bucket_meta, "is_last": True},
+            metadata=meta,
             socket=self.socket,
             topic=self.topic,
         )
@@ -313,6 +327,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             topic=self.topic,
         )
         metadata = await broadcast_op.wait_for_complete()
+        self.last_extra_metadata = metadata.get("extra_metadata")
         total_bytes += self.bucket_size
         total_params += len(metadata["bucket_meta"])
 

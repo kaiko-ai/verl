@@ -36,6 +36,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 
+from verl.utils.import_utils import deprecated
+
 try:
     # for torch 2.5+
     from torch.distributed.tensor import DTensor
@@ -64,6 +66,7 @@ from verl.utils.fsdp_utils import (
     MixedPrecisionPolicy,
     apply_fsdp2,
     collect_lora_params,
+    collect_merged_lora_params,
     fsdp2_load_full_state_dict,
     fsdp_version,
     get_fsdp_wrap_policy,
@@ -87,6 +90,7 @@ from verl.utils.py_functional import convert_to_regular_types
 # QAT support
 from verl.utils.qat import apply_qat, enable_qat_fuse
 from verl.utils.ray_utils import get_event_loop
+from verl.utils.transformers_compat import get_auto_model_for_vision2seq
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
@@ -127,28 +131,7 @@ def get_sharding_strategy(device_mesh, zero3_enable=True):
     return sharding_strategy
 
 
-@contextmanager
-def _zero_lora_scaling(model):
-    """Zero LoRA scaling factors to compute base-model-only output.
-
-    Unlike PEFT's disable_adapter(), this does not toggle requires_grad on any parameter,
-    avoiding FSDP2 mixed-precision hook corruption and FSDP1 FlatParameter requires_grad leaks.
-    """
-    from peft.tuners.lora.layer import LoraLayer
-
-    saved = []
-    for module in model.modules():
-        if isinstance(module, LoraLayer):
-            saved.append((module, {k: v for k, v in module.scaling.items()}))
-    try:
-        for module, _ in saved:
-            for adapter in module.scaling:
-                module.scaling[adapter] = 0.0
-        yield
-    finally:
-        for module, orig in saved:
-            for adapter, scale in orig.items():
-                module.scaling[adapter] = scale
+from verl.utils.fsdp_utils import zero_lora_scaling as _zero_lora_scaling
 
 
 def get_vl_model_vision_tower(vl_model_instance):
@@ -164,6 +147,7 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+@deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -249,7 +233,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # omega_profiler_config is DictConfig
         # profiler_config is a ProfilerConfig dataclass
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory", "precision_debugger"]:
             tool_config = omega_conf_to_dataclass(
                 omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
             )
@@ -372,12 +356,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoConfig,
             AutoModel,
             AutoModelForCausalLM,
-            AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
         )
+
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            AutoModelForVision2Seq = None
+        try:
+            from transformers import AutoModelForImageTextToText
+        except ImportError:
+            AutoModelForImageTextToText = AutoModelForVision2Seq
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
+
+        AutoModelForVision2Seq = get_auto_model_for_vision2seq()
 
         assert role in ["actor", "ref"]
 
@@ -760,6 +753,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # used for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
         self.layered_summon = self.config.rollout.get("layered_summon", False)
+        self.peft_merge: bool = model_config.lora.get("merge", False)
 
         # 5. switch to trainer mode
         # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
@@ -779,13 +773,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=self.base_sync_done,
-            )
-            if not self.base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+            if self.peft_merge:
+                # Merge LoRA into base weights and extract with HF key names.
+                # Required for backends (e.g. SGLang) whose load_weights() expects
+                # standard HF param names and can't handle LoRA delta keys.
+                params = collect_merged_lora_params(module=self.actor_module_fsdp)
+                # Full merged weights, not LoRA deltas — clear peft_config so
+                # downstream update_weights treats these as plain HF params.
+                peft_config = None
+                self.base_sync_done = True
+            else:
+                params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=self.base_sync_done,
+                )
+                if not self.base_sync_done:
+                    params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
             params = self.actor_module_fsdp.state_dict()
 
@@ -798,10 +802,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # separately collect and update LoRA weights and base model weights through their respective interfaces.
         # Here: params contains LoRA weights, base_model_params contains base model weights.
         # Only needed if the rollout engine actually sleeps/frees weights (free_cache_engine=True).
+        # Skip when peft_merge=True: params already contains full merged weights.
         if (
             peft_config is not None
             and getattr(self.rollout, "sleep_level", None) == 2
             and self.config.rollout.free_cache_engine
+            and not self.peft_merge
         ):
             base_model_params = collect_lora_params(
                 module=self.actor_module_fsdp,
@@ -820,14 +826,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         set_expandable_segments(False)
 
-        if peft_config is not None and self.base_sync_done:
-            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
-        else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in params.items()
+        # Ensure all params are on GPU before sending to rollout engine.
+        # collect_lora_params returns CPU tensors via .detach().cpu(), so the
+        # previous base_sync_done fast-path silently passed CPU tensors through,
+        # which could cause errors in backends that expect GPU tensors (e.g.
+        # SGLang's CUDA IPC serializer).
+        device = get_device_id()
+        _items = params.items() if isinstance(params, dict) else params
+        per_tensor_param = (
+            (
+                name,
+                param.to(device, non_blocking=True).full_tensor()
+                if isinstance(param, DTensor)
+                else param.to(device, non_blocking=False),
             )
+            for name, param in _items
+        )
 
         # QAT: quantize weights before sending to vLLM
         if self._qat_enabled:
@@ -855,6 +869,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             peft_config is not None
             and getattr(self.rollout, "sleep_level", None) == 2
             and self.config.rollout.free_cache_engine
+            and not self.peft_merge
         ):
             per_tensor_base_params = (
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
@@ -1011,10 +1026,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
-        # Free PyTorch's cached-but-unused CUDA memory after init so that
-        # vLLM MP Executor workers (separate processes) see it as available.
+        # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
-        log_gpu_memory_usage("After init_model empty_cache", logger=logger)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
@@ -1310,12 +1323,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 pass
 
 
+@deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
 class CriticWorker(Worker, DistProfilerExtension):
     def __init__(self, config: FSDPCriticConfig):
         Worker.__init__(self)
         omega_profiler_config = config.get("profiler", {})
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory", "precision_debugger"]:
             tool_config = omega_conf_to_dataclass(
                 omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
             )
@@ -1763,6 +1777,6 @@ class CriticWorker(Worker, DistProfilerExtension):
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self):
+    async def update_weights(self, global_steps: int = None):
         await self.rollout_mode()
         return True

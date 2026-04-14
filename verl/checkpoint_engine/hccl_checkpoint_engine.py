@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
 import logging
 import os
 import time
@@ -24,8 +23,12 @@ import zmq
 from vllm.distributed.utils import StatelessProcessGroup
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
+from verl.utils.device import is_torch_npu_available
 from verl.utils.distributed import stateless_init_process_group
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+
+if not is_torch_npu_available(check_device=False):
+    raise ImportError("HCCLCheckpointEngine is unavailable because the torch.npu module is not available.")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -67,8 +70,7 @@ class BroadcastOperation:
         self.socket = socket
         self.topic = topic
 
-        loop = asyncio.get_running_loop()
-        self._task = loop.run_in_executor(None, self._run)
+        self._run()
 
     def _run(self):
         # broadcast tensor meta via zeromq PUB/SUB
@@ -88,11 +90,10 @@ class BroadcastOperation:
         Returns:
             dict[str, TensorMeta]: The bucket meta after broadcast.
         """
-        await self._task
         return self.metadata
 
 
-@CheckpointEngineRegistry.register("hccl")
+@CheckpointEngineRegistry.register("nccl")
 class HCCLCheckpointEngine(CheckpointEngine):
     """HCCL checkpoint engine with collective communication.
 
@@ -148,6 +149,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         self.send_buf = None
         self.recv_buf = None
+        torch.npu.empty_cache()
 
     @classmethod
     def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
@@ -165,7 +167,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
     def _start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
-        self.zmq_port, self.listen_sock = get_free_port(self.ip)
+        self.zmq_port, _ = get_free_port(self.ip)
 
         context = zmq.Context()
         self.socket = context.socket(zmq.PUB)
@@ -225,11 +227,12 @@ class HCCLCheckpointEngine(CheckpointEngine):
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Optional metadata included in first bucket's ZMQ message.
         """
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
 
@@ -241,6 +244,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
         broadcast_op = None
+        extra_metadata_sent = False
 
         start_time = time.time()
         bucket_meta: dict[str, TensorMeta] = {}
@@ -254,11 +258,16 @@ class HCCLCheckpointEngine(CheckpointEngine):
                 if broadcast_op is not None:
                     await broadcast_op.wait_for_complete()
 
+                meta = {"bucket_meta": bucket_meta, "is_last": False}
+                if not extra_metadata_sent and extra_metadata is not None:
+                    meta["extra_metadata"] = extra_metadata
+                    extra_metadata_sent = True
+
                 broadcast_op = BroadcastOperation(
                     rank=self.rank,
                     process_group=self.pyhccl,
                     bucket=send_buf,
-                    metadata={"bucket_meta": bucket_meta, "is_last": False},
+                    metadata=meta,
                     socket=self.socket,
                     topic=self.topic,
                 )
@@ -286,11 +295,15 @@ class HCCLCheckpointEngine(CheckpointEngine):
         if broadcast_op is not None:
             await broadcast_op.wait_for_complete()
 
+        meta = {"bucket_meta": bucket_meta, "is_last": True}
+        if not extra_metadata_sent and extra_metadata is not None:
+            meta["extra_metadata"] = extra_metadata
+
         broadcast_op = BroadcastOperation(
             rank=self.rank,
             process_group=self.pyhccl,
             bucket=send_buf,
-            metadata={"bucket_meta": bucket_meta, "is_last": True},
+            metadata=meta,
             socket=self.socket,
             topic=self.topic,
         )
@@ -319,6 +332,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
             topic=self.topic,
         )
         metadata = await broadcast_op.wait_for_complete()
+        self.last_extra_metadata = metadata.get("extra_metadata")
         total_bytes += self.bucket_size
         total_params += len(metadata["bucket_meta"])
 

@@ -22,8 +22,9 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.utils.distributed import initialize_global_process_group_ray
+from verl.utils.import_utils import import_external_libs
 from verl.utils.ray_utils import auto_await
-from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 
 
@@ -159,17 +160,22 @@ class CheckpointEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Optional metadata (e.g., peft_config, base_sync_done) piggybacked
+                on the first bucket's ZMQ message. Extracted by receive_weights into
+                self.last_extra_metadata before any tensors are yielded.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def receive_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Receive the weights of the model.
+
+        Sets self.last_extra_metadata (from the first bucket) before yielding any tensors.
 
         Yields:
             A tuple of the name of the weight tensor and the tensor itself.
@@ -223,13 +229,15 @@ class ColocatedCheckpointEngine(CheckpointEngine):
     def build_topology(cls, *args, **kwargs):
         raise NotImplementedError
 
-    def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Optional metadata piggybacked for the receiver.
         """
         self.weights = weights
+        self._extra_metadata = extra_metadata
 
     def receive_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Receive the weights of the model.
@@ -237,6 +245,7 @@ class ColocatedCheckpointEngine(CheckpointEngine):
         Yields:
             A tuple of the name of the weight tensor and the tensor itself.
         """
+        self.last_extra_metadata = getattr(self, "_extra_metadata", None)
         yield from self.weights
         self.weights = None
 
@@ -255,29 +264,80 @@ class CheckpointEngineWorker(Worker):
         rollout_config: RolloutConfig,
         model_config: HFModelConfig,
         server_adapter: BaseRollout = None,
+        *args,
+        **kwargs,
     ) -> None:
+        super().__init__()
         self.rollout_config = rollout_config
         self.model_config = model_config
 
+        self.server_adapter: BaseRollout = server_adapter
+        backend = self.rollout_config.checkpoint_engine.backend
+        bucket_size = self.rollout_config.checkpoint_engine.update_weights_bucket_megabytes << 20
+        engine_kwargs = self.rollout_config.checkpoint_engine.engine_kwargs.get(backend, {})
+        # If custom_backend_module is set, import it so plugins can register
+        # in CheckpointEngineRegistry before the backend is instantiated.
+        import_external_libs(self.rollout_config.checkpoint_engine.custom_backend_module or None)
+        self.checkpoint_engine: CheckpointEngine = CheckpointEngineRegistry.new(
+            backend, bucket_size=bucket_size, **engine_kwargs
+        )
+        self.extra_rollout_args = args
+        self.extra_rollout_kwargs = kwargs
+        if self.server_adapter is None:
+            self.server_adapter = get_rollout_class(self.rollout_config.name, self.rollout_config.mode)(
+                *self.extra_rollout_args,
+                config=self.rollout_config,
+                model_config=self.model_config,
+                device_mesh=None,
+                **self.extra_rollout_kwargs,
+            )
         # sglang and trt-llm need device_mesh for internal communication
         initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo")
-        self.server_adapter: BaseRollout = server_adapter or get_rollout_class(
-            rollout_config.name, rollout_config.mode
-        )(config=rollout_config, model_config=model_config, device_mesh=None)
-
-        backend = rollout_config.checkpoint_engine.backend
-        bucket_size = rollout_config.checkpoint_engine.update_weights_bucket_megabytes << 20
-        engine_kwargs = rollout_config.checkpoint_engine.engine_kwargs.get(backend, {})
-        self.checkpoint_engine = CheckpointEngineRegistry.new(backend, bucket_size=bucket_size, **engine_kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self):
-        weights = self.checkpoint_engine.receive_weights()
-        await self.server_adapter.update_weights(weights)
+    async def update_weights(self, global_steps: int = None):
+        await self._receive_and_load_weights(global_steps)
+        # If the last round was a base sync, expect adapter weights next
+        extra = self.checkpoint_engine.last_extra_metadata or {}
+        if extra.get("base_sync_done") is False:
+            await self._receive_and_load_weights(global_steps)
+
+    async def _receive_and_load_weights(self, global_steps: int = None):
+        weight_gen = self.checkpoint_engine.receive_weights()
+
+        # Prime the generator to trigger first-bucket receive and metadata extraction
+        first_pair = await anext(weight_gen)
+
+        # Read extra metadata (peft_config, base_sync_done) set by receive_weights
+        extra = self.checkpoint_engine.last_extra_metadata or {}
+        kwargs = {}
+        if extra.get("peft_config") is not None:
+            kwargs["peft_config"] = extra["peft_config"]
+            kwargs["base_sync_done"] = extra.get("base_sync_done", True)
+
+        # Chain first item back into the generator
+        async def chained(first, rest):
+            yield first
+            async for item in rest:
+                yield item
+
+        await self.server_adapter.update_weights(
+            chained(first_pair, weight_gen), global_steps=global_steps, **kwargs
+        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_replica_rank(self) -> int:
+        """Get replica rank from the underlying rollout server adapter."""
+        return self.server_adapter.replica_rank
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def is_leader_rank(self) -> bool:
+        """Get leader rank flag from the underlying rollout server adapter."""
+        return self.server_adapter.is_leader_rank
 
 
 _worker_cls = ray.remote(CheckpointEngineWorker)
@@ -307,19 +367,21 @@ class CheckpointEngineManager:
     ```
 
     Args:
-        backend: The checkpoint engine backend.
+        config: The checkpoint engine config.
         trainer: The trainer worker group.
         replicas: The list of rollout replicas.
     """
 
     def __init__(
         self,
-        backend: str,
+        config: CheckpointEngineConfig,
         trainer: RayWorkerGroup,
         replicas: list[RolloutReplica],
     ) -> None:
-        self.backend = backend
-        self.backend_cls = CheckpointEngineRegistry.get(backend)
+        self.config = config
+        self.backend = config.backend
+        import_external_libs(self.config.custom_backend_module or None)
+        self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.trainer = trainer
         self.replicas = replicas
 
@@ -370,18 +432,24 @@ class CheckpointEngineManager:
     @auto_await
     async def sleep_replicas(self):
         """Sleep all rollout replicas: free weight and kv_cache device memory."""
-        # skip sleep replicas for disaggregated rollout
-        if self.backend != "naive":
-            return
         await asyncio.gather(*[r.sleep() for r in self.replicas])
 
     @auto_await
-    async def update_weights(self):
-        """Update weights from trainer to rollout replicas."""
+    async def wake_up_replicas(self):
+        """Resume all rollout replicas: recover kv_cache and weights device memory."""
+        await asyncio.gather(*[r.wake_up() for r in self.replicas])
+
+    @auto_await
+    async def update_weights(self, global_steps: int = None):
+        """Update weights from trainer to rollout replicas.
+
+        Args:
+            global_steps: The global steps of the trainer.
+        """
 
         # 0. update weights for sync training with colocated trainer and rollout
         if self.backend == "naive":
-            ray.get(self.trainer.update_weights())
+            ray.get(self.trainer.update_weights(global_steps=global_steps))
             return
 
         # 1. abort and save all unfinished requests for partial rollout
@@ -394,17 +462,23 @@ class CheckpointEngineManager:
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         trainer = self.trainer
 
-        # 3. build process group
+        # 3. sleep replicas to free kv_cache before weight sync (if free_cache_engine is enabled)
+        await self.sleep_replicas()
+
+        # 4. build process group
         self.build_process_group(rollout)
 
-        # 4. update weights of all workers
-        ray.get(trainer.update_weights() + rollout.update_weights())
+        # 5. update weights of all workers
+        ray.get(trainer.update_weights(global_steps=global_steps) + rollout.update_weights(global_steps=global_steps))
 
-        # 5. finalize all workers
+        # 6. finalize all workers
         ray.get(
             trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
 
-        # 6. resume all unfinished requests for partial rollout
-        await asyncio.gather(*[r.resume_all_requests() for r in self.replicas])
+        # 7. resume replicas to recover kv_cache (for free_cache_engine scenarios)
+        await self.wake_up_replicas()
+
+        # 8. resume all unfinished requests for partial rollout
+        await asyncio.gather(*[r.resume_generation() for r in self.replicas])

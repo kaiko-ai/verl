@@ -82,7 +82,7 @@ class NixlAgent:
 
     def start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
-        self.listen_port, self.listen_sock = get_free_port(self.ip)
+        self.listen_port, _ = get_free_port(self.ip)
 
         context = zmq.asyncio.Context()
         self.socket = context.socket(zmq.PULL)
@@ -362,12 +362,15 @@ class NIXLCheckpointEngine(CheckpointEngine):
         self.next_agent = None
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            extra_metadata: Not yet supported on NIXL backend.
         """
+        if extra_metadata is not None:
+            raise NotImplementedError("NIXL checkpoint engine does not support extra_metadata (LoRA adapter sync)")
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
 
         # For trainer workers other than rank 0, just consume weights and do nothing.
