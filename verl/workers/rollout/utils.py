@@ -93,9 +93,12 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
     <|vision_start|><|image_pad|><|vision_end|>
     ```
     """
+    if processor is None:
+        return prompt_ids
+
+    # Phase 1 — Qwen2.5-VL fast path (unchanged).
     if (
-        processor is not None
-        and hasattr(processor, "image_processor")
+        hasattr(processor, "image_processor")
         and "Qwen2VLImageProcessor" in processor.image_processor.__class__.__name__
     ):
         prompt_ids = np.array(prompt_ids)
@@ -103,5 +106,20 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
         is_value = (prompt_ids == processor.image_token_id) | (prompt_ids == processor.video_token_id)
         mask[1:] &= ~(is_value[1:] & is_value[:-1])
         return prompt_ids[mask].tolist()
-    else:
+
+    # Phase 2 — generic fallback for any processor that exposes placeholder ids.
+    unk = getattr(processor, "unk_token_id", None)
+    placeholder_ids: list[int] = []
+    for attr in ("image_token_id", "video_token_id"):
+        tok = getattr(processor, attr, None)
+        if tok is None or tok == unk:
+            continue
+        placeholder_ids.append(tok)
+    if not placeholder_ids:
         return prompt_ids
+
+    prompt_ids_arr = np.asarray(prompt_ids)
+    is_value = np.isin(prompt_ids_arr, placeholder_ids)
+    mask = np.ones(len(prompt_ids_arr), dtype=bool)
+    mask[1:] &= ~(is_value[1:] & is_value[:-1])
+    return prompt_ids_arr[mask].tolist()

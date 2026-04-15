@@ -111,6 +111,12 @@ def compute_distillation_loss_range(
 ) -> dict[str, Metric]:
     """Compute min and max distillation loss over valid response tokens."""
     distillation_losses_response = distillation_losses[response_mask.bool()]
+    if distillation_losses_response.numel() == 0:
+        zero = torch.tensor(0.0, device=distillation_losses.device)
+        return {
+            "distillation/loss_min": Metric(AggregationType.MIN, zero),
+            "distillation/loss_max": Metric(AggregationType.MAX, zero),
+        }
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
@@ -242,6 +248,18 @@ def distillation_loss(
     )
     response_mask = data["response_mask"]
     loss_agg_mode = config.loss_agg_mode
+
+    think_token_coef = loss_config.think_token_coef
+    think_mask = data.get("think_token_mask", None)
+    if think_token_coef < 1.0 and think_mask is not None:
+        valid_tokens = response_mask.sum()
+        think_tokens = (response_mask * think_mask).sum()
+        if valid_tokens > 0:
+            distillation_metrics["distillation/think_ratio"] = Metric(
+                AggregationType.MEAN, think_tokens / valid_tokens
+            )
+        token_weight = torch.where(think_mask.bool(), think_token_coef, 1.0)
+        response_mask = response_mask * token_weight
 
     distillation_metrics.update(
         compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)

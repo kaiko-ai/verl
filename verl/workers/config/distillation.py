@@ -70,6 +70,7 @@ class DistillationLossConfig(BaseConfig):
 
     use_policy_gradient: bool = True
     policy_loss_mode: str = "vanilla"
+    think_token_coef: float = 1.0
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2

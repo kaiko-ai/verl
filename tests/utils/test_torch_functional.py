@@ -21,6 +21,7 @@ import torch.multiprocessing as mp
 
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
 from verl.utils.torch_functional import (
+    build_think_token_mask,
     distributed_masked_mean,
     distributed_mean_max_min_std,
     expand_as_nested,
@@ -150,3 +151,83 @@ def test_expand_as_nested():
 
     with pytest.raises(AssertionError):
         expand_as_nested(tensor, nested_tensor.unsqueeze(-1))
+
+
+class MockTokenizer:
+    def __init__(self, vocab=None):
+        self._vocab = vocab or {}
+
+    def decode(self, ids, skip_special_tokens=False):
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        if isinstance(ids, int):
+            return self._vocab.get(ids, chr(ord('a') + (ids % 26)))
+        if len(ids) == 1:
+            return self._vocab.get(ids[0], chr(ord('a') + (ids[0] % 26)))
+        return "".join(self._vocab.get(i, chr(ord('a') + (i % 26))) for i in ids)
+
+
+class TestBuildThinkTokenMask:
+    # Token IDs: <think>=10, </think>=11, regular tokens=1-9, padding=0
+    VOCAB = {10: "<think>", 11: "</think>"}
+
+    def _tok(self):
+        return MockTokenizer(self.VOCAB)
+
+    def test_single_think_block(self):
+        ids = torch.tensor([[10, 1, 2, 11, 3, 4, 0]])
+        rmask = torch.tensor([[1, 1, 1, 1, 1, 1, 0]], dtype=torch.float32)
+        mask = build_think_token_mask(ids, rmask, self._tok())
+        assert torch.equal(mask, torch.tensor([[1, 1, 1, 1, 0, 0, 0]], dtype=torch.float32))
+
+    def test_no_think_block(self):
+        ids = torch.tensor([[1, 2, 3, 4, 0]])
+        rmask = torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.float32)
+        mask = build_think_token_mask(ids, rmask, self._tok())
+        assert torch.equal(mask, torch.zeros_like(rmask))
+
+    def test_multiple_think_blocks(self):
+        # <think> r </think> answer <think> r2 </think> answer2
+        ids = torch.tensor([[10, 1, 11, 3, 10, 2, 11, 4]])
+        rmask = torch.ones(1, 8, dtype=torch.float32)
+        mask = build_think_token_mask(ids, rmask, self._tok())
+        assert torch.equal(mask, torch.tensor([[1, 1, 1, 0, 1, 1, 1, 0]], dtype=torch.float32))
+
+    def test_think_at_end_no_answer(self):
+        # Unclosed think block — all valid tokens should be masked
+        ids = torch.tensor([[10, 1, 2, 3, 0]])
+        rmask = torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.float32)
+        mask = build_think_token_mask(ids, rmask, self._tok())
+        assert torch.equal(mask, torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.float32))
+
+    def test_batch_mixed(self):
+        # Three rows: think block, no think, all padding
+        ids = torch.tensor([[10, 1, 11, 3, 4, 0], [1, 2, 3, 4, 5, 0], [0, 0, 0, 0, 0, 0]])
+        rmask = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 0], [0, 0, 0, 0, 0, 0]], dtype=torch.float32)
+        mask = build_think_token_mask(ids, rmask, self._tok())
+        expected = torch.tensor([[1, 1, 1, 0, 0, 0], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]], dtype=torch.float32)
+        assert torch.equal(mask, expected)
+
+    def test_multi_token_markers(self):
+        # <think> = [20, 21], </think> = [30, 31] — tests BPE boundary handling
+        vocab = {20: "<thi", 21: "nk>", 30: "</thi", 31: "nk>"}
+        ids = torch.tensor([[20, 21, 1, 30, 31, 2]])
+        rmask = torch.ones(1, 6, dtype=torch.float32)
+        mask = build_think_token_mask(ids, rmask, MockTokenizer(vocab))
+        assert torch.equal(mask, torch.tensor([[1, 1, 1, 1, 1, 0]], dtype=torch.float32))
+
+    def test_prompt_ends_with_think(self):
+        # Prompt ends with <think>, so response starts inside a think block
+        prompt = torch.tensor([[0, 5, 6, 10]])
+        ids = torch.tensor([[1, 2, 11, 3]])  # reason </think> answer
+        rmask = torch.ones(1, 4, dtype=torch.float32)
+        mask = build_think_token_mask(ids, rmask, self._tok(), prompt_ids=prompt)
+        assert torch.equal(mask, torch.tensor([[1, 1, 1, 0]], dtype=torch.float32))
+
+    def test_prompt_think_no_close(self):
+        # Prompt ends with <think>, response never closes — entire response is think
+        prompt = torch.tensor([[5, 10]])
+        ids = torch.tensor([[1, 2, 3, 4]])
+        rmask = torch.ones(1, 4, dtype=torch.float32)
+        mask = build_think_token_mask(ids, rmask, self._tok(), prompt_ids=prompt)
+        assert torch.equal(mask, torch.ones(1, 4, dtype=torch.float32))
