@@ -51,6 +51,12 @@ class DistillationLossConfig(BaseConfig):
         as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3 or forward_kl_topk.
     policy_loss_mode (str):
         Name of the policy loss to use when use_policy_gradient is true.
+    think_token_coef (float):
+        Weight applied to response tokens inside <think>...</think> blocks when
+        aggregating the distillation loss. Non-think tokens always keep weight 1.0.
+        Set to 1.0 (default) to distill think + answer equally (no-op — no mask
+        built); 0.0 to distill only the final answer; a value in (0, 1) to
+        partially distill the reasoning trace. Only active when < 1.0.
     clip_ratio (float):
         PPO clipping ratio for policy loss.
     clip_ratio_low (float):

@@ -42,7 +42,13 @@ distillation_loss:
   # Optional min clamp value for log probabilities for stability, e.g., log q - log p where p or q are very close to zero.
   log_prob_min_clamp: null
 
-  # Weight for distillation on think tokens. 1.0=no masking, 0.0=full mask.
+  # Weight applied to response tokens inside <think>...</think> blocks when
+  # aggregating the distillation loss — used to up-/down-weight reasoning traces
+  # vs. the final answer. Only the think positions are scaled; non-think tokens
+  # keep weight 1.0. The mask is built only when this value is < 1.0.
+  #   1.0 (default): think tokens contribute fully (no-op, no mask built).
+  #   0.0: think tokens fully excluded — distill only the final answer.
+  #   (0, 1): partial distillation of the reasoning trace.
   think_token_coef: 1.0
 
   # Whether to incorporate distillation loss as a reward.
