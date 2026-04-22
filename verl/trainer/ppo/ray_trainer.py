@@ -67,7 +67,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import build_think_token_mask, masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
@@ -1428,6 +1428,18 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    if (
+                        self.distillation_config is not None
+                        and self.distillation_config.distillation_loss.think_token_coef < 1.0
+                    ):
+                        batch.batch["think_token_mask"] = build_think_token_mask(
+                            response_ids=batch.batch["responses"],
+                            response_mask=batch.batch["response_mask"],
+                            tokenizer=self.tokenizer,
+                            prompt_ids=batch.batch["prompts"],
+                        )
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

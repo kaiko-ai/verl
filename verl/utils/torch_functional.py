@@ -16,9 +16,11 @@ Contain small torch utilities
 """
 
 import math
+import re
 from contextlib import contextmanager
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -360,6 +362,86 @@ def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2,
     """
     eos_mask = torch.isin(response_id, torch.tensor(eos_token, device=response_id.device)).int()
     return (eos_mask.cumsum(dim=1) - eos_mask).eq(0).to(dtype)
+
+
+def build_think_token_mask(
+    response_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    tokenizer,
+    prompt_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build a float mask that is 1.0 inside <think>...</think> blocks, 0.0 outside.
+
+    Uses string-based detection (decode → find markers → map back to tokens) to avoid
+    BPE boundary issues where token subsequences differ based on context.
+
+    Handles multiple think blocks per sequence. Only marks tokens within response_mask.
+    If prompt_ids is provided, checks whether each prompt ends with <think> to determine
+    if the response starts inside a think block.
+
+    Args:
+        response_ids: (bsz, resp_len) token IDs of the response portion.
+        response_mask: (bsz, resp_len) binary mask for valid response tokens.
+        tokenizer: tokenizer to encode <think>/</ think> markers.
+        prompt_ids: (bsz, prompt_len) optional prompt token IDs to detect initial state.
+
+    Returns:
+        (bsz, resp_len) float tensor, 1.0 inside think blocks, 0.0 outside.
+    """
+    bsz, seq_len = response_ids.shape
+    mask = torch.zeros(bsz, seq_len, dtype=torch.float32, device=response_ids.device)
+
+    open_tag = "<think>"
+    tag_pattern = re.compile(r"</?think>")
+
+    for b in range(bsz):
+        resp_len = int(response_mask[b].sum().item())
+        if resp_len == 0:
+            continue
+
+        # Check if prompt ends with <think> (decode last ~50 tokens in one call)
+        in_think = False
+        if prompt_ids is not None:
+            prompt_tail = tokenizer.decode(prompt_ids[b, -50:], skip_special_tokens=False)
+            if prompt_tail.rstrip().endswith(open_tag):
+                in_think = True
+
+        # Decode response and build char→token offset mapping
+        valid_ids = response_ids[b, :resp_len].tolist()
+        # Per-token decode for accurate char offsets (BPE tokens may produce
+        # different text when decoded individually vs in sequence)
+        token_texts = [tokenizer.decode([tid], skip_special_tokens=False) for tid in valid_ids]
+        token_lens = np.array([len(t) for t in token_texts], dtype=np.int64)
+        full_text = "".join(token_texts)
+
+        starts = np.zeros(len(token_lens), dtype=np.int64)
+        if len(token_lens) > 1:
+            starts[1:] = np.cumsum(token_lens[:-1])
+
+        char_mask = np.zeros(len(full_text), dtype=np.bool_)
+        state = in_think
+        prev = 0
+        for m in tag_pattern.finditer(full_text):
+            is_open = m.group() == open_tag
+            if state:
+                if not is_open:
+                    char_mask[prev : m.end()] = True
+                    state = False
+                    prev = m.end()
+                else:
+                    char_mask[prev : m.end()] = True
+                    prev = m.end()
+            elif is_open:
+                state = True
+                char_mask[m.start() : m.end()] = True
+                prev = m.end()
+        if state:
+            char_mask[prev:] = True
+
+        token_think = np.add.reduceat(char_mask.view(np.uint8), starts) > 0
+        mask[b, :resp_len] = torch.from_numpy(token_think.astype(np.float32)).to(device=response_ids.device)
+
+    return mask
 
 
 def compute_grad_norm(model: nn.Module) -> float:
