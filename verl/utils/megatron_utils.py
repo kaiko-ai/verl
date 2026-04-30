@@ -247,6 +247,18 @@ def make_megatron_module(
             post_model_creation_callbacks.append(value_model_hook)
         if override_model_config.get("moe_config", {}).get("freeze_moe_router", False):
             post_model_creation_callbacks.append(freeze_moe_router)
+        # Freeze params support
+        freeze_vision_model = override_model_config.get("freeze_vision_model", False)
+        freeze_vision_projection = override_model_config.get("freeze_vision_projection", False)
+        freeze_language_model = override_model_config.get("freeze_language_model", False)
+        if freeze_vision_model or freeze_vision_projection or freeze_language_model:
+            post_model_creation_callbacks.append(
+                lambda model, **kwargs: model.freeze(
+                    freeze_language_model=freeze_language_model,
+                    freeze_vision_model=freeze_vision_model,
+                    freeze_vision_projection=freeze_vision_projection,
+                )
+            )
         if provider is not None:
             # When using PEFT with Megatron-Bridge, we must apply PEFT transformation
             # BEFORE wrapping the model in DDP. This is required because:
