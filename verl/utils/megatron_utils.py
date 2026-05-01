@@ -252,13 +252,27 @@ def make_megatron_module(
         freeze_vision_projection = override_model_config.get("freeze_vision_projection", False)
         freeze_language_model = override_model_config.get("freeze_language_model", False)
         if freeze_vision_model or freeze_vision_projection or freeze_language_model:
-            post_model_creation_callbacks.append(
-                lambda model, **kwargs: model.freeze(
+
+            def _freeze_with_log(model, **_kwargs):
+                # Log pre/post trainable param counts so freeze application is observable
+                # in worker logs (model.freeze itself is silent in mcore VL models).
+                total = sum(p.numel() for p in model.parameters())
+                trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                model.freeze(
                     freeze_language_model=freeze_language_model,
                     freeze_vision_model=freeze_vision_model,
                     freeze_vision_projection=freeze_vision_projection,
                 )
-            )
+                trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(
+                    f"[freeze] flags(language={freeze_language_model}, "
+                    f"vision={freeze_vision_model}, projection={freeze_vision_projection}) "
+                    f"total={total:,} trainable_before={trainable_before:,} "
+                    f"trainable_after={trainable_after:,} "
+                    f"frozen_delta={trainable_before - trainable_after:,}"
+                )
+
+            post_model_creation_callbacks.append(_freeze_with_log)
         if provider is not None:
             # When using PEFT with Megatron-Bridge, we must apply PEFT transformation
             # BEFORE wrapping the model in DDP. This is required because:
