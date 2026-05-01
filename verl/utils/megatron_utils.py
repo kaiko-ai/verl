@@ -271,8 +271,10 @@ def make_megatron_module(
                     f"trainable_after={trainable_after:,} "
                     f"frozen_delta={trainable_before - trainable_after:,}"
                 )
-
+            print("[freeze] Attaching _freeze_with_log callback")
             post_model_creation_callbacks.append(_freeze_with_log)
+        else:
+            print("[freeze] Not attaching _freeze_with_log callback")
         if provider is not None:
             # When using PEFT with Megatron-Bridge, we must apply PEFT transformation
             # BEFORE wrapping the model in DDP. This is required because:
