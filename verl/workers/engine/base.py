@@ -127,7 +127,16 @@ class BaseEngine:
         grad_norm = self.optimizer_step()
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
-            outputs["metrics"]["grad_norm"] = grad_norm
+            # megatron-core 0.16 returned grad_norm as a Python float; 26.04+ returns
+            # it as a 1-element CUDA tensor (deliberate, to avoid a host-device sync
+            # inside optimizer.step()). Convert to scalar here so the metrics dict
+            # (wrapped downstream in TensorDict's NonTensorData, which TensorDict.cpu()
+            # treats as opaque) doesn't carry a CUDA tensor across the Ray boundary
+            # into CPU-only orchestrator actors — they'd hit "Attempting to deserialize
+            # object on a CUDA device but torch.cuda.is_available() is False".
+            outputs["metrics"]["grad_norm"] = (
+                grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
+            )
         return outputs
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:
