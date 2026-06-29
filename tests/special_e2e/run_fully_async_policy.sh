@@ -7,6 +7,7 @@ set -xeuo pipefail
 
 NUM_GPUS=${NUM_GPUS:-8}
 ACTOR_STRATEGY=${ACTOR_STRATEGY:-"fsdp2"}  # fsdp2 or megatron
+ROLLOUT_NAME=${ROLLOUT_NAME:-"vllm"}       # vllm, sglang, or trtllm
 
 # Download model if not exists
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
@@ -15,10 +16,10 @@ MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 
 
 rollout_mode="async"
-rollout_name="vllm" # sglang or vllm
-if [ "$rollout_mode" = "async" ]; then
+rollout_name="${ROLLOUT_NAME}"
+return_raw_chat="True"
+if [ "$rollout_name" = "vllm" ]; then
     export VLLM_USE_V1=1
-    return_raw_chat="True"
 fi
 
 # Algorithm parameters
@@ -49,8 +50,9 @@ top_k=-1
 val_top_p=0.7
 
 # Fully async specific parameters
-n_gpus_rollout=4
-n_gpus_training=4
+# Split GPUs evenly between rollout and training.
+n_gpus_rollout=${N_GPUS_ROLLOUT:-$((NUM_GPUS / 2))}
+n_gpus_training=${N_GPUS_TRAINING:-$((NUM_GPUS / 2))}
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
@@ -63,7 +65,12 @@ trigger_parameter_sync_step=4
 partial_rollout=True
 use_trainer_do_validate=False
 
-exp_name="$(basename "${MODEL_ID,,}")-fully-async-policy-${ACTOR_STRATEGY}-minimal"
+SKIP_ENABLE=True
+SKIP_DUMP_DIR=${SKIP_DUMP_DIR:-${HOME}/data/rollout_dump_async}
+SKIP_STEPS='[1]'
+SKIP_ACTION=cache
+
+exp_name="$(basename "${MODEL_ID,,}")-fully-async-policy-${rollout_name}-${ACTOR_STRATEGY}-minimal"
 
 echo "Running fully_async_policy with ${ACTOR_STRATEGY} strategy"
 echo "Total GPUs: ${NUM_GPUS}, Rollout GPUs: ${n_gpus_rollout}, Training GPUs: ${n_gpus_training}"
@@ -97,7 +104,7 @@ common_params=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz}
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode}
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.80
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.60
     actor_rollout_ref.rollout.temperature=${temperature}
     actor_rollout_ref.rollout.top_p=${top_p}
     actor_rollout_ref.rollout.top_k=${top_k}
@@ -137,6 +144,10 @@ common_params=(
     async_training.use_trainer_do_validate=${use_trainer_do_validate}
     actor_rollout_ref.rollout.checkpoint_engine.backend='nccl'
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
+    skip.async_rollout.enable=${SKIP_ENABLE}
+    skip.async_rollout.dump_dir=${SKIP_DUMP_DIR}
+    skip.async_rollout.steps=${SKIP_STEPS}
+    skip.async_rollout.action=${SKIP_ACTION}
 )
 
     # Detect device
@@ -149,9 +160,15 @@ EOF
 if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then
     echo "Running fully async training with FSDP2 strategy..."
     # FSDP2 specific parameters
-    gen_tp=1
+    # trtllm: one replica uses all rollout GPUs as a single TP group.
+    # vllm/sglang: TP=1, rely on data parallelism across replicas.
+    if [ "${rollout_name}" = "trtllm" ]; then
+        gen_tp=${GEN_TP:-${n_gpus_rollout}}
+    else
+        gen_tp=2
+    fi
     sp_size=1
-    fsdp_size=1
+    fsdp_size=2
     ref_offload=True
     actor_offload=False
 
@@ -184,9 +201,13 @@ if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then
 elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
     echo "Running fully async training with Megatron strategy..."
     # Megatron specific parameters
-    gen_tp=2
+    if [ "${rollout_name}" = "trtllm" ]; then
+        gen_tp=${GEN_TP:-${n_gpus_rollout}}
+    else
+        gen_tp=2
+    fi
     train_tp=2
-    train_pp=2
+    train_pp=$((n_gpus_training / train_tp))
     ref_offload=True
     actor_offload=True
     common_params+=(
@@ -218,4 +239,3 @@ else
 fi
 
 echo "Fully async policy E2E test completed successfully with ${ACTOR_STRATEGY} strategy"
-

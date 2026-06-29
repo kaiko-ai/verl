@@ -27,7 +27,13 @@ import ray.util.collective as collective
 import torch
 import zmq
 
-from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
+from verl.checkpoint_engine.base import (
+    CheckpointEngine,
+    CheckpointEngineRegistry,
+    TensorMeta,
+    merge_weight_chunks,
+    split_weight_chunks,
+)
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
@@ -151,18 +157,18 @@ class NCCLCheckpointEngine(CheckpointEngine):
         torch.cuda.empty_cache()
 
     @classmethod
-    def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
-        trainer_kwargs = {
-            "rank": [0] + [-1] * (trainer_world_size - 1),
-            "world_size": [rollout_world_size + 1] * trainer_world_size,
-            "master_metadata": [metadata[0]] * trainer_world_size,
+    def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]):
+        actor_wg_kwargs = {
+            "rank": [0] + [-1] * (actor_wg_world_size - 1),
+            "world_size": [rollout_world_size + 1] * actor_wg_world_size,
+            "master_metadata": [metadata[0]] * actor_wg_world_size,
         }
         rollout_kwargs = {
             "rank": list(range(1, rollout_world_size + 1)),
             "world_size": [rollout_world_size + 1] * rollout_world_size,
             "master_metadata": [metadata[0]] * rollout_world_size,
         }
-        return trainer_kwargs, rollout_kwargs
+        return actor_wg_kwargs, rollout_kwargs
 
     def _start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
@@ -198,7 +204,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             rank (int): The rank of the current process.
             world_size (int): The total number of processes.
         """
-        # For trainer workers other than rank 0, their rank should be -1.
+        # For actor workers other than rank 0, their rank should be -1.
         if rank < 0:
             self.rank = rank
             self.world_size = world_size
@@ -221,17 +227,19 @@ class NCCLCheckpointEngine(CheckpointEngine):
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], extra_metadata: dict = None):
+    async def send_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int | None = None,
+    ):
         """Send the weights of the model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
-            extra_metadata: Optional metadata (e.g., peft_config) included in the first bucket's
-                ZMQ message. Extracted by receive_weights into self.last_extra_metadata.
         """
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
 
-        # For trainer rank other than 0, consume weights without sending.
+        # For actor rank other than 0, consume weights without sending.
         if self.rank < 0:
             for name, weight in weights:
                 pass
@@ -239,30 +247,24 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
         broadcast_op = None
-        extra_metadata_sent = False
 
         start_time = time.time()
         bucket_meta: dict[str, TensorMeta] = {}
         offset = 0
-        for name, weight in weights:
+        async for tensor_meta, chunk in split_weight_chunks(weights, self.bucket_size):
             # fill the tensor bucket
-            if offset + weight.nbytes > self.bucket_size:
+            if offset + tensor_meta.chunk_size > self.bucket_size:
                 torch.cuda.synchronize()
 
                 # wait previous broadcast op finish
                 if broadcast_op is not None:
                     await broadcast_op.wait_for_complete()
 
-                meta = {"bucket_meta": bucket_meta, "is_last": False}
-                if not extra_metadata_sent and extra_metadata is not None:
-                    meta["extra_metadata"] = extra_metadata
-                    extra_metadata_sent = True
-
                 broadcast_op = BroadcastOperation(
                     rank=self.rank,
                     group_name=self.group_name,
                     bucket=send_buf,
-                    metadata=meta,
+                    metadata={"bucket_meta": bucket_meta, "is_last": False},
                     socket=self.socket,
                     topic=self.topic,
                 )
@@ -272,33 +274,24 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 bucket_meta = {}
                 offset = 0
 
-            assert offset + weight.nbytes <= self.bucket_size, (
-                f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-            )
+            assert offset + tensor_meta.chunk_size <= self.bucket_size
+            assert tensor_meta.name not in bucket_meta
 
-            bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
-            }
-            send_buf[offset : offset + weight.nbytes] = cp.asarray(weight.view(-1).view(torch.uint8))
-            offset += weight.nbytes
+            tensor_meta.offset = offset
+            bucket_meta[tensor_meta.name] = tensor_meta
+            send_buf[offset : offset + tensor_meta.chunk_size] = cp.asarray(chunk)
+            offset += tensor_meta.chunk_size
 
         # broadcast last bucket
         torch.cuda.synchronize()
         if broadcast_op is not None:
             await broadcast_op.wait_for_complete()
 
-        meta = {"bucket_meta": bucket_meta, "is_last": True}
-        if not extra_metadata_sent and extra_metadata is not None:
-            meta["extra_metadata"] = extra_metadata
-
         broadcast_op = BroadcastOperation(
             rank=self.rank,
             group_name=self.group_name,
             bucket=send_buf,
-            metadata=meta,
+            metadata={"bucket_meta": bucket_meta, "is_last": True},
             socket=self.socket,
             topic=self.topic,
         )
@@ -306,11 +299,23 @@ class NCCLCheckpointEngine(CheckpointEngine):
         logger.info(f"Rank {self.rank} send weights done, time cost: {time.time() - start_time:.2f}s")
 
     @torch.no_grad()
-    async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    async def receive_weights(
+        self,
+        global_steps: int | None = None,
+    ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
         """Receive the weights of the model.
 
         Yields:
             A tuple of the name of the weight tensor and the tensor itself.
+        """
+        async for name, weight in merge_weight_chunks(self._receive_weight_chunks(), self.bucket_size):
+            yield name, weight
+
+    async def _receive_weight_chunks(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        """Receive the weight chunks of the model.
+
+        Yields:
+            A tuple of the name of the weight tensor and the chunk itself.
         """
         assert self.rank > 0, "Rank 0 should not receive weights."
         send_buf, recv_buf = self.send_buf, self.recv_buf
@@ -327,7 +332,6 @@ class NCCLCheckpointEngine(CheckpointEngine):
             topic=self.topic,
         )
         metadata = await broadcast_op.wait_for_complete()
-        self.last_extra_metadata = metadata.get("extra_metadata")
         total_bytes += self.bucket_size
         total_params += len(metadata["bucket_meta"])
 
@@ -345,11 +349,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
             )
 
             # 2. yield tensor from send_buf
-            for name, meta in metadata["bucket_meta"].items():
-                dtype, shape = meta["dtype"], meta["shape"]
-                size = dtype.itemsize * shape.numel()
-                tensor = send_buf[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-                yield name, tensor
+            for name, tensor_meta in metadata["bucket_meta"].items():
+                tensor = send_buf[tensor_meta.offset : tensor_meta.offset + tensor_meta.chunk_size]
+                yield tensor_meta, tensor
 
             # 3. wait for next bucket broadcast finish
             metadata = await broadcast_op.wait_for_complete()
@@ -361,11 +363,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
             send_buf, recv_buf = recv_buf, send_buf
 
         # yield tensor from send_buf
-        for name, meta in metadata["bucket_meta"].items():
-            dtype, shape = meta["dtype"], meta["shape"]
-            size = dtype.itemsize * shape.numel()
-            tensor = send_buf[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-            yield name, tensor
+        for name, tensor_meta in metadata["bucket_meta"].items():
+            tensor = send_buf[tensor_meta.offset : tensor_meta.offset + tensor_meta.chunk_size]
+            yield tensor_meta, tensor
 
         time_cost = time.time() - start_time
         bandwidth = total_bytes / time_cost / (1024 * 1024 * 1024)

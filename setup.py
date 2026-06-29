@@ -29,7 +29,7 @@ install_requires = [
     "datasets",
     "dill",
     "hydra-core",
-    "numpy<2.0.0",
+    "numpy>=2.0.0",
     "pandas",
     "peft",
     "pyarrow>=19.0.0",
@@ -38,7 +38,9 @@ install_requires = [
     "ray[default]>=2.41.0",
     "torchdata",
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
-    "transformers",
+    # 5.6.0 ships a broken flash-attention path (crashes on s_aux=None for
+    # sink-less models); fixed in 5.6.1. See huggingface/transformers#45588.
+    "transformers!=5.6.0",
     "wandb",
     "packaging>=20.0",
     "tensorboard",
@@ -85,7 +87,7 @@ setup(
     version=__version__,
     package_dir={"": "."},
     packages=find_packages(where="."),
-    url="https://github.com/volcengine/verl",
+    url="https://github.com/verl-project/verl",
     license="Apache 2.0",
     author="Bytedance - Seed - MLSys",
     author_email="zhangchi.usc1992@bytedance.com, gmsheng@connect.hku.hk",
