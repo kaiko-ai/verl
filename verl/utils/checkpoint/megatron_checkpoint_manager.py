@@ -583,6 +583,36 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 torch.distributed.barrier()
 
         if self.should_save_model:
+            # KAIKO-STOPGAP(upstream #6842): write the HF config/tokenizer BEFORE the bridge
+            # weight-save. mbridge reads the on-disk HF config to infer the shard/param layout;
+            # if the weight-save runs first on a fresh dir it silently drops MoE expert params
+            # (seen on Qwen3.5-35B-A3B) and the checkpoint won't reload. Paired with the json
+            # default=str stopgap further below (upstream #6335). Both are back-ports onto this
+            # pre-refactor manager — on the next upstream sync DROP BOTH: upstream's refactored
+            # _save_checkpoint already writes config-first (+barrier) and sanitizes the config dump.
+            if self.rank == 0:
+                # Save tokenizer
+                hf_config_tokenizer_path = get_hf_model_checkpoint_path(local_path)
+                if self.processing_class is not None:
+                    self.processing_class.save_pretrained(hf_config_tokenizer_path)
+                # Save huggingface config
+                self.hf_config.save_pretrained(hf_config_tokenizer_path)
+                if hasattr(self.hf_config, "name_or_path") and self.hf_config.name_or_path:
+                    try:
+                        generation_config = GenerationConfig.from_pretrained(self.hf_config.name_or_path)
+                        generation_config.save_pretrained(hf_config_tokenizer_path)
+                    except Exception:
+                        # if the generation config isn't available, we don't save it
+                        pass
+                log_with_rank(
+                    f"Saved Huggingface config and tokenizer to {hf_config_tokenizer_path}",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+            # rank 0's config write must be visible to all ranks before the bridge reads it
+            torch.distributed.barrier()
+
             if self.use_hf_checkpoint:
                 # Use mbridge to save HF model checkpoint
                 log_with_rank(f"Saving HF model checkpoint to {local_path} with bridge", rank=self.rank, logger=logger)
@@ -610,29 +640,6 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                         self.bridge.save_hf_weights(self.model, hf_ckpt_path)
 
                 log_with_rank(f"Saved bridge checkpoint to {hf_ckpt_path}", rank=self.rank, logger=logger)
-
-            # Only rank 0 saves the hf config and tokenizer to huggingface path
-            # No matter whether we save hf model or not
-            if self.rank == 0:
-                # Save tokenizer
-                hf_config_tokenizer_path = get_hf_model_checkpoint_path(local_path)
-                if self.processing_class is not None:
-                    self.processing_class.save_pretrained(hf_config_tokenizer_path)
-                # Save huggingface config
-                self.hf_config.save_pretrained(hf_config_tokenizer_path)
-                if hasattr(self.hf_config, "name_or_path") and self.hf_config.name_or_path:
-                    try:
-                        generation_config = GenerationConfig.from_pretrained(self.hf_config.name_or_path)
-                        generation_config.save_pretrained(hf_config_tokenizer_path)
-                    except Exception:
-                        # if the generation config isn't available, we don't save it
-                        pass
-                log_with_rank(
-                    f"Saved Huggingface config and tokenizer to {hf_config_tokenizer_path}",
-                    rank=self.rank,
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
 
         if self.should_save_extra:
             if self.rank == 0:
@@ -668,10 +675,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 for key in pop_keys:
                     transformer_config_dict.pop(key)
                 transformer_config_path = get_transformer_config_checkpoint_path(local_path)
-                # KAIKO-STOPGAP(upstream #6335 / bc3f3bf0): that commit replaces this block with
-                # _to_json_safe_config_dict(). Until the fork syncs past it, default=str stops
-                # json.dump crashing on newer TransformerConfig types (e.g. InferenceCudaGraphScope).
-                # This file is write-only provenance metadata — nothing reads it back on load.
+                # KAIKO-STOPGAP(upstream #6335 / bc3f3bf0): default=str stops json.dump crashing
+                # on newer TransformerConfig types (e.g. InferenceCudaGraphScope). Write-only
+                # provenance sidecar — nothing reads it back on load. Paired with the #6842
+                # config-order stopgap above; DROP BOTH on the next upstream sync (that commit
+                # replaces this block with _to_json_safe_config_dict()).
                 with open(transformer_config_path, "w") as f:
                     json.dump(transformer_config_dict, f, indent=2, default=str)
 
