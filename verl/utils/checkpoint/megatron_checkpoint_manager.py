@@ -668,8 +668,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 for key in pop_keys:
                     transformer_config_dict.pop(key)
                 transformer_config_path = get_transformer_config_checkpoint_path(local_path)
+                # KAIKO-STOPGAP(upstream #6335 / bc3f3bf0): that commit replaces this block with
+                # _to_json_safe_config_dict(). Until the fork syncs past it, default=str stops
+                # json.dump crashing on newer TransformerConfig types (e.g. InferenceCudaGraphScope).
+                # This file is write-only provenance metadata — nothing reads it back on load.
                 with open(transformer_config_path, "w") as f:
-                    json.dump(transformer_config_dict, f, indent=2)
+                    json.dump(transformer_config_dict, f, indent=2, default=str)
 
         if self.should_save_hf_model and not self.use_hf_checkpoint:
             # wait for everyone to dump to local
