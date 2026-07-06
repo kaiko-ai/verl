@@ -116,4 +116,11 @@ class LinearCrossEntropy(torch.autograd.Function):
         return (d_hidden, d_weight, None, None, None, None)
 
 
-linear_cross_entropy = LinearCrossEntropy.apply
+def linear_cross_entropy(hidden, weight, labels, temperature=1.0, reduction="none", dist_process_group=None):
+    # FSDP2 keeps the master weight in fp32 and only casts it to param_dtype inside the module
+    # forward hook; the fused kernel reads .weight directly and bypasses that hook, so coerce the
+    # weight to the activation dtype here. Autograd-tracked (grad flows back to the fp32 leaf).
+    # No-op under FSDP1, where the flat param is already cast.
+    if weight.dtype != hidden.dtype:
+        weight = weight.to(hidden.dtype)
+    return LinearCrossEntropy.apply(hidden, weight, labels, temperature, reduction, dist_process_group)
