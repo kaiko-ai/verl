@@ -82,6 +82,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def get_vl_model_vision_tower(vl_model_instance):
+    """Extract the vision tower from a VL model instance, or None if absent."""
+    if hasattr(vl_model_instance, "model") and hasattr(vl_model_instance.model, "visual"):
+        return vl_model_instance.model.visual  # transformers >= 4.52.0
+    elif hasattr(vl_model_instance, "visual"):
+        return vl_model_instance.visual  # transformers < 4.52.0
+    return None
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -576,8 +585,6 @@ class FSDPEngine(BaseEngine):
 
         # Freeze vision tower before FSDP wrapping so FSDP2 sees correct requires_grad state
         if getattr(self.model_config, "freeze_vision_tower", False):
-            from verl.workers.fsdp_workers import get_vl_model_vision_tower
-
             vision_tower = get_vl_model_vision_tower(module)
             if vision_tower is not None:
                 vision_tower.requires_grad_(False)
