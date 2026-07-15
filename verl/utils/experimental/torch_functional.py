@@ -220,6 +220,10 @@ class FusedLinearForPPO(torch.nn.Module):
         temperature: float = 1.0,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         input_ids = input_ids.to(torch.int64)
+        # FSDP2 keeps the master weight fp32 (only cast inside the module hook, which this fused
+        # path bypasses); coerce to the activation dtype so the kernel gets matching operands.
+        if vocab_weights.dtype != hidden_states.dtype:
+            vocab_weights = vocab_weights.to(hidden_states.dtype)
         return FusedLinearForPPOFunction.apply(
             hidden_states,
             vocab_weights,
