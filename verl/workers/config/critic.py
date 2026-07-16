@@ -80,6 +80,10 @@ class CriticConfig(BaseConfig):
     strategy: str = MISSING
     ppo_micro_batch_size_per_gpu: Optional[int] = None
     enable: Optional[bool] = None
+    # n_gpus_per_node > 0 places the critic on its own resource pool (SAO separate critic pool);
+    # 0 keeps it colocated on the trainer pool. Consumed by the kaiko fully-async pool allocator.
+    n_gpus_per_node: int = 0
+    nnodes: int = 1
     rollout_n: int = 1
     ppo_mini_batch_size: int = 1
     use_dynamic_bsz: bool = False

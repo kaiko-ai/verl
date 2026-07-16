@@ -263,6 +263,45 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+@register_adv_est("vapo_gae")
+def compute_gae_advantage_return_vapo(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: torch.Tensor,
+    alpha: float = 1.5,
+):
+    """SAO/VAPO length-adaptive-λ GAE.
+
+    The POLICY advantage uses a per-sequence ``λ = 1 - 1/(α·L)`` (L = valid response-token count in
+    that sequence), while the critic RETURNS use ``λ = 1`` (Monte-Carlo target). Long trajectories get
+    λ closer to 1 (less bias); α controls the length scaling (SAO/VAPO use α≈1.5). Observation-token
+    skipping matches ``compute_gae_advantage_return``. Invoked via an explicit branch in
+    ``compute_advantage`` (the generic dispatch path does not supply values/gamma).
+    """
+    with torch.no_grad():
+        gen_len = token_level_rewards.shape[-1]
+        seq_len = response_mask.sum(dim=-1).clamp(min=1.0)  # (bs,) valid response tokens
+        lam_policy = (1.0 - 1.0 / (alpha * seq_len)).clamp(0.0, 1.0)  # (bs,)
+
+        def _gae(lam):  # lam: scalar or (bs,) tensor
+            nextvalues = 0
+            lastgaelam = 0
+            adv_reversed = []
+            for t in reversed(range(gen_len)):
+                delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
+                lastgaelam_ = delta + gamma * lam * lastgaelam
+                nextvalues = values[:, t] * response_mask[:, t] + (1 - response_mask[:, t]) * nextvalues
+                lastgaelam = lastgaelam_ * response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
+                adv_reversed.append(lastgaelam)
+            return torch.stack(adv_reversed[::-1], dim=1)
+
+        advantages = _gae(lam_policy)  # policy advantage: adaptive λ
+        returns = _gae(torch.ones_like(lam_policy)) + values  # critic target: λ=1 (MC)
+        advantages = verl_F.masked_whiten(advantages, response_mask)
+    return advantages, returns
+
+
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
@@ -2463,6 +2502,29 @@ def compute_policy_loss_bypass_mode(
             config=config,
             rollout_is_weights=computed_is_weights,
         )
+
+    elif loss_type == "sao_dis":
+        # SAO Direct double-sided Importance Sampling (paper Eq. 1): L = f(r)·Â·log π_θ, where
+        # r = π_θ/π_rollout (bypass mode: old_log_prob IS rollout_log_prob), and f(x)=x inside the
+        # band (1-ε_low, 1+ε_high) else 0 (out-of-band tokens get zero gradient — masked, not clipped).
+        # This is REINFORCE (Â·log π_θ) weighted by the detached band-masked rollout ratio, so we reuse
+        # compute_policy_loss_reinforce with rollout_is_weights = f(r). ε_low/ε_high = clip_ratio_low/high.
+        eps_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+        eps_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+        with torch.no_grad():
+            ratio = torch.exp(torch.clamp(log_prob - rollout_log_prob, min=-20.0, max=20.0))
+            in_band = (ratio > (1.0 - eps_low)) & (ratio < (1.0 + eps_high))
+            sao_weights = torch.where(in_band, ratio, torch.zeros_like(ratio))
+        pg_loss, pg_metrics = compute_policy_loss_reinforce(
+            rollout_log_prob=rollout_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=effective_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_is_weights=sao_weights,
+        )
+        pg_metrics["actor/sao_band_keep_frac"] = verl_F.masked_mean(in_band.float(), effective_mask).detach().item()
 
     elif loss_type == "ppo_clip":
         # PPO-clip: The ratio π_current/π_old = π_current/π_rollout already handles IS

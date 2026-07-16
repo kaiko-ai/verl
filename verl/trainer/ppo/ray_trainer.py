@@ -232,6 +232,19 @@ def compute_advantage(
                 config.pf_ppo.get("reweight_method"),
                 config.pf_ppo.get("weight_pow"),
             )
+    elif adv_estimator == "vapo_gae":
+        # SAO/VAPO length-adaptive-λ GAE. Needs values+gamma (the generic dispatch path below does
+        # not supply them), so it gets an explicit branch mirroring GAE. Requires the critic
+        # (critic.enable: true / values in batch), same as GAE.
+        advantages, returns = core_algos.compute_gae_advantage_return_vapo(
+            token_level_rewards=data.batch["token_level_rewards"],
+            values=data.batch["values"],
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+            alpha=config.get("vapo_alpha", 0.05) if config is not None else 0.05,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]

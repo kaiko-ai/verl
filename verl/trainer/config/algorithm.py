@@ -652,6 +652,9 @@ class AlgoConfig(BaseConfig):
     lam: float = 1.0
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
+    # SAO/VAPO length-adaptive-λ GAE (adv_estimator="vapo_gae"): policy advantage uses per-sequence
+    # λ = 1 - 1/(α·L), so the effective horizon 1/(1-λ) ≈ α·L scales with response length L. VAPO uses α≈0.05.
+    vapo_alpha: float = 0.05
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

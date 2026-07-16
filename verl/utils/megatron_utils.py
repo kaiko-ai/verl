@@ -279,6 +279,31 @@ def make_megatron_module(
             post_model_creation_callbacks.append(_freeze_with_log)
         else:
             print("[freeze] Not attaching _freeze_with_log callback")
+        if override_model_config.get("freeze_attention", False):
+
+            def _freeze_attention(model, **_kwargs):
+                # SAO frozen-attention critic: freeze self-attention params so only FFN/router/value
+                # head train. mcore names attention params under ".self_attention." (linear_qkv,
+                # linear_proj, q/k_layernorm, core_attention). mbridge hands the callback the full
+                # list of model-parallel chunks, so iterate chunks (single module also supported).
+                chunks = model if isinstance(model, list) else [model]
+                total = sum(p.numel() for m in chunks for p in m.parameters())
+                trainable_before = sum(p.numel() for m in chunks for p in m.parameters() if p.requires_grad)
+                frozen = 0
+                for m in chunks:
+                    for name, p in m.named_parameters():
+                        if ".self_attention." in name and p.requires_grad:
+                            p.requires_grad = False
+                            frozen += p.numel()
+                trainable_after = sum(p.numel() for m in chunks for p in m.parameters() if p.requires_grad)
+                print(
+                    f"[freeze_attention] total={total:,} trainable_before={trainable_before:,} "
+                    f"trainable_after={trainable_after:,} frozen_attn={frozen:,}"
+                )
+                return model
+
+            print("[freeze] Attaching _freeze_attention callback")
+            post_model_creation_callbacks.append(_freeze_attention)
         if provider is not None:
             from megatron.bridge.peft.utils import create_peft_hook, load_peft_adapter_checkpoint
             from megatron.bridge.training.utils.config_utils import create_ddp_config
