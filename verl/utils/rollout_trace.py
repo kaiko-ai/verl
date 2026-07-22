@@ -214,6 +214,13 @@ def rollout_trace_attr(
         tracer = RolloutTraceConfig.get_client()
         span_attributes = {str(k): str(v) for k, v in attributes.items()}
         span_attributes["openinference.span.kind"] = "CHAIN"
+        # KAIKO_RUN_ID (audit-folder UUID / Ray submission id) uniquely identifies the
+        # training run; experiment_name alone collides across resubmissions. Doubling it
+        # as the OpenInference session id groups a run's traces in Arize's Sessions tab.
+        kaiko_run_id = os.environ.get("KAIKO_RUN_ID")
+        if kaiko_run_id:
+            span_attributes["kaiko_run_id"] = kaiko_run_id
+            span_attributes["session.id"] = kaiko_run_id
         try:
             with tracer.start_as_current_span(
                 name=name,
@@ -588,6 +595,18 @@ def _auto_attach_trace_conversation(result) -> None:
         span_kind="AGENT",
     )
     result.trace_conversation = None
+
+
+def rollout_trace_current_trace_id() -> str | None:
+    """Return the 32-hex trace id of the root rollout trace span, or None when untraced.
+
+    Only valid inside a ``rollout_trace_attr`` context with a recording span; callers
+    use it to correlate a rollout's output with its trace in the backend (e.g. Arize).
+    """
+    span = _root_trace_span.get()
+    if span is None or not span.is_recording():
+        return None
+    return format(span.get_span_context().trace_id, "032x")
 
 
 def _message_text(msg: dict) -> str | None:

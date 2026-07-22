@@ -545,7 +545,7 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, trace_ids=None):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -604,6 +604,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_trace_ids = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -690,7 +691,20 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+            # collect rollout trace ids (set by the agent loop when tracing is enabled;
+            # _postprocess expands extra_fields keys into non_tensor_batch columns)
+            trace_id_col = test_batch.non_tensor_batch.get("rollout_trace_id")
+            if trace_id_col is not None:
+                sample_trace_ids.extend(trace_id_col.tolist())
+            else:
+                sample_trace_ids.extend([None] * reward_tensor.shape[0])
+
+        self._maybe_log_val_generations(
+            inputs=sample_inputs,
+            outputs=sample_outputs,
+            scores=sample_scores,
+            trace_ids=sample_trace_ids if any(t is not None for t in sample_trace_ids) else None,
+        )
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)

@@ -57,6 +57,7 @@ from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
+    rollout_trace_current_trace_id,
 )
 from verl.utils.skip import SkipManager
 from verl.utils.tokenizer import (
@@ -622,7 +623,11 @@ class AgentLoopWorker:
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
         # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        if not trace_this_step:
+        # Validation bypasses both the step interval and the per-worker sample cap: every
+        # validation episode is traced so downstream tables can link each row to its trace.
+        if validate:
+            traced_indices = set(range(len(batch)))
+        elif not trace_this_step:
             traced_indices = set()
         elif max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
@@ -695,6 +700,9 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            trace_id = rollout_trace_current_trace_id()
+            if trace_id is not None:
+                output.extra_fields["rollout_trace_id"] = trace_id
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(

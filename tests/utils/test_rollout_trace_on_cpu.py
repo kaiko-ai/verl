@@ -607,6 +607,48 @@ async def test_auto_attach_conversation_targets_root_span():
     provider.shutdown()
 
 
+async def test_rollout_trace_current_trace_id_and_run_id(monkeypatch):
+    """Inside rollout_trace_attr: trace id is retrievable and KAIKO_RUN_ID stamps the root span."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+
+    from verl.utils.rollout_trace import rollout_trace_current_trace_id
+
+    monkeypatch.setenv("KAIKO_RUN_ID", "run-1234abcd")
+
+    exporter = InMemorySpanExporter()
+    provider = OITracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-trace-id")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    assert rollout_trace_current_trace_id() is None  # outside any trace context
+
+    captured = {}
+    with rollout_trace_attr(step=1, sample_index=0, rollout_n=0, name="agent_loop"):
+        captured["trace_id"] = rollout_trace_current_trace_id()
+
+    assert captured["trace_id"] is not None
+    assert len(captured["trace_id"]) == 32
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    assert len(exported) == 1
+    root = exported[0]
+    assert format(root.context.trace_id, "032x") == captured["trace_id"]
+    attrs = dict(root.attributes)
+    assert attrs.get("kaiko_run_id") == "run-1234abcd"
+    assert attrs.get("session.id") == "run-1234abcd"
+
+    provider.shutdown()
+
+
 async def test_auto_attach_noop_when_none():
     """No trace_conversation on result → no error, no conversation attributes."""
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
