@@ -701,9 +701,12 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            trace_id = rollout_trace_current_trace_id()
-            if trace_id is not None:
-                output.extra_fields["rollout_trace_id"] = trace_id
+            if RolloutTraceConfig.get_backend() is not None:
+                # Set the keys on every rollout (None when this sample is not traced):
+                # extra_fields keys become non_tensor_batch columns and DataProto.concat
+                # requires identical keys, so sampled tracing must not make batches
+                # heterogeneous.
+                output.extra_fields["rollout_trace_id"] = rollout_trace_current_trace_id()
                 output.extra_fields["rollout_span_id"] = rollout_trace_current_span_id()
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
