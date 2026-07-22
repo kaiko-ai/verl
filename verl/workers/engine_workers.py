@@ -638,6 +638,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
 
+            # Disaggregated trainer (no colocated rollout): variable-length packed
+            # batches fragment the caching allocator, so run with expandable segments
+            # permanently on. The colocated path instead toggles this around each
+            # naive-mode weight sync in update_weights.
+            if "rollout" not in self.role:
+                set_expandable_segments(True)
+
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
 
