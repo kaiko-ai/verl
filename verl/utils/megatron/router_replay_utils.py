@@ -353,6 +353,30 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
                 moe_idx += 1
 
 
+def set_model_router_replay_action(model, action):
+    """Toggle the router-replay action on the FORWARDED model's own TopKRouter routers.
+
+    Mirrors set_router_replay_data's module-walk: it addresses each layer's real router by type,
+    bypassing the process-global RouterReplay.router_instances positional slice. That slice can
+    hold orphan routers (observed 48 vs 24 from the Qwen3VL decoder doubling), so the positional
+    toggle never reaches the real routers, leaving them stuck in REPLAY_FORWARD; the backward
+    recompute then reads a stale cross-micro-batch target_topk_idx instead of popping its own
+    per-micro-batch entry from replay_backward_list.
+    """
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    if model is None:
+        return 0
+    walk = model if isinstance(model, (list, tuple)) else [model]
+    n = 0
+    for m in walk:
+        for mod in m.modules():
+            if isinstance(mod, TopKRouter) and getattr(mod, "router_replay", None) is not None:
+                mod.router_replay.set_router_replay_action(action)
+                n += 1
+    return n
+
+
 def reorder_and_merge_vpp_layers(
     micro_batch_tensor_list,
     num_microbatches: int,
