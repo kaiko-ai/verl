@@ -609,6 +609,18 @@ def rollout_trace_current_trace_id() -> str | None:
     return format(span.get_span_context().trace_id, "032x")
 
 
+def rollout_trace_current_span_id() -> str | None:
+    """Return the 16-hex span id of the root rollout trace span, or None when untraced.
+
+    Post-hoc span evaluations (e.g. Arize update_evaluations) attach by span id;
+    the root span makes them trace-level.
+    """
+    span = _root_trace_span.get()
+    if span is None or not span.is_recording():
+        return None
+    return format(span.get_span_context().span_id, "016x")
+
+
 def _message_text(msg: dict) -> str | None:
     """Extract the plain-text content of a chat message, or None if it has none."""
     content = msg.get("content")

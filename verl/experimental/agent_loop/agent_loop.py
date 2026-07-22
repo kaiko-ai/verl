@@ -57,6 +57,7 @@ from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
+    rollout_trace_current_span_id,
     rollout_trace_current_trace_id,
 )
 from verl.utils.skip import SkipManager
@@ -703,6 +704,7 @@ class AgentLoopWorker:
             trace_id = rollout_trace_current_trace_id()
             if trace_id is not None:
                 output.extra_fields["rollout_trace_id"] = trace_id
+                output.extra_fields["rollout_span_id"] = rollout_trace_current_span_id()
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(

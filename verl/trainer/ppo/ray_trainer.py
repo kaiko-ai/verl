@@ -605,6 +605,7 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
         sample_trace_ids = []
+        sample_span_ids = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -691,13 +692,18 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-            # collect rollout trace ids (set by the agent loop when tracing is enabled;
-            # _postprocess expands extra_fields keys into non_tensor_batch columns)
+            # collect rollout trace/span ids (set by the agent loop when tracing is
+            # enabled; _postprocess expands extra_fields keys into non_tensor_batch columns)
             trace_id_col = test_batch.non_tensor_batch.get("rollout_trace_id")
             if trace_id_col is not None:
                 sample_trace_ids.extend(trace_id_col.tolist())
             else:
                 sample_trace_ids.extend([None] * reward_tensor.shape[0])
+            span_id_col = test_batch.non_tensor_batch.get("rollout_span_id")
+            if span_id_col is not None:
+                sample_span_ids.extend(span_id_col.tolist())
+            else:
+                sample_span_ids.extend([None] * reward_tensor.shape[0])
 
         self._maybe_log_val_generations(
             inputs=sample_inputs,
@@ -730,9 +736,11 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources, sample_uids, reward_extra_infos_dict, sample_turns, span_ids=sample_span_ids
+        )
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns, span_ids=None):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
