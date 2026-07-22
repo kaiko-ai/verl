@@ -912,7 +912,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
             layers_topk_idx = model_inputs["routed_experts"]
-            set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank)
+            set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank, model=unwrapped_model)
 
         if pad_mode == DatasetPadMode.NO_PADDING:
             label = input_ids.clone()
