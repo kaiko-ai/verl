@@ -590,6 +590,21 @@ def _auto_attach_trace_conversation(result) -> None:
     result.trace_conversation = None
 
 
+def _message_text(msg: dict) -> str | None:
+    """Extract the plain-text content of a chat message, or None if it has none."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content or None
+    if content is not None and not isinstance(content, list) and hasattr(content, "__iter__"):
+        content = list(content)
+    if isinstance(content, list):
+        text = "\n".join(
+            item.get("text", "") for item in content if hasattr(item, "get") and item.get("type") == "text"
+        )
+        return text or None
+    return None
+
+
 def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
     """Encode a PIL image to a base64 data URI. Returns None if img is not a valid image."""
     if not hasattr(img, "save"):
@@ -620,12 +635,18 @@ def rollout_trace_attach_conversation(
     max_dimension: int | None = None,
     span_kind: str | None = None,
 ):
-    """Attach a conversation (messages + images) to the current trace span.
+    """Attach a conversation (messages + images) to the root trace span.
 
     For the Arize backend, serializes the conversation as OpenInference
     ``llm.input_messages`` attributes with roles, text, and inline images.
     Image placeholders (``{"type": "image"}``) in message content are resolved
     to base64-encoded images from the ``images`` list, consumed in order.
+
+    Targets the root span opened by ``rollout_trace_attr`` (falling back to the
+    current span outside that context) so the trace list renders the episode the
+    way Arize expects: kind, input and output on the top-level row. Also derives
+    ``input.value`` from the first user message and ``output.value`` from the
+    last assistant message.
 
     Should be called once at the end of a ``@rollout_trace_op``-decorated function.
 
@@ -655,12 +676,27 @@ def rollout_trace_attach_conversation(
 
     from opentelemetry import trace
 
-    span = trace.get_current_span()
+    span = _root_trace_span.get()
+    if span is None or not span.is_recording():
+        span = trace.get_current_span()
     if not span.is_recording():
         return
 
     if span_kind:
         span.set_attribute("openinference.span.kind", span_kind)
+
+    first_user_text = next(
+        (_message_text(m) for m in messages if m.get("role") == "user" and _message_text(m)), None
+    )
+    last_assistant_text = next(
+        (_message_text(m) for m in reversed(messages) if m.get("role") == "assistant" and _message_text(m)), None
+    )
+    if first_user_text is not None:
+        span.set_attribute("input.value", first_user_text)
+        span.set_attribute("input.mime_type", "text/plain")
+    if last_assistant_text is not None:
+        span.set_attribute("output.value", last_assistant_text)
+        span.set_attribute("output.mime_type", "text/plain")
 
     image_idx = 0
     images = images or []
