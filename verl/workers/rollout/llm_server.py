@@ -254,7 +254,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
     invisible to the AgentLoop.
     """
 
-    @rollout_trace_op
+    # No @rollout_trace_op: this override delegates to LLMServerClient.generate,
+    # which is already traced — decorating both produced two identical nested
+    # spans per turn (pure span-budget waste).
     async def generate(
         self,
         request_id,
