@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import time
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -704,7 +705,27 @@ class vLLMHttpServer:
         self.global_steps = global_steps
 
     async def wait_for_requests_to_drain(self):
-        await self.engine.wait_for_requests_to_drain()
+        # Bound the weight-sync drain so a genuinely stuck engine raises instead of hanging forever.
+        drain_timeout = 1200.0
+        start = time.time()
+        while True:
+            in_flight = len(self.engine.output_processor.request_states)
+            dp_running = self.engine.engine_core.dp_engines_running()
+            if not dp_running and in_flight <= 0:
+                return
+            # Re-abort any request admitted after the initial abort snapshot. Bounded because the
+            # rollouter is paused (pause_for_sync); a targeted abort that does not re-enter the DP
+            # pause consensus.
+            if in_flight > 0:
+                ids = list(self.engine.output_processor.request_states.keys())
+                if ids:
+                    await self.engine.abort(ids)
+            if time.time() - start >= drain_timeout:
+                raise TimeoutError(
+                    f"Timed out after {drain_timeout}s waiting for requests to drain "
+                    f"(in_flight={in_flight}, dp_running={dp_running})"
+                )
+            await asyncio.sleep(1)
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.
