@@ -62,6 +62,7 @@ from verl.utils.megatron_utils import (
     patch_engine_mtp,
     register_megatron_training_hooks,
     unwrap_model,
+    warmup_nccl_communicators,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
 from verl.utils.seqlen_balancing import restore_dynamic_batch
@@ -474,6 +475,11 @@ class MegatronEngine(BaseEngine):
         )
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
+
+        if self.engine_config.nccl_comm_warmup:
+            warmed = warmup_nccl_communicators()
+            logger.warning("[nccl-warmup] eagerly initialized %d parallel-group communicators: %s", len(warmed), warmed)
+            log_gpu_memory_usage("After NCCL communicator warmup", logger=logger)
 
     def train_mode(self, **kwargs):
         """
