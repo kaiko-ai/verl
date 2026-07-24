@@ -148,6 +148,20 @@ class vLLMHttpServer:
         self.global_steps = None
         self._warned_missing_spec_decode_stats = False
 
+        # Submitter gate for the weight-sync drain: park rollout turns (esp. multi-turn agent
+        # continuations) that would otherwise admit AFTER the abort snapshot and hang the DP
+        # drain. See abort_all_requests / generate below.
+        self._submission_paused = False
+        self._admitting = 0
+        self._resume_event = asyncio.Event()
+        self._resume_event.set()
+        logger.warning(
+            "### KAIKO-DRAINFIX vLLMHttpServer __init__ (submitter-gate v1) replica=%s node=%s "
+            "-- patched verl via LOCAL_VERL IS ACTIVE",
+            self.replica_rank,
+            self.node_rank,
+        )
+
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
             self.config.load_format = "auto"
@@ -549,18 +563,44 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        generator = self.engine.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
-        )
+        # Submitter gate (weight-sync drain-hang fix): if a sync pause is in effect, park this
+        # turn until resume so its admission can't land after the abort snapshot. The loop-exit
+        # check and the _admitting bump have NO await between them -> atomic under the actor's
+        # single event loop, so abort_all_requests can't snapshot while we slip in.
+        parked = False
+        while self._submission_paused:
+            if not parked:
+                parked = True
+                logger.warning(
+                    "### KAIKO-DRAINFIX generate PARKED request_id=%s (submission paused for weight sync)",
+                    request_id,
+                )
+            await self._resume_event.wait()
+        self._admitting += 1
+        if parked:
+            logger.warning("### KAIKO-DRAINFIX generate RESUMED request_id=%s", request_id)
 
-        # Get final response
+        # Get final response. Decrement _admitting on the first output (admission has reached
+        # the engine by then); the finally covers the zero-output (immediate abort) case so the
+        # counter always balances.
         final_res: Optional[RequestOutput] = None
-        async for output in generator:
-            final_res = output
+        admitted = False
+        try:
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
+            async for output in generator:
+                if not admitted:
+                    admitted = True
+                    self._admitting -= 1
+                final_res = output
+        finally:
+            if not admitted:
+                self._admitting -= 1
         assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
@@ -744,6 +784,30 @@ class vLLMHttpServer:
         """
         try:
             if _VLLM_VERSION >= version.parse("0.12.0"):
+                # Close the submitter gate BEFORE the abort snapshot, then wait for any turn
+                # already past the gate (admission in flight, not yet in the engine) to land.
+                # This is what prevents a post-snapshot orphan -> DP phantom-wave drain hang.
+                self._submission_paused = True
+                self._resume_event.clear()
+                _gate_t0 = time.time()
+                _spins = 0
+                while self._admitting > 0:
+                    if time.time() - _gate_t0 > 60.0:
+                        logger.warning(
+                            "### KAIKO-DRAINFIX abort_all_requests: gate barrier TIMEOUT after 60s, "
+                            "_admitting=%s still in flight -- proceeding to snapshot anyway",
+                            self._admitting,
+                        )
+                        break
+                    _spins += 1
+                    await asyncio.sleep(0.01)
+                logger.warning(
+                    "### KAIKO-DRAINFIX abort_all_requests: submitter gate CLOSED, in-flight "
+                    "admissions drained (_admitting=%s, spins=%s, %.3fs) -> taking abort snapshot",
+                    self._admitting,
+                    _spins,
+                    time.time() - _gate_t0,
+                )
                 # Snapshot request IDs before pausing for reporting
                 request_ids = list(self.engine.output_processor.request_states.keys())
 
@@ -801,6 +865,16 @@ class vLLMHttpServer:
         Only effective on vLLM >= 0.12.0 where pause_generation is used.
         No-op on older versions.
         """
+        # Reopen the submitter gate and wake any parked turns. Done before the node_rank guard
+        # so the flag is always cleared, even on non-head servers.
+        if self._submission_paused:
+            logger.warning(
+                "### KAIKO-DRAINFIX resume_generation: reopening submitter gate (replica=%s node=%s)",
+                self.replica_rank,
+                self.node_rank,
+            )
+        self._submission_paused = False
+        self._resume_event.set()
         if self.node_rank != 0:
             return
         if _VLLM_VERSION >= version.parse("0.12.0"):
