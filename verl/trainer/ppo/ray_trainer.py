@@ -692,8 +692,7 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-            # collect rollout trace/span ids (set by the agent loop when tracing is
-            # enabled; _postprocess expands extra_fields keys into non_tensor_batch columns)
+            # rollout trace/span ids are stamped by the agent loop when tracing is enabled
             trace_id_col = test_batch.non_tensor_batch.get("rollout_trace_id")
             if trace_id_col is not None:
                 sample_trace_ids.extend(trace_id_col.tolist())
