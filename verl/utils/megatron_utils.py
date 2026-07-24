@@ -258,23 +258,28 @@ def make_megatron_module(
         if freeze_vision_model or freeze_vision_projection or freeze_language_model:
 
             def _freeze_with_log(model, **_kwargs):
-                # Log pre/post trainable param counts so freeze application is observable
-                # in worker logs (model.freeze itself is silent in mcore VL models).
-                total = sum(p.numel() for p in model.parameters())
-                trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                model.freeze(
-                    freeze_language_model=freeze_language_model,
-                    freeze_vision_model=freeze_vision_model,
-                    freeze_vision_projection=freeze_vision_projection,
-                )
-                trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                # Under (virtual) pipeline parallelism megatron-bridge passes the model as a LIST
+                # of chunks, not a single module; freeze each chunk (the vision tower lives only on
+                # the first stage, so freeze() is a no-op on the others). Log pre/post trainable
+                # counts so the freeze is observable (model.freeze is silent in mcore VL models).
+                chunks = model if isinstance(model, list) else [model]
+                total = sum(p.numel() for m in chunks for p in m.parameters())
+                trainable_before = sum(p.numel() for m in chunks for p in m.parameters() if p.requires_grad)
+                for m in chunks:
+                    m.freeze(
+                        freeze_language_model=freeze_language_model,
+                        freeze_vision_model=freeze_vision_model,
+                        freeze_vision_projection=freeze_vision_projection,
+                    )
+                trainable_after = sum(p.numel() for m in chunks for p in m.parameters() if p.requires_grad)
                 print(
                     f"[freeze] flags(language={freeze_language_model}, "
                     f"vision={freeze_vision_model}, projection={freeze_vision_projection}) "
-                    f"total={total:,} trainable_before={trainable_before:,} "
+                    f"chunks={len(chunks)} total={total:,} trainable_before={trainable_before:,} "
                     f"trainable_after={trainable_after:,} "
                     f"frozen_delta={trainable_before - trainable_after:,}"
                 )
+                return model
             print("[freeze] Attaching _freeze_with_log callback")
             post_model_creation_callbacks.append(_freeze_with_log)
         else:
