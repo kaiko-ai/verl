@@ -77,6 +77,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class MegatronEngine(BaseEngine):
+    # Sized for bf16, where a non-finite gradient is always a real defect: a transient survives one
+    # skip because the next batch differs, so 5 in a row means a systematic source. fp16 needs a far
+    # larger value -- its grad scaler legitimately overflows once per halving (twice, at the default
+    # hysteresis=2) while calibrating down from initial_loss_scale, so 5 aborts mid-calibration.
     _MAX_CONSECUTIVE_NONFINITE_SKIPS = 5
     _nonfinite_skips = 0
 
@@ -514,6 +518,46 @@ class MegatronEngine(BaseEngine):
             # if use distributed optimizer, zero grad buffer will be handled by optimizer
             chunk.zero_grad_buffer()
 
+    def _find_nonfinite_grads(self):
+        """Detect non-finite gradients, agreed collectively. Returns (found, per-buffer detail).
+
+        bf16 builds no grad scaler, so Megatron never reports non-finite gradients and an
+        unguarded NaN is written straight into the weights. The decision must be identical on
+        every rank -- a rank-local skip desyncs the collectives -- hence the all-reduce.
+        """
+        local_bad = 0
+        detail = []
+        chunks = self.module if isinstance(self.module, list) else [self.module]
+        for chunk_idx, chunk in enumerate(chunks):
+            # nn.Module.buffers() is a method; Megatron's DDP shadows it with a list. Only the
+            # list form holds the contiguous grad buffers we want.
+            buffers = getattr(chunk, "buffers", None)
+            if isinstance(buffers, (list, tuple)) and buffers:
+                for buf_idx, buf in enumerate(buffers):
+                    data = getattr(buf, "grad_data", None)
+                    if data is None or data.numel() == 0:
+                        continue
+                    if not torch.isfinite(data).all():
+                        local_bad = 1
+                        detail.append(
+                            f"chunk{chunk_idx}/buf{buf_idx}(numel={data.numel()},"
+                            f"nan={int(torch.isnan(data).sum())},inf={int(torch.isinf(data).sum())})"
+                        )
+            else:
+                for name, param in chunk.named_parameters():
+                    grad = getattr(param, "main_grad", None)
+                    if grad is None:
+                        grad = param.grad
+                    if grad is None or grad.numel() == 0:
+                        continue
+                    if not torch.isfinite(grad).all():
+                        local_bad = 1
+                        detail.append(f"chunk{chunk_idx}/{name}")
+
+        flag = torch.tensor([local_bad], dtype=torch.int32, device=get_device_id())
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item()), detail
+
     def optimizer_step(self):
         """
         Perform an optimization step to update model parameters based on accumulated gradients.
@@ -521,6 +565,26 @@ class MegatronEngine(BaseEngine):
         Returns:
             grad_norm (float): The norm of the gradients before clipping or update.
         """
+        nonfinite, detail = self._find_nonfinite_grads()
+        if nonfinite:
+            self._nonfinite_skips += 1
+            logger.warning(
+                "[nonfinite-grad] optimizer step skipped (pre-step scan); rank=%s "
+                "consecutive skips=%d/%d local_offenders=%s",
+                torch.distributed.get_rank(),
+                self._nonfinite_skips,
+                self._MAX_CONSECUTIVE_NONFINITE_SKIPS,
+                detail[:8] if detail else "none-on-this-rank",
+            )
+            self.optimizer.zero_grad()
+            if self._nonfinite_skips >= self._MAX_CONSECUTIVE_NONFINITE_SKIPS:
+                raise RuntimeError(
+                    f"Optimizer skipped {self._nonfinite_skips} consecutive steps on non-finite "
+                    "gradients; training is not progressing. See the [nonfinite-grad] offender "
+                    "list above and the trainer's NON-FINITE VALUES report for the entry point."
+                )
+            return 0.0
+
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
 
         if update_successful:
