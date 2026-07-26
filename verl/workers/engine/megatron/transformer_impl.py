@@ -77,6 +77,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class MegatronEngine(BaseEngine):
+    _MAX_CONSECUTIVE_NONFINITE_SKIPS = 5
+    _nonfinite_skips = 0
+
     def __init__(
         self,
         model_config: HFModelConfig,
@@ -522,11 +525,28 @@ class MegatronEngine(BaseEngine):
 
         if update_successful:
             # allgather already execute in optimizer.step in new megatron
-            pass
+            self._nonfinite_skips = 0
         else:
-            raise NotImplementedError("Megatron optimizer step failed. This should not happen")
+            # With a grad scaler (fp16), Megatron reports non-finite grads by returning
+            # success=False and grad_norm=None: the step is skipped and the loss scale halved.
+            # Skipping is the correct response to a transient spike, but a persistent source
+            # would silently stop training, so escalate once it stops looking transient.
+            self._nonfinite_skips += 1
+            logger.warning(
+                "[nonfinite-grad] optimizer step skipped (non-finite grads); "
+                "consecutive skips=%d/%d",
+                self._nonfinite_skips,
+                self._MAX_CONSECUTIVE_NONFINITE_SKIPS,
+            )
+            if self._nonfinite_skips >= self._MAX_CONSECUTIVE_NONFINITE_SKIPS:
+                raise RuntimeError(
+                    f"Optimizer skipped {self._nonfinite_skips} consecutive steps on non-finite "
+                    "gradients; training is not progressing. Check the loss scale (a collapse "
+                    "toward min_loss_scale indicates a systematic source, not a transient spike)."
+                )
 
-        return grad_norm
+        # grad_norm is None on a skipped step; keep the metric numeric.
+        return grad_norm if grad_norm is not None else 0.0
 
     def lr_scheduler_step(self):
         """
