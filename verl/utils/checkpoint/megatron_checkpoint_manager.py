@@ -31,6 +31,7 @@ from transformers import GenerationConfig
 
 from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.fs import is_non_local, local_mkdir_safe
+from verl.utils.host_memory import release_freed_host_memory
 from verl.utils.logger import log_with_rank
 from verl.utils.megatron.dist_checkpointing import load_dist_checkpointing, save_dist_checkpointing
 from verl.utils.megatron_utils import (
@@ -896,6 +897,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         )
         metadata = self._load_content_metadata(metadata_source)
 
+
         # Model sharded state dict is shared across the model-load and
         # optimizer-load metadata inputs, so build it once when either path
         # needs it. The dist_ckpt model load and the HF+PEFT load both read
@@ -936,6 +938,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             self._load_model_as_hf_via_bridge(hf_model_path)
             log_with_rank(f"Loaded HF model checkpoint from {hf_model_path} with bridge", rank=self.rank, logger=logger)
 
+
         # ── Load optimizer / LR scheduler ───────────────────────────────────
         if self.should_load_optimizer:
             optim_sd = self._build_optimizer_state_dict(model_sharded_state_dict, metadata, is_loading=True)
@@ -943,6 +946,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 sharded_state_dict=optim_sd,
                 ckpt_dir=optim_dist_path,
             )
+            # Each rank reads a SUPERSET of its shard here and slices afterwards, so this is the
+            # expected peak; the question these probes answer is whether it is ever given back.
             assert "optimizer" in loaded_optim, (
                 f"Optimizer state dict not found in {loaded_optim.keys()}. "
                 f"Please check the checkpoint file {optim_dist_path}."
@@ -973,6 +978,17 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             )
             self.load_rng_states(loaded_extra["rng_state"])
             log_with_rank(f"Loaded RNG states from {extra_dist_path}", rank=self.rank, logger=logger)
+
+        # From here the sharded state dicts built for the load, and the superset the dist-checkpoint
+        # reader materialised, are all garbage -- but they sit in reference cycles, so dropping the
+        # names is not enough and scope exit does not free them. The forced collection inside
+        # release_freed_host_memory is what actually returns the memory, and it matters because
+        # Ray's OOM monitor counts anon and ignores page cache.
+        model_sharded_state_dict = model_sd = loaded_model = None
+        optim_sd = loaded_optim = None
+        extra_sd = loaded_extra = None
+        del model_sharded_state_dict, model_sd, loaded_model, optim_sd, loaded_optim, extra_sd, loaded_extra
+        release_freed_host_memory("post-load", rank=self.rank)
 
         if del_local_after_load:
             try:

@@ -34,6 +34,7 @@ from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpoint
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.host_memory import release_freed_host_memory
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron.router_replay_utils import (
@@ -341,6 +342,10 @@ class MegatronEngine(BaseEngine):
                 self.bridge.load_hf_weights(
                     module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
                 )
+
+        # The weight loader releases its staging buffers by refcounting, so this is a cheap one-off
+        # guard rather than a known fix.
+        release_freed_host_memory("post-init-weight-load")
 
         if torch.distributed.get_rank() == 0:
             print_model_size(module[0])
