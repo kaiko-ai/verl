@@ -156,7 +156,7 @@ class vLLMHttpServer:
         self._resume_event = asyncio.Event()
         self._resume_event.set()
         logger.warning(
-            "### KAIKO-DRAINFIX vLLMHttpServer __init__ (submitter-gate v1) replica=%s node=%s "
+            "vLLMHttpServer __init__ (submitter-gate v1) replica=%s node=%s "
             "-- patched verl via LOCAL_VERL IS ACTIVE",
             self.replica_rank,
             self.node_rank,
@@ -571,14 +571,14 @@ class vLLMHttpServer:
         while self._submission_paused:
             if not parked:
                 parked = True
-                logger.warning(
-                    "### KAIKO-DRAINFIX generate PARKED request_id=%s (submission paused for weight sync)",
+                logger.debug(
+                    "generate PARKED request_id=%s (submission paused for weight sync)",
                     request_id,
                 )
             await self._resume_event.wait()
         self._admitting += 1
         if parked:
-            logger.warning("### KAIKO-DRAINFIX generate RESUMED request_id=%s", request_id)
+            logger.debug("generate RESUMED request_id=%s", request_id)
 
         # Get final response. Decrement _admitting on the first output (admission has reached
         # the engine by then); the finally covers the zero-output (immediate abort) case so the
@@ -794,7 +794,7 @@ class vLLMHttpServer:
                 while self._admitting > 0:
                     if time.time() - _gate_t0 > 60.0:
                         logger.warning(
-                            "### KAIKO-DRAINFIX abort_all_requests: gate barrier TIMEOUT after 60s, "
+                            "abort_all_requests: gate barrier TIMEOUT after 60s, "
                             "_admitting=%s still in flight -- proceeding to snapshot anyway",
                             self._admitting,
                         )
@@ -802,7 +802,7 @@ class vLLMHttpServer:
                     _spins += 1
                     await asyncio.sleep(0.01)
                 logger.warning(
-                    "### KAIKO-DRAINFIX abort_all_requests: submitter gate CLOSED, in-flight "
+                    "abort_all_requests: submitter gate CLOSED, in-flight "
                     "admissions drained (_admitting=%s, spins=%s, %.3fs) -> taking abort snapshot",
                     self._admitting,
                     _spins,
@@ -869,7 +869,7 @@ class vLLMHttpServer:
         # so the flag is always cleared, even on non-head servers.
         if self._submission_paused:
             logger.warning(
-                "### KAIKO-DRAINFIX resume_generation: reopening submitter gate (replica=%s node=%s)",
+                "resume_generation: reopening submitter gate (replica=%s node=%s)",
                 self.replica_rank,
                 self.node_rank,
             )

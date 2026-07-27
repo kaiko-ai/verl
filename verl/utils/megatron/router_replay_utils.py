@@ -317,8 +317,8 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
         )  # layer_num, dynamic_bs_all, topk
         # FIX (module-walk): bind target-writing to the FORWARDED model's own routers, not a
         # positional slice of the process-global RouterReplay.router_instances list. The global
-        # list can hold more objects than this model's local layers (observed 48 vs 24 doubling),
-        # so `[offset:offset+n]` writes to the wrong objects and the forward reads unset (None)
+        # list can hold more objects than this model's local layers, so `[offset:offset+n]` can
+        # write to the wrong objects and the forward then reads unset (None)
         # ones. Walking `model.modules()` addresses each layer's OWN router.router_replay by type
         # and its own global layer_number (1-based; reshape dim-0 is 0-based global -> gidx=ln-1),
         # invariant to how many other TopKRouters exist in the process.
@@ -358,7 +358,7 @@ def set_model_router_replay_action(model, action):
 
     Mirrors set_router_replay_data's module-walk: it addresses each layer's real router by type,
     bypassing the process-global RouterReplay.router_instances positional slice. That slice can
-    hold orphan routers (observed 48 vs 24 from the Qwen3VL decoder doubling), so the positional
+    hold orphan routers, in which case the positional
     toggle never reaches the real routers, leaving them stuck in REPLAY_FORWARD; the backward
     recompute then reads a stale cross-micro-batch target_topk_idx instead of popping its own
     per-micro-batch entry from replay_backward_list.
