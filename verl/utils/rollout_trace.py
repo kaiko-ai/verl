@@ -600,8 +600,11 @@ def _auto_attach_trace_conversation(result) -> None:
         image_format=arize.get("image_format", "png"),
         max_dimension=arize.get("max_dimension"),
         span_kind="AGENT",
+        tools=getattr(result, "trace_tools", None),
     )
     result.trace_conversation = None
+    if hasattr(result, "trace_tools"):
+        result.trace_tools = None
 
 
 def rollout_trace_current_trace_id() -> str | None:
@@ -672,6 +675,7 @@ def rollout_trace_attach_conversation(
     image_format: str = "png",
     max_dimension: int | None = None,
     span_kind: str | None = None,
+    tools: list[dict] | None = None,
 ):
     """Attach a conversation (messages + images) to the root trace span.
 
@@ -701,6 +705,8 @@ def rollout_trace_attach_conversation(
             this value (preserving aspect ratio).
         span_kind: If set, override the ``openinference.span.kind`` attribute
             on the current span (e.g. "AGENT").
+        tools: Tool definition dicts (OpenAI function schema format) available to
+            the agent, serialized as ``llm.tools.{i}.tool.json_schema`` attributes.
     """
     if not messages:
         return
@@ -722,6 +728,9 @@ def rollout_trace_attach_conversation(
 
     if span_kind:
         span.set_attribute("openinference.span.kind", span_kind)
+
+    for tool_idx, tool in enumerate(tools or []):
+        span.set_attribute(f"llm.tools.{tool_idx}.tool.json_schema", json.dumps(tool))
 
     first_user_text = next(
         (_message_text(m) for m in messages if m.get("role") == "user" and _message_text(m)), None

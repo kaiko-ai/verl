@@ -114,6 +114,8 @@ class AgentLoopOutput(BaseModel):
     """Extra fields for dynamic addition."""
     trace_conversation: Optional[list[dict[str, Any]]] = Field(default=None, exclude=True)
     """Decoded conversation for tracing. Set by agent, consumed by rollout_trace_op, then cleared."""
+    trace_tools: Optional[list[dict[str, Any]]] = Field(default=None, exclude=True)
+    """Tool definitions available to the agent, for tracing. Same lifecycle as trace_conversation."""
 
     mm_processor_kwargs: Optional[dict[str, Any]] = None
     """Processor/backend kwargs that must stay aligned across rollout and training paths."""

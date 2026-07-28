@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import sys
 import types
@@ -568,6 +569,12 @@ async def test_auto_attach_conversation_targets_root_span():
                 {"role": "tool", "content": "tool output"},
                 {"role": "assistant", "content": "The answer is 42."},
             ]
+            self.trace_tools = [
+                {
+                    "type": "function",
+                    "function": {"name": "filesystem_read_file", "description": "Read a file."},
+                }
+            ]
             self.multi_modal_data = {}
             self.prompt_ids = [1, 2]
             self.response_ids = [3, 4]
@@ -599,6 +606,7 @@ async def test_auto_attach_conversation_targets_root_span():
     assert root_attrs.get("llm.input_messages.4.message.role") == "assistant"
     assert root_attrs.get("input.value") == "Find the answer."
     assert root_attrs.get("output.value") == "The answer is 42."
+    assert json.loads(root_attrs["llm.tools.0.tool.json_schema"])["function"]["name"] == "filesystem_read_file"
 
     # The child op span stays a plain CHAIN without the conversation
     assert child_attrs.get("openinference.span.kind") == "CHAIN"
