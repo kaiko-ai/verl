@@ -47,6 +47,10 @@ class RolloutTraceConfig:
             Total traces = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample.
         trace_step_interval (int): Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
             Defaults to 1 (trace every step).
+        val_sample_interval (int): During validation, trace every N-th sample of each worker
+            batch (positions 0, N, 2N, ...). Deterministic, so the same samples are traced on
+            every validation pass. Defaults to 1 (trace all validation samples). Validation
+            ignores max_samples_per_step_per_worker and trace_step_interval.
     """
 
     _instance: Optional["RolloutTraceConfig"] = None
@@ -58,6 +62,7 @@ class RolloutTraceConfig:
     experiment_name: str = None
     max_samples_per_step_per_worker: int | None = None
     trace_step_interval: int = 1
+    val_sample_interval: int = 1
     arize_config: dict = {}
 
     def __new__(cls, *args, **kwargs):
@@ -81,6 +86,7 @@ class RolloutTraceConfig:
         token2text: bool = False,
         max_samples_per_step_per_worker: int | None = None,
         trace_step_interval: int = 1,
+        val_sample_interval: int = 1,
         arize_config: Optional[dict] = None,
     ):
         config = cls.get_instance()
@@ -93,6 +99,7 @@ class RolloutTraceConfig:
         config.experiment_name = experiment_name
         config.max_samples_per_step_per_worker = max_samples_per_step_per_worker
         config.trace_step_interval = max(1, trace_step_interval)
+        config.val_sample_interval = max(1, val_sample_interval)
         config.arize_config = arize_config or {}
 
         if backend == "weave":

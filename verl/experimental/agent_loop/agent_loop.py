@@ -553,6 +553,7 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
             trace_config.get("trace_step_interval", 1),
+            val_sample_interval=trace_config.get("val_sample_interval", 1),
             arize_config=trace_config.get("arize", None),
         )
 
@@ -624,9 +625,11 @@ class AgentLoopWorker:
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
         # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        # Validation bypasses both sampling knobs: every validation episode is traced.
+        # Validation ignores both training knobs and instead traces every val_sample_interval-th
+        # position of each worker batch — deterministic, so the same samples are traced each pass.
         if validate:
-            traced_indices = set(range(len(batch)))
+            val_sample_interval = RolloutTraceConfig.get_instance().val_sample_interval
+            traced_indices = set(range(0, len(batch), val_sample_interval))
         elif not trace_this_step:
             traced_indices = set()
         elif max_samples_per_worker is not None:

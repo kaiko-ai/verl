@@ -863,3 +863,19 @@ async def test_root_span_metadata_from_rollout_trace_op():
     assert "output.value" not in child_attrs
 
     provider.shutdown()
+
+
+def test_val_sample_interval_init_and_clamp():
+    """val_sample_interval flows through init and is clamped to >= 1."""
+    RolloutTraceConfig.reset()
+    try:
+        RolloutTraceConfig.init("proj", "exp", backend=None, val_sample_interval=20)
+        assert RolloutTraceConfig.get_instance().val_sample_interval == 20
+    finally:
+        RolloutTraceConfig.reset()
+
+    try:
+        RolloutTraceConfig.init("proj", "exp", backend=None, val_sample_interval=0)
+        assert RolloutTraceConfig.get_instance().val_sample_interval == 1
+    finally:
+        RolloutTraceConfig.reset()
