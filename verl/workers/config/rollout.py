@@ -87,6 +87,7 @@ class TraceConfig(BaseConfig):
     token2text: bool = False
     max_samples_per_step_per_worker: Optional[int] = None
     trace_step_interval: int = 1
+    val_sample_interval: int = 1
     arize: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -94,6 +95,8 @@ class TraceConfig(BaseConfig):
             raise ValueError("`max_samples_per_step_per_worker` must be a non-negative integer or null.")
         if self.trace_step_interval < 1:
             raise ValueError("`trace_step_interval` must be >= 1.")
+        if self.val_sample_interval < 1:
+            raise ValueError("`val_sample_interval` must be >= 1.")
 
 
 @dataclass

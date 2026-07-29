@@ -254,7 +254,6 @@ class FullyAsyncLLMServerClient(LLMServerClient):
     invisible to the AgentLoop.
     """
 
-    @rollout_trace_op
     async def generate(
         self,
         request_id,

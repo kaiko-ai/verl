@@ -57,6 +57,8 @@ from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
+    rollout_trace_current_span_id,
+    rollout_trace_current_trace_id,
 )
 from verl.utils.skip import SkipManager
 from verl.utils.tokenizer import (
@@ -112,6 +114,8 @@ class AgentLoopOutput(BaseModel):
     """Extra fields for dynamic addition."""
     trace_conversation: Optional[list[dict[str, Any]]] = Field(default=None, exclude=True)
     """Decoded conversation for tracing. Set by agent, consumed by rollout_trace_op, then cleared."""
+    trace_tools: Optional[list[dict[str, Any]]] = Field(default=None, exclude=True)
+    """Tool definitions available to the agent, for tracing. Same lifecycle as trace_conversation."""
 
     mm_processor_kwargs: Optional[dict[str, Any]] = None
     """Processor/backend kwargs that must stay aligned across rollout and training paths."""
@@ -551,6 +555,7 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
             trace_config.get("trace_step_interval", 1),
+            val_sample_interval=trace_config.get("val_sample_interval", 1),
             arize_config=trace_config.get("arize", None),
         )
 
@@ -622,7 +627,12 @@ class AgentLoopWorker:
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
         # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        if not trace_this_step:
+        # Validation ignores both training knobs and instead traces every val_sample_interval-th
+        # position of each worker batch — deterministic, so the same samples are traced each pass.
+        if validate:
+            val_sample_interval = RolloutTraceConfig.get_instance().val_sample_interval
+            traced_indices = set(range(0, len(batch), val_sample_interval))
+        elif not trace_this_step:
             traced_indices = set()
         elif max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
@@ -695,6 +705,11 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            if RolloutTraceConfig.get_backend() is not None:
+                # Set on every rollout (None when untraced): extra_fields keys become
+                # non_tensor_batch columns and DataProto.concat requires identical keys.
+                output.extra_fields["rollout_trace_id"] = rollout_trace_current_trace_id()
+                output.extra_fields["rollout_span_id"] = rollout_trace_current_span_id()
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(

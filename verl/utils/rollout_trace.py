@@ -47,6 +47,10 @@ class RolloutTraceConfig:
             Total traces = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample.
         trace_step_interval (int): Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
             Defaults to 1 (trace every step).
+        val_sample_interval (int): During validation, trace every N-th sample of each worker
+            batch (positions 0, N, 2N, ...). Deterministic, so the same samples are traced on
+            every validation pass. Defaults to 1 (trace all validation samples). Validation
+            ignores max_samples_per_step_per_worker and trace_step_interval.
     """
 
     _instance: Optional["RolloutTraceConfig"] = None
@@ -58,6 +62,7 @@ class RolloutTraceConfig:
     experiment_name: str = None
     max_samples_per_step_per_worker: int | None = None
     trace_step_interval: int = 1
+    val_sample_interval: int = 1
     arize_config: dict = {}
 
     def __new__(cls, *args, **kwargs):
@@ -81,6 +86,7 @@ class RolloutTraceConfig:
         token2text: bool = False,
         max_samples_per_step_per_worker: int | None = None,
         trace_step_interval: int = 1,
+        val_sample_interval: int = 1,
         arize_config: Optional[dict] = None,
     ):
         config = cls.get_instance()
@@ -93,6 +99,7 @@ class RolloutTraceConfig:
         config.experiment_name = experiment_name
         config.max_samples_per_step_per_worker = max_samples_per_step_per_worker
         config.trace_step_interval = max(1, trace_step_interval)
+        config.val_sample_interval = max(1, val_sample_interval)
         config.arize_config = arize_config or {}
 
         if backend == "weave":
@@ -214,6 +221,13 @@ def rollout_trace_attr(
         tracer = RolloutTraceConfig.get_client()
         span_attributes = {str(k): str(v) for k, v in attributes.items()}
         span_attributes["openinference.span.kind"] = "CHAIN"
+        # KAIKO_RUN_ID (audit-folder UUID / Ray submission id) uniquely identifies the
+        # training run; experiment_name alone collides across resubmissions. Doubling it
+        # as the OpenInference session id groups a run's traces in Arize's Sessions tab.
+        kaiko_run_id = os.environ.get("KAIKO_RUN_ID")
+        if kaiko_run_id:
+            span_attributes["kaiko_run_id"] = kaiko_run_id
+            span_attributes["session.id"] = kaiko_run_id
         try:
             with tracer.start_as_current_span(
                 name=name,
@@ -586,8 +600,50 @@ def _auto_attach_trace_conversation(result) -> None:
         image_format=arize.get("image_format", "png"),
         max_dimension=arize.get("max_dimension"),
         span_kind="AGENT",
+        tools=getattr(result, "trace_tools", None),
     )
     result.trace_conversation = None
+    if hasattr(result, "trace_tools"):
+        result.trace_tools = None
+
+
+def rollout_trace_current_trace_id() -> str | None:
+    """Return the 32-hex trace id of the root rollout trace span, or None when untraced.
+
+    Only valid inside a ``rollout_trace_attr`` context with a recording span; callers
+    use it to correlate a rollout's output with its trace in the backend (e.g. Arize).
+    """
+    span = _root_trace_span.get()
+    if span is None or not span.is_recording():
+        return None
+    return format(span.get_span_context().trace_id, "032x")
+
+
+def rollout_trace_current_span_id() -> str | None:
+    """Return the 16-hex span id of the root rollout trace span, or None when untraced.
+
+    Post-hoc span evaluations (e.g. Arize update_evaluations) attach by span id;
+    the root span makes them trace-level.
+    """
+    span = _root_trace_span.get()
+    if span is None or not span.is_recording():
+        return None
+    return format(span.get_span_context().span_id, "016x")
+
+
+def _message_text(msg: dict) -> str | None:
+    """Extract the plain-text content of a chat message, or None if it has none."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content or None
+    if content is not None and not isinstance(content, list) and hasattr(content, "__iter__"):
+        content = list(content)
+    if isinstance(content, list):
+        text = "\n".join(
+            item.get("text", "") for item in content if hasattr(item, "get") and item.get("type") == "text"
+        )
+        return text or None
+    return None
 
 
 def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
@@ -619,13 +675,20 @@ def rollout_trace_attach_conversation(
     image_format: str = "png",
     max_dimension: int | None = None,
     span_kind: str | None = None,
+    tools: list[dict] | None = None,
 ):
-    """Attach a conversation (messages + images) to the current trace span.
+    """Attach a conversation (messages + images) to the root trace span.
 
     For the Arize backend, serializes the conversation as OpenInference
     ``llm.input_messages`` attributes with roles, text, and inline images.
     Image placeholders (``{"type": "image"}``) in message content are resolved
     to base64-encoded images from the ``images`` list, consumed in order.
+
+    Targets the root span opened by ``rollout_trace_attr`` (falling back to the
+    current span outside that context) so the trace list renders the episode the
+    way Arize expects: kind, input and output on the top-level row. Also derives
+    ``input.value`` from the first user message and ``output.value`` from the
+    last assistant message.
 
     Should be called once at the end of a ``@rollout_trace_op``-decorated function.
 
@@ -642,6 +705,8 @@ def rollout_trace_attach_conversation(
             this value (preserving aspect ratio).
         span_kind: If set, override the ``openinference.span.kind`` attribute
             on the current span (e.g. "AGENT").
+        tools: Tool definition dicts (OpenAI function schema format) available to
+            the agent, serialized as ``llm.tools.{i}.tool.json_schema`` attributes.
     """
     if not messages:
         return
@@ -655,12 +720,30 @@ def rollout_trace_attach_conversation(
 
     from opentelemetry import trace
 
-    span = trace.get_current_span()
+    span = _root_trace_span.get()
+    if span is None or not span.is_recording():
+        span = trace.get_current_span()
     if not span.is_recording():
         return
 
     if span_kind:
         span.set_attribute("openinference.span.kind", span_kind)
+
+    for tool_idx, tool in enumerate(tools or []):
+        span.set_attribute(f"llm.tools.{tool_idx}.tool.json_schema", json.dumps(tool))
+
+    first_user_text = next(
+        (_message_text(m) for m in messages if m.get("role") == "user" and _message_text(m)), None
+    )
+    last_assistant_text = next(
+        (_message_text(m) for m in reversed(messages) if m.get("role") == "assistant" and _message_text(m)), None
+    )
+    if first_user_text is not None:
+        span.set_attribute("input.value", first_user_text)
+        span.set_attribute("input.mime_type", "text/plain")
+    if last_assistant_text is not None:
+        span.set_attribute("output.value", last_assistant_text)
+        span.set_attribute("output.mime_type", "text/plain")
 
     image_idx = 0
     images = images or []
