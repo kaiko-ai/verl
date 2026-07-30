@@ -328,7 +328,12 @@ class MegatronEngine(BaseEngine):
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
 
-        if self.engine_config.use_dist_checkpointing:
+        # Load initial weights from a Megatron dist checkpoint only when a path is actually given.
+        # With use_dist_checkpointing=True but no dist_checkpointing_path (a fresh run off an HF
+        # base), fall through to the mbridge HF loader below. Saves still go out in dist format,
+        # so this enables load-HF-then-save-dist without a pre-converted dist base -- and avoids
+        # dist_checkpointing.load(None) -> os.path.isdir(None) crashing at init.
+        if self.engine_config.use_dist_checkpointing and self.engine_config.dist_checkpointing_path:
             load_mcore_dist_weights(
                 module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
             )
