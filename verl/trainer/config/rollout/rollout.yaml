@@ -326,6 +326,10 @@ trace:
   # Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
   trace_step_interval: 1
 
+  # During validation, trace every N-th sample of each worker batch (deterministic, so the
+  # same samples are traced on every validation pass). 1 traces all validation samples.
+  val_sample_interval: 1
+
   # Arize-specific config
   arize:
     image_format: png

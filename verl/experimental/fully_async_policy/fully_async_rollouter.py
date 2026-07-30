@@ -753,6 +753,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
 
+            # Without this the agent loop reads global_steps=0 for every streamed
+            # sample, defeating trace_step_interval and step metadata.
+            full_batch.meta_info["global_steps"] = self.global_steps
+
             sample_id = f"sample_{epoch}_{self.global_steps}"
 
             rollout_sample = RolloutSample(

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import sys
 import types
@@ -540,6 +541,122 @@ async def test_auto_attach_conversation():
     provider.shutdown()
 
 
+async def test_auto_attach_conversation_targets_root_span():
+    """Inside rollout_trace_attr, the conversation and input/output land on the root span."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+    from openinference.instrumentation.config import TraceConfig
+
+    exporter = InMemorySpanExporter()
+    config = TraceConfig(base64_image_max_length=200_000)
+    provider = OITracerProvider(config=config)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-root-attach")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    class FakeResult:
+        def __init__(self):
+            self.trace_conversation = [
+                {"role": "system", "content": "You are an agent."},
+                {"role": "user", "content": [{"type": "text", "text": "Find the answer."}]},
+                {"role": "assistant", "content": "Looking it up."},
+                {"role": "tool", "content": "tool output"},
+                {"role": "assistant", "content": "The answer is 42."},
+            ]
+            self.trace_tools = [
+                {
+                    "type": "function",
+                    "function": {"name": "filesystem_read_file", "description": "Read a file."},
+                }
+            ]
+            self.multi_modal_data = {}
+            self.prompt_ids = [1, 2]
+            self.response_ids = [3, 4]
+            self.response_mask = [1, 1]
+            self.extra_fields = {}
+            self.metrics = {}
+
+    class AgentUnderTest:
+        @rollout_trace_op
+        async def run(self):
+            return FakeResult()
+
+    agent = AgentUnderTest()
+    with rollout_trace_attr(step=1, sample_index=2, rollout_n=0, name="agent_loop"):
+        await agent.run()
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    by_name = {s.name: dict(s.attributes) for s in exported}
+    child_name = next(n for n in by_name if n.endswith("AgentUnderTest.run"))
+    assert set(by_name) == {"agent_loop", child_name}
+
+    root_attrs = by_name["agent_loop"]
+    child_attrs = by_name[child_name]
+
+    # Conversation, span kind, and input/output all live on the root span
+    assert root_attrs.get("openinference.span.kind") == "AGENT"
+    assert root_attrs.get("llm.input_messages.0.message.role") == "system"
+    assert root_attrs.get("llm.input_messages.4.message.role") == "assistant"
+    assert root_attrs.get("input.value") == "Find the answer."
+    assert root_attrs.get("output.value") == "The answer is 42."
+    assert json.loads(root_attrs["llm.tools.0.tool.json_schema"])["function"]["name"] == "filesystem_read_file"
+
+    # The child op span stays a plain CHAIN without the conversation
+    assert child_attrs.get("openinference.span.kind") == "CHAIN"
+    assert not any(k.startswith("llm.input_messages") for k in child_attrs)
+
+    provider.shutdown()
+
+
+async def test_rollout_trace_current_trace_id_and_run_id(monkeypatch):
+    """Inside rollout_trace_attr: trace id is retrievable and KAIKO_RUN_ID stamps the root span."""
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from openinference.instrumentation import TracerProvider as OITracerProvider
+
+    from verl.utils.rollout_trace import rollout_trace_current_trace_id
+
+    monkeypatch.setenv("KAIKO_RUN_ID", "run-1234abcd")
+
+    exporter = InMemorySpanExporter()
+    provider = OITracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test-trace-id")
+
+    rc = RolloutTraceConfig.get_instance()
+    rc.backend = "arize"
+    rc.client = tracer
+    rc._initialized = True
+
+    assert rollout_trace_current_trace_id() is None  # outside any trace context
+
+    captured = {}
+    with rollout_trace_attr(step=1, sample_index=0, rollout_n=0, name="agent_loop"):
+        captured["trace_id"] = rollout_trace_current_trace_id()
+
+    assert captured["trace_id"] is not None
+    assert len(captured["trace_id"]) == 32
+
+    provider.force_flush()
+    exported = exporter.get_finished_spans()
+    assert len(exported) == 1
+    root = exported[0]
+    assert format(root.context.trace_id, "032x") == captured["trace_id"]
+    attrs = dict(root.attributes)
+    assert attrs.get("kaiko_run_id") == "run-1234abcd"
+    assert attrs.get("session.id") == "run-1234abcd"
+
+    provider.shutdown()
+
+
 async def test_auto_attach_noop_when_none():
     """No trace_conversation on result → no error, no conversation attributes."""
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -754,3 +871,19 @@ async def test_root_span_metadata_from_rollout_trace_op():
     assert "output.value" not in child_attrs
 
     provider.shutdown()
+
+
+def test_val_sample_interval_init_and_clamp():
+    """val_sample_interval flows through init and is clamped to >= 1."""
+    RolloutTraceConfig.reset()
+    try:
+        RolloutTraceConfig.init("proj", "exp", backend=None, val_sample_interval=20)
+        assert RolloutTraceConfig.get_instance().val_sample_interval == 20
+    finally:
+        RolloutTraceConfig.reset()
+
+    try:
+        RolloutTraceConfig.init("proj", "exp", backend=None, val_sample_interval=0)
+        assert RolloutTraceConfig.get_instance().val_sample_interval == 1
+    finally:
+        RolloutTraceConfig.reset()
