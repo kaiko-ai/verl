@@ -134,7 +134,7 @@ class AgentLoopOutput(BaseModel):
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
-            output["routed_experts"] = torch.tensor(routed_experts, dtype=torch.int64)
+            output["routed_experts"] = torch.tensor(routed_experts, dtype=torch.uint8)
 
         # rm_scores: reward score for each token
         reward_score = output.pop("reward_score", None)
@@ -178,7 +178,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
     routed_experts: Optional[torch.Tensor] = None
-    """Padded routed experts for the total tokens."""
+    """Compact (unpadded) routed experts [length, layer, topk] uint8; the dense 131072-wide form
+    (~95% zeros) is rebuilt JIT on the trainer instead of being serialized. See routed_experts_start_pos."""
+    routed_experts_start_pos: Optional[int] = None
+    """Left-pad offset at which the compact routed_experts slice begins in the padded sequence."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -799,6 +802,7 @@ class AgentLoopWorker:
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
         routed_experts = None
+        routed_experts_start_pos = None
         if output.routed_experts is not None:
             total_length = input_ids.shape[1]
             length, layer_num, topk_num = output.routed_experts.shape
@@ -811,19 +815,17 @@ class AgentLoopWorker:
                 experts_tensor = output.routed_experts
             else:
                 raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
-            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
-
-            # Calculate start position: left padding means original prompt starts at the end
+            # Left padding means the original prompt starts at the end of the padded prompt block.
             start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
-            end_pos = min(start_pos + length, total_length)
-
-            # Add boundary checks for robustness
-            if start_pos < 0 or end_pos > total_length:
+            if start_pos < 0 or start_pos + length > total_length:
                 raise ValueError(
-                    f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
+                    f"Invalid routed_experts range: start_pos={start_pos}, length={length}, total_length={total_length}"
                 )
-
-            routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+            # Store only the compact [length, layer, topk] slice + its offset. The dense
+            # [1, total_length, layer, topk] form is ~95% zeros; it is rebuilt JIT during batch
+            # assembly so it is never serialized. uint8: routing indices are <256 experts.
+            routed_experts = experts_tensor.to(torch.uint8).contiguous()
+            routed_experts_start_pos = start_pos
 
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(
@@ -871,6 +873,7 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
+            routed_experts_start_pos=routed_experts_start_pos,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             mm_processor_kwargs=output.mm_processor_kwargs,
@@ -1066,8 +1069,8 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].routed_experts is not None:
-            optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+        # routed_experts is carried compactly in non_tensor_batch (below) and rebuilt JIT on the
+        # trainer, so it is intentionally NOT stacked into the dense tensor batch here.
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
@@ -1096,6 +1099,19 @@ class AgentLoopWorker:
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
+        if inputs[0].routed_experts is not None:
+            # Compact routing slices ([length, layer, topk] uint8) + left-pad offsets; the trainer
+            # rebuilds the dense [bsz, seq_len, layer, topk] tensor JIT before left_right_2_no_padding.
+            # np.empty + per-element assign, NOT np.array([...], dtype=object): a group whose
+            # trajectories share one length collapses to a rectangular 4-D array, which then breaks
+            # DataProto.concat's axis-0 concat against a ragged (1-D object) sample.
+            compact = np.empty(len(inputs), dtype=object)
+            for i, inp in enumerate(inputs):
+                compact[i] = inp.routed_experts.numpy()
+            non_tensor_batch["routed_experts_compact"] = compact
+            non_tensor_batch["routed_experts_start_pos"] = np.array(
+                [inp.routed_experts_start_pos for inp in inputs], dtype=np.int32
+            )
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
             non_tensor_batch.update(input_non_tensor_batch)
 
