@@ -53,6 +53,7 @@ from verl.utils.megatron.router_replay_utils import (
     merge_router_topk_indices,
     pp_gather,
     reorder_and_merge_vpp_layers,
+    set_model_router_replay_action,
     set_router_replay_data,
 )
 from verl.utils.megatron.tensor_parallel import (
@@ -1260,6 +1261,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
             router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
             for router in router_instance_list:
                 router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            set_model_router_replay_action(unwrapped_model, RouterReplayAction.REPLAY_FORWARD)
 
         if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
             layers_topk_idx = model_inputs["routed_experts"]
@@ -1274,6 +1276,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 vp_rank,
                 replay_mask=replay_mask,
                 local_cp_size=local_cp_size,
+                model=unwrapped_model,
             )
 
         if pad_mode == DatasetPadMode.NO_PADDING:
@@ -1372,6 +1375,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
             router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
             for router in router_instance_list:
                 router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+            set_model_router_replay_action(unwrapped_model, RouterReplayAction.REPLAY_BACKWARD)
 
         return output, partial(postprocess_micro_batch_func, data=batch, local_cp_size=local_cp_size)
 
