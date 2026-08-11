@@ -126,6 +126,25 @@ def assemble_batch_from_rollout_samples(
         rollout_samples_batch.append(batch)
     final_batch = DataProto.concat(rollout_samples_batch)
 
+    # Rebuild routed_experts from the compact per-sample slices shipped in non_tensor_batch (the
+    # dense [bsz, seq_len, layer, topk] form is ~95% zeros and is never serialized). Force CPU:
+    # torch.zeros() with no device follows the process default device; if that is CUDA in this
+    # context an implicit alloc would put ~19 GB on the GPU every step.
+    if "routed_experts_compact" in final_batch.non_tensor_batch:
+        compacts = final_batch.non_tensor_batch["routed_experts_compact"]
+        starts = final_batch.non_tensor_batch["routed_experts_start_pos"]
+        seq_len = final_batch.batch["input_ids"].shape[1]
+        n = len(compacts)
+        layer_num, topk_num = compacts[0].shape[1], compacts[0].shape[2]
+        dense = torch.zeros(n, seq_len, layer_num, topk_num, dtype=torch.uint8, device="cpu")
+        for i in range(n):
+            c = torch.from_numpy(compacts[i])
+            sp = int(starts[i])
+            dense[i, sp : sp + c.shape[0]] = c
+        final_batch.batch["routed_experts"] = dense
+        final_batch.non_tensor_batch.pop("routed_experts_compact", None)
+        final_batch.non_tensor_batch.pop("routed_experts_start_pos", None)
+
     # Calculate response_mask (if not present)
     if "response_mask" not in final_batch.batch.keys():
         final_batch.batch["response_mask"] = compute_response_mask(final_batch)

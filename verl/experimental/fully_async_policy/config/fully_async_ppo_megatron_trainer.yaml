@@ -25,6 +25,10 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Max in-flight rollout samples (vLLM concurrency). 0 = legacy len(replicas)*16 floor;
+  # -1 = full staleness budget (max_required_samples); >0 = explicit. Clamped to the budget.
+  max_concurrent_samples: 0
+
 # Rollout config
 rollout:
 

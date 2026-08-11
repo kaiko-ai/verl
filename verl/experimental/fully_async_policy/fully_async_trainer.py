@@ -512,6 +512,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if steps is not None and last_profiler_step in steps:
             await asyncio.wrap_future(self.rollouter._stop_profiling.remote().future())
 
+        # Quiesce rollout submission before draining vLLM for the weight sync, so new
+        # rollout requests can't race the drain's abort snapshot (the DP-pause admission
+        # hang). Resumed by reset_staleness() below once weights are synced.
+        await asyncio.wrap_future(self.rollouter.pause_for_sync.remote().future())
+
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
         print(

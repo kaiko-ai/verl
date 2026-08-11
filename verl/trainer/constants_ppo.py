@@ -40,7 +40,7 @@ PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
         "NCCL_DEBUG": "WARN",
-        "VLLM_LOGGING_LEVEL": "WARN",
+        "VLLM_LOGGING_LEVEL": "INFO",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         # TODO: disable compile cache due to cache corruption issue

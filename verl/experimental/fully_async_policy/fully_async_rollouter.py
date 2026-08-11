@@ -438,8 +438,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
-            self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
+            # max_concurrent_samples: 0 => legacy len(replicas)*16 floor; -1 => full staleness
+            # budget (max_required_samples); >0 => explicit. Always clamped to the budget.
+            _mcs = self.config.async_training.get("max_concurrent_samples", 0)
+            if not _mcs:  # 0 or None
+                base = len(self.llm_server_manager.get_replicas()) * 16
+            elif _mcs < 0:
+                base = self.max_required_samples
+            else:
+                base = _mcs
+            self.max_concurrent_samples = min(base, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
 
             print(
@@ -460,6 +468,30 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     def get_total_train_steps(self):
         return self.total_train_steps
+
+    async def pause_for_sync(self, settle_polls: int = 3, interval_s: float = 0.2) -> int:
+        """Hard-pause request submission ahead of a weight-sync drain.
+
+        Sets ``paused`` so ``_processor_worker`` stops launching new generation
+        requests, then confirms it has actually stopped by waiting for
+        ``active_tasks`` to stop growing for ``settle_polls`` consecutive checks.
+        Without this, the rollouter keeps feeding requests into the engine while
+        the trainer aborts+drains it for the weight update, and a request admitted
+        after the abort snapshot is never aborted nor scheduled -> the drain hangs.
+        Resumed by ``reset_staleness`` after the sync. Returns residual in-flight.
+        """
+        async with self.lock:
+            self.paused = True
+            self._resume_event.clear()
+        prev = -1
+        stable = 0
+        while stable < settle_polls:
+            n = len(self.active_tasks)
+            stable = stable + 1 if n <= prev else 0
+            prev = n
+            await asyncio.sleep(interval_s)
+        print(f"[FullyAsyncRollouter][Public][pause_for_sync] submission paused, active_tasks={len(self.active_tasks)}")
+        return len(self.active_tasks)
 
     async def reset_staleness(self):
         """

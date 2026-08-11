@@ -34,6 +34,7 @@ from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpoint
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.host_memory import release_freed_host_memory
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 from verl.utils.megatron.router_replay_utils import (
@@ -41,6 +42,7 @@ from verl.utils.megatron.router_replay_utils import (
     merge_router_topk_indices,
     pp_gather,
     reorder_and_merge_vpp_layers,
+    set_model_router_replay_action,
     set_router_replay_data,
 )
 from verl.utils.megatron.tensor_parallel import (
@@ -61,6 +63,7 @@ from verl.utils.megatron_utils import (
     patch_engine_mtp,
     register_megatron_training_hooks,
     unwrap_model,
+    warmup_nccl_communicators,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
 from verl.utils.seqlen_balancing import restore_dynamic_batch
@@ -75,6 +78,13 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class MegatronEngine(BaseEngine):
+    # Sized for bf16, where a non-finite gradient is always a real defect: a transient survives one
+    # skip because the next batch differs, so 5 in a row means a systematic source. fp16 needs a far
+    # larger value -- its grad scaler legitimately overflows once per halving (twice, at the default
+    # hysteresis=2) while calibrating down from initial_loss_scale, so 5 aborts mid-calibration.
+    _MAX_CONSECUTIVE_NONFINITE_SKIPS = 5
+    _nonfinite_skips = 0
+
     def __init__(
         self,
         model_config: HFModelConfig,
@@ -318,7 +328,12 @@ class MegatronEngine(BaseEngine):
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
 
-        if self.engine_config.use_dist_checkpointing:
+        # Load initial weights from a Megatron dist checkpoint only when a path is actually given.
+        # With use_dist_checkpointing=True but no dist_checkpointing_path (a fresh run off an HF
+        # base), fall through to the mbridge HF loader below. Saves still go out in dist format,
+        # so this enables load-HF-then-save-dist without a pre-converted dist base -- and avoids
+        # dist_checkpointing.load(None) -> os.path.isdir(None) crashing at init.
+        if self.engine_config.use_dist_checkpointing and self.engine_config.dist_checkpointing_path:
             load_mcore_dist_weights(
                 module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
             )
@@ -332,6 +347,10 @@ class MegatronEngine(BaseEngine):
                 self.bridge.load_hf_weights(
                     module, self.model_config.local_path, allowed_mismatched_params=allowed_mismatched_params
                 )
+
+        # The weight loader releases its staging buffers by refcounting, so this is a cheap one-off
+        # guard rather than a known fix.
+        release_freed_host_memory("post-init-weight-load")
 
         if torch.distributed.get_rank() == 0:
             print_model_size(module[0])
@@ -474,6 +493,11 @@ class MegatronEngine(BaseEngine):
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
+        if self.engine_config.nccl_comm_warmup:
+            warmed = warmup_nccl_communicators()
+            logger.warning("[nccl-warmup] eagerly initialized %d parallel-group communicators: %s", len(warmed), warmed)
+            log_gpu_memory_usage("After NCCL communicator warmup", logger=logger)
+
     def train_mode(self, **kwargs):
         """
         Context manager entry for switching the engine and model into training mode.
@@ -504,6 +528,46 @@ class MegatronEngine(BaseEngine):
             # if use distributed optimizer, zero grad buffer will be handled by optimizer
             chunk.zero_grad_buffer()
 
+    def _find_nonfinite_grads(self):
+        """Detect non-finite gradients, agreed collectively. Returns (found, per-buffer detail).
+
+        bf16 builds no grad scaler, so Megatron never reports non-finite gradients and an
+        unguarded NaN is written straight into the weights. The decision must be identical on
+        every rank -- a rank-local skip desyncs the collectives -- hence the all-reduce.
+        """
+        local_bad = 0
+        detail = []
+        chunks = self.module if isinstance(self.module, list) else [self.module]
+        for chunk_idx, chunk in enumerate(chunks):
+            # nn.Module.buffers() is a method; Megatron's DDP shadows it with a list. Only the
+            # list form holds the contiguous grad buffers we want.
+            buffers = getattr(chunk, "buffers", None)
+            if isinstance(buffers, (list, tuple)) and buffers:
+                for buf_idx, buf in enumerate(buffers):
+                    data = getattr(buf, "grad_data", None)
+                    if data is None or data.numel() == 0:
+                        continue
+                    if not torch.isfinite(data).all():
+                        local_bad = 1
+                        detail.append(
+                            f"chunk{chunk_idx}/buf{buf_idx}(numel={data.numel()},"
+                            f"nan={int(torch.isnan(data).sum())},inf={int(torch.isinf(data).sum())})"
+                        )
+            else:
+                for name, param in chunk.named_parameters():
+                    grad = getattr(param, "main_grad", None)
+                    if grad is None:
+                        grad = param.grad
+                    if grad is None or grad.numel() == 0:
+                        continue
+                    if not torch.isfinite(grad).all():
+                        local_bad = 1
+                        detail.append(f"chunk{chunk_idx}/{name}")
+
+        flag = torch.tensor([local_bad], dtype=torch.int32, device=get_device_id())
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item()), detail
+
     def optimizer_step(self):
         """
         Perform an optimization step to update model parameters based on accumulated gradients.
@@ -511,15 +575,52 @@ class MegatronEngine(BaseEngine):
         Returns:
             grad_norm (float): The norm of the gradients before clipping or update.
         """
+        nonfinite, detail = self._find_nonfinite_grads()
+        if nonfinite:
+            self._nonfinite_skips += 1
+            logger.warning(
+                "[nonfinite-grad] optimizer step skipped (pre-step scan); rank=%s "
+                "consecutive skips=%d/%d local_offenders=%s",
+                torch.distributed.get_rank(),
+                self._nonfinite_skips,
+                self._MAX_CONSECUTIVE_NONFINITE_SKIPS,
+                detail[:8] if detail else "none-on-this-rank",
+            )
+            self.optimizer.zero_grad()
+            if self._nonfinite_skips >= self._MAX_CONSECUTIVE_NONFINITE_SKIPS:
+                raise RuntimeError(
+                    f"Optimizer skipped {self._nonfinite_skips} consecutive steps on non-finite "
+                    "gradients; training is not progressing. See the [nonfinite-grad] offender "
+                    "list above and the trainer's NON-FINITE VALUES report for the entry point."
+                )
+            return 0.0
+
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
 
         if update_successful:
             # allgather already execute in optimizer.step in new megatron
-            pass
+            self._nonfinite_skips = 0
         else:
-            raise NotImplementedError("Megatron optimizer step failed. This should not happen")
+            # With a grad scaler (fp16), Megatron reports non-finite grads by returning
+            # success=False and grad_norm=None: the step is skipped and the loss scale halved.
+            # Skipping is the correct response to a transient spike, but a persistent source
+            # would silently stop training, so escalate once it stops looking transient.
+            self._nonfinite_skips += 1
+            logger.warning(
+                "[nonfinite-grad] optimizer step skipped (non-finite grads); "
+                "consecutive skips=%d/%d",
+                self._nonfinite_skips,
+                self._MAX_CONSECUTIVE_NONFINITE_SKIPS,
+            )
+            if self._nonfinite_skips >= self._MAX_CONSECUTIVE_NONFINITE_SKIPS:
+                raise RuntimeError(
+                    f"Optimizer skipped {self._nonfinite_skips} consecutive steps on non-finite "
+                    "gradients; training is not progressing. Check the loss scale (a collapse "
+                    "toward min_loss_scale indicates a systematic source, not a transient spike)."
+                )
 
-        return grad_norm
+        # grad_norm is None on a skipped step; keep the metric numeric.
+        return grad_norm if grad_norm is not None else 0.0
 
     def lr_scheduler_step(self):
         """
@@ -909,10 +1010,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
             router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
             for router in router_instance_list:
                 router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            # The positional list above addresses orphan routers (decoder doubling); toggle the
+            # real forwarded routers by module-walk so they actually re-enter REPLAY_FORWARD.
+            set_model_router_replay_action(unwrapped_model, RouterReplayAction.REPLAY_FORWARD)
 
         if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
             layers_topk_idx = model_inputs["routed_experts"]
-            set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank)
+            set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank, model=unwrapped_model)
 
         if pad_mode == DatasetPadMode.NO_PADDING:
             label = input_ids.clone()
@@ -1031,6 +1135,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
             router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
             for router in router_instance_list:
                 router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+            # Toggle the real forwarded routers too (see forward-phase note): only then does the
+            # backward recompute run in REPLAY_BACKWARD and pop this micro-batch's own target from
+            # replay_backward_list instead of reading a stale target_topk_idx.
+            set_model_router_replay_action(unwrapped_model, RouterReplayAction.REPLAY_BACKWARD)
 
         return output, partial(postprocess_micro_batch_func, data=batch, local_cp_size=local_cp_size)
 

@@ -166,6 +166,8 @@ class McoreEngineConfig(EngineConfig):
         dynamic_context_parallel (bool): Whether to enable hybrid context parallelism.
         max_seqlen_per_dp_cp_rank (Optional[int]): Maximum sequence length per DPxCP rank.
         sequence_parallel (bool): Whether to enable sequence parallelism.
+        nccl_comm_warmup (bool): Eagerly init each parallel group's NCCL communicator before
+            training to avoid a lazy "Failed to CUDA calloc async" at the iteration-1 peak.
         use_distributed_optimizer (bool): Whether to use distributed optimizer.
         use_dist_checkpointing (bool): Whether to use distributed checkpointing.
         dist_checkpointing_path (Optional[str]): Path for distributed checkpointing.
@@ -193,6 +195,7 @@ class McoreEngineConfig(EngineConfig):
     entropy_from_logits_chunk_size: int = 2048
     max_seqlen_per_dp_cp_rank: Optional[int] = None
     sequence_parallel: bool = True
+    nccl_comm_warmup: bool = False
     use_distributed_optimizer: bool = True
     use_dist_checkpointing: bool = False
     dist_checkpointing_path: Optional[str] = None
