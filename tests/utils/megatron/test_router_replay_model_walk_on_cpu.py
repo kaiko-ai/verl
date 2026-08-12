@@ -122,3 +122,15 @@ def test_action_is_toggled_on_the_forwarded_models_own_routers(orphans_then_mode
 
     assert all(router.router_replay_action == RouterReplayAction.REPLAY_BACKWARD for router in _routers(model))
     assert all(orphan.router_replay_action is None for orphan in orphans)
+
+
+def test_mtp_routers_are_not_addressed(orphans_then_model):
+    """MTP layers restart layer numbering at 1, so they would alias decoder layer 1."""
+    _, decoder = orphans_then_model
+    model = torch.nn.Module()
+    model.decoder, model.mtp = decoder, torch.nn.ModuleList([FakeTopKRouter(1)])
+
+    router_replay_utils.set_model_router_replay_action(model, RouterReplayAction.REPLAY_BACKWARD)
+
+    assert [ln for ln, _ in router_replay_utils.iter_model_routers(model)] == list(range(1, NUM_LAYERS + 1))
+    assert model.mtp[0].router_replay.router_replay_action is None

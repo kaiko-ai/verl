@@ -493,7 +493,10 @@ def iter_model_routers(model):
     can address the wrong objects. Walking the forwarded model reaches each layer's own router.
     """
     for chunk in model if isinstance(model, list | tuple) else [model]:
-        for module in chunk.modules():
+        # Scope to the decoder: MTP layers restart layer numbering at 1, so they alias decoder
+        # layers, and the replay tensor carries no MTP rows. ``mtp`` is a sibling of ``decoder``
+        # on both GPTModel and HybridModel, the only two classes that build one.
+        for module in getattr(chunk, "decoder", chunk).modules():
             router = getattr(module, "router_replay", None)
             if isinstance(module, TopKRouter) and router is not None and module.layer_number is not None:
                 yield module.layer_number, router
