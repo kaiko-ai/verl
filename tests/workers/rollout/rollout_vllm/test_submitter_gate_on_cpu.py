@@ -28,6 +28,7 @@ import pytest
 pytest.importorskip("ray")
 pytest.importorskip("vllm")
 
+from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout import vllm_async_server
 
 
@@ -49,15 +50,25 @@ class _FakeEngine:
         self.resume_calls += 1
 
 
-def _make_server(node_rank: int = 0):
+def _make_server(node_rank: int = 0, rollout_mode: RolloutMode = RolloutMode.HYBRID):
     server = object.__new__(vllm_async_server.vLLMHttpServer)
     server.node_rank = node_rank
+    server.rollout_mode = rollout_mode
+    server.config = SimpleNamespace(free_cache_engine=True)
+    server.global_steps = 7
     server.engine = _FakeEngine()
     server.engine.server = server
     server._submission_paused = False
     server._admitting = 0
     server._resume_event = asyncio.Event()
     server._resume_event.set()
+    server._rejecting = False
+    server.sleep_hybrid_calls = 0
+
+    async def _sleep_hybrid():
+        server.sleep_hybrid_calls += 1
+
+    server._sleep_hybrid = _sleep_hybrid
     return server
 
 
@@ -88,22 +99,68 @@ def test_submission_parks_while_gate_closed_and_wakes_on_resume():
         await server.abort_all_requests()
         assert server._submission_paused is True
 
-        admitted = asyncio.Event()
-
-        async def submitter():
-            # Mirrors the park loop at the head of generate().
-            while server._submission_paused:
-                await server._resume_event.wait()
-            admitted.set()
-
-        task = asyncio.create_task(submitter())
+        task = asyncio.create_task(server._park_until_admitted("r1"))
         await asyncio.sleep(0.05)
         assert not task.done(), "submission must park while the gate is closed"
-        assert not admitted.is_set()
+        assert server._admitting == 0
 
         await server.resume_generation()
-        await asyncio.wait_for(task, timeout=5)
-        assert admitted.is_set()
+        assert await asyncio.wait_for(task, timeout=5) is None
+        assert server._admitting == 1
+
+    asyncio.run(main())
+
+
+def test_sleep_behind_closed_gate_rejects_parked_and_new_requests():
+    async def main():
+        server = _make_server()
+        await server.abort_all_requests()
+
+        parked = asyncio.create_task(server._park_until_admitted("parked"))
+        await asyncio.sleep(0.05)
+        assert not parked.done()
+
+        await server.sleep()
+        assert server.sleep_hybrid_calls == 1
+
+        output = await asyncio.wait_for(parked, timeout=5)
+        assert output.stop_reason == "aborted", "parked request must fail over instead of waiting for validation"
+        assert output.token_ids == []
+        assert output.extra_fields["global_steps"] == 7
+
+        late = await asyncio.wait_for(server._park_until_admitted("late"), timeout=5)
+        assert late.stop_reason == "aborted", "requests arriving while asleep must be rejected immediately"
+        assert server._admitting == 0, "rejected requests never count as admissions"
+        assert server._submission_paused is True, "gate stays closed until resume_generation"
+
+    asyncio.run(main())
+
+
+def test_sleep_with_open_gate_does_not_reject():
+    async def main():
+        server = _make_server()
+        await server.sleep()
+
+        assert server._rejecting is False
+        assert await server._park_until_admitted("r1") is None
+        assert server._admitting == 1
+
+    asyncio.run(main())
+
+
+def test_resume_after_sleep_clears_rejection():
+    async def main():
+        server = _make_server()
+        await server.abort_all_requests()
+        await server.sleep()
+        assert server._rejecting is True
+
+        await server.resume_generation()
+
+        assert server._rejecting is False
+        assert server._submission_paused is False
+        assert await server._park_until_admitted("r1") is None
+        assert server._admitting == 1
 
     asyncio.run(main())
 

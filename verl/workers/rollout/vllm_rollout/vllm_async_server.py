@@ -172,6 +172,7 @@ class vLLMHttpServer:
         self._admitting = 0
         self._resume_event = asyncio.Event()
         self._resume_event.set()
+        self._rejecting = False
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
@@ -657,12 +658,9 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        # No await between the final gate check and the bump: on the actor's single event loop
-        # that keeps "gate closed and _admitting == 0" from being observed mid-admission.
-        while self._submission_paused:
-            logger.debug("parking request %s until weight sync completes", request_id)
-            await self._resume_event.wait()
-        self._admitting += 1
+        rejected = await self._park_until_admitted(request_id)
+        if rejected is not None:
+            return rejected
 
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
             generator = self.engine.generate(
@@ -856,6 +854,11 @@ class vLLMHttpServer:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
+            # Sleeping behind a closed gate means no resume is coming for a while (the engine is
+            # lent back to training), so parked requests must fail over to another server.
+            if self._submission_paused:
+                self._rejecting = True
+                self._resume_event.set()
             await self._sleep_hybrid()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             await self.engine.sleep(level=1)
@@ -996,11 +999,31 @@ class vLLMHttpServer:
         """Resume generation after abort_all_requests (pause_generation)."""
         # Before the node_rank guard: every server in the replica closed the gate, so every
         # server must reopen it.
+        self._rejecting = False
         self._submission_paused = False
         self._resume_event.set()
         if self.node_rank != 0:
             return
         await self.engine.resume_generation()
+
+    async def _park_until_admitted(self, request_id: str) -> Optional[TokenOutput]:
+        """Wait out a closed gate. Returns an aborted output if the server went to sleep meanwhile."""
+        while self._submission_paused:
+            if self._rejecting:
+                logger.debug("rejecting request %s: server is asleep behind a closed gate", request_id)
+                return TokenOutput(
+                    token_ids=[],
+                    log_probs=None,
+                    routed_experts=None,
+                    stop_reason="aborted",
+                    extra_fields={"global_steps": self.global_steps},
+                )
+            logger.debug("parking request %s until weight sync completes", request_id)
+            await self._resume_event.wait()
+        # No await between the final gate check and the bump: on the actor's single event loop
+        # that keeps "gate closed and _admitting == 0" from being observed mid-admission.
+        self._admitting += 1
+        return None
 
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort a specific generation request.
