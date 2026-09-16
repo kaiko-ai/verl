@@ -854,11 +854,6 @@ class vLLMHttpServer:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # Sleeping behind a closed gate means no resume is coming for a while (the engine is
-            # lent back to training), so parked requests must fail over to another server.
-            if self._submission_paused:
-                self._rejecting = True
-                self._resume_event.set()
             await self._sleep_hybrid()
         elif self.rollout_mode == RolloutMode.COLOCATED:
             await self.engine.sleep(level=1)
@@ -1006,11 +1001,22 @@ class vLLMHttpServer:
             return
         await self.engine.resume_generation()
 
+    async def reject_parked_requests(self):
+        """Fail requests parked behind the closed gate with an abort so the client re-routes them.
+
+        For a server leaving the load balancer with no resume_generation coming soon (a hybrid
+        replica handed back to training); parking would strand them until the next resume.
+        """
+        if not self._submission_paused:
+            return
+        self._rejecting = True
+        self._resume_event.set()
+
     async def _park_until_admitted(self, request_id: str) -> Optional[TokenOutput]:
-        """Wait out a closed gate. Returns an aborted output if the server went to sleep meanwhile."""
+        """Wait out a closed gate. Returns an aborted output if the server rejected parked requests."""
         while self._submission_paused:
             if self._rejecting:
-                logger.debug("rejecting request %s: server is asleep behind a closed gate", request_id)
+                logger.debug("rejecting request %s: server left rotation behind a closed gate", request_id)
                 return TokenOutput(
                     token_ids=[],
                     log_probs=None,
@@ -1425,6 +1431,10 @@ class vLLMReplica(RolloutReplica):
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
+
+    async def reject_parked_requests(self):
+        """Fail requests parked behind the gate on all servers so the client re-routes them."""
+        await asyncio.gather(*[server.reject_parked_requests.remote() for server in self.servers])
 
     async def abort_request(self, request_id: str) -> dict[str, Any]:
         """Abort a specific request. Tries all servers since we don't know which one has it.

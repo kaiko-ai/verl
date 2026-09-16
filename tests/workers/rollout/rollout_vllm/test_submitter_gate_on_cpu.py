@@ -111,7 +111,7 @@ def test_submission_parks_while_gate_closed_and_wakes_on_resume():
     asyncio.run(main())
 
 
-def test_sleep_behind_closed_gate_rejects_parked_and_new_requests():
+def test_reject_parked_fails_parked_and_new_requests_with_abort():
     async def main():
         server = _make_server()
         await server.abort_all_requests()
@@ -120,8 +120,8 @@ def test_sleep_behind_closed_gate_rejects_parked_and_new_requests():
         await asyncio.sleep(0.05)
         assert not parked.done()
 
+        await server.reject_parked_requests()
         await server.sleep()
-        assert server.sleep_hybrid_calls == 1
 
         output = await asyncio.wait_for(parked, timeout=5)
         assert output.stop_reason == "aborted", "parked request must fail over instead of waiting for validation"
@@ -129,30 +129,50 @@ def test_sleep_behind_closed_gate_rejects_parked_and_new_requests():
         assert output.extra_fields["global_steps"] == 7
 
         late = await asyncio.wait_for(server._park_until_admitted("late"), timeout=5)
-        assert late.stop_reason == "aborted", "requests arriving while asleep must be rejected immediately"
+        assert late.stop_reason == "aborted", "requests arriving after the reject must fail immediately"
         assert server._admitting == 0, "rejected requests never count as admissions"
         assert server._submission_paused is True, "gate stays closed until resume_generation"
 
     asyncio.run(main())
 
 
-def test_sleep_with_open_gate_does_not_reject():
+def test_sleep_behind_closed_gate_keeps_parking():
+    # Colocate mode aborts, sleeps, trains, then resumes: requests must wait, not fail over.
     async def main():
         server = _make_server()
+        await server.abort_all_requests()
         await server.sleep()
+        assert server.sleep_hybrid_calls == 1
 
+        task = asyncio.create_task(server._park_until_admitted("r1"))
+        await asyncio.sleep(0.05)
+        assert not task.done(), "sleep alone must not reject parked requests"
         assert server._rejecting is False
+
+        await server.resume_generation()
+        assert await asyncio.wait_for(task, timeout=5) is None
+        assert server._admitting == 1
+
+    asyncio.run(main())
+
+
+def test_reject_parked_with_open_gate_is_harmless():
+    async def main():
+        server = _make_server()
+        await server.reject_parked_requests()
+
+        assert server._rejecting is False, "an open gate never parks, so nothing to reject"
         assert await server._park_until_admitted("r1") is None
         assert server._admitting == 1
 
     asyncio.run(main())
 
 
-def test_resume_after_sleep_clears_rejection():
+def test_resume_after_reject_clears_rejection():
     async def main():
         server = _make_server()
         await server.abort_all_requests()
-        await server.sleep()
+        await server.reject_parked_requests()
         assert server._rejecting is True
 
         await server.resume_generation()

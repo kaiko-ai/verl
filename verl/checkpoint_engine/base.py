@@ -484,6 +484,11 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
 
     @auto_await
+    async def reject_parked_replicas(self):
+        """Fail requests held back since abort_replicas on replicas that will not resume soon."""
+        await asyncio.gather(*[r.reject_parked_requests() for r in self.replicas])
+
+    @auto_await
     async def release_kv_cache_replicas(self):
         """Release kv_cache of all rollout replicas before NCCL weight sync.
 

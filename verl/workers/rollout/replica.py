@@ -278,6 +278,10 @@ class RolloutReplica(ABC):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
 
+    async def reject_parked_requests(self):
+        """Fail requests held back since abort_all_requests when no resume_generation is coming soon."""
+        return None
+
     async def clear_kv_cache(self):
         """reset kv cache in each rollout server."""
         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])
