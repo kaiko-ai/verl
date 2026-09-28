@@ -535,6 +535,9 @@ class vLLMHttpServer:
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
         if self.config.full_determinism:
             sampling_params.setdefault("seed", self.replica_rank + self.config.seed)
+        # Only token ids are consumed; string stop/bad_words matching needs detokenized text.
+        if not sampling_params.get("stop") and not sampling_params.get("bad_words"):
+            sampling_params.setdefault("detokenize", False)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
