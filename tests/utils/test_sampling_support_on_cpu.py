@@ -213,7 +213,9 @@ def _install_fake_megatron():
         return dist.get_world_size() if dist.is_initialized() else 1
 
     parallel_state = types.SimpleNamespace(
-        get_tensor_model_parallel_rank=rank, get_tensor_model_parallel_world_size=world_size
+        get_tensor_model_parallel_rank=rank,
+        get_tensor_model_parallel_world_size=world_size,
+        get_tensor_model_parallel_group=lambda: None,  # default group
     )
     vocab_utility = types.SimpleNamespace(
         vocab_range_from_per_partition_vocab_size=lambda size, r, ws: (r * size, (r + 1) * size)
@@ -272,15 +274,20 @@ def _reference(logits, label, support):
 
 def _check_against_reference(world_size, rank):
     logits, label, support = _make_case()
+    temperature = 0.7
     shard = logits.size(-1) // world_size
     local = logits[..., rank * shard : (rank + 1) * shard].clone().requires_grad_(True)
 
-    out = vocab_parallel_log_probs_over_support(local, label, support)
+    # As in the Megatron engine: the model output is scaled in place by the temperature, then the
+    # log-prob op shifts/exponentiates it in place. Autograd must still reach the model output.
+    scaled = local * 1.0
+    scaled.div_(temperature)
+    out = vocab_parallel_log_probs_over_support(scaled, label, support)
     weights = torch.linspace(0.5, 1.5, out.numel()).view_as(out)
     (out * weights).sum().backward()
 
     full = logits.clone().requires_grad_(True)
-    ref = _reference(full, label, support)
+    ref = _reference(full / temperature, label, support)
     (ref * weights).sum().backward()
 
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
@@ -320,6 +327,19 @@ def test_kernel_matches_masked_softmax_tp(world_size):
     mp.spawn(_tp_worker, args=(world_size, port), nprocs=world_size, join=True)
 
 
+def test_kernel_accepts_bf16_logits():
+    saved = _install_fake_megatron()
+    try:
+        logits, label, support = _make_case()
+        local = logits.to(torch.bfloat16).requires_grad_(True)
+        out = vocab_parallel_log_probs_over_support(local, label, support)
+        out.sum().backward()
+        assert out.dtype == torch.float32 and local.grad.dtype == torch.bfloat16
+        torch.testing.assert_close(out, _reference(local.detach().float(), label, support), rtol=1e-5, atol=1e-5)
+    finally:
+        _restore_modules(saved)
+
+
 def test_kernel_rejects_label_outside_support():
     saved = _install_fake_megatron()
     try:
@@ -337,8 +357,9 @@ def test_kernel_zero_padded_rows_use_full_vocabulary():
     try:
         logits, label, _ = _make_case()
         support = torch.zeros(1, logits.size(1), 4, dtype=torch.int32)
-        out = vocab_parallel_log_probs_over_support(logits, label, support)
-        torch.testing.assert_close(out, torch.log_softmax(logits, -1).gather(-1, label.unsqueeze(-1)).squeeze(-1))
+        expected = torch.log_softmax(logits, -1).gather(-1, label.unsqueeze(-1)).squeeze(-1)
+        out = vocab_parallel_log_probs_over_support(logits.clone(), label, support)
+        torch.testing.assert_close(out, expected)
     finally:
         _restore_modules(saved)
 

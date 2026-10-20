@@ -148,6 +148,98 @@ def compute_support_metrics(support: torch.Tensor, response_mask: torch.Tensor) 
     }
 
 
+class _VocabParallelLogProbsOverSupport(torch.autograd.Function):
+    """Support-normalized log-probs with a full-vocabulary fallback, in one pass over the logits.
+
+    Like Megatron's vocab-parallel cross-entropy, it works on the logits buffer in place (shift,
+    exp) and reuses it for the gradient: nothing saves the logits for backward (a plain
+    ``torch.gather`` would, and the in-place ops would then break autograd), and no second
+    vocabulary-sized gradient is allocated.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, label, support):
+        import torch.distributed as dist
+        from megatron.core import parallel_state as mpu
+        from megatron.core.tensor_parallel.utils import VocabUtility
+
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        tp_group = mpu.get_tensor_model_parallel_group() if tp_size > 1 else None
+
+        def all_reduce(tensor, op):
+            if tp_size > 1:
+                dist.all_reduce(tensor, op=op, group=tp_group)
+            return tensor
+
+        partition_vocab_size = logits.size(-1)
+        vocab_start, vocab_end = VocabUtility.vocab_range_from_per_partition_vocab_size(
+            partition_vocab_size, mpu.get_tensor_model_parallel_rank(), tp_size
+        )
+        # In place when the logits are already fp32, as in Megatron's cross-entropy.
+        logits_fp32 = logits.float()
+        buffer = logits_fp32.view(-1, partition_vocab_size)
+        label = label.reshape(-1).long()
+        support = support.reshape(-1, support.size(-1)).to(device=logits.device, dtype=torch.long)
+        rows = torch.arange(label.numel(), device=logits.device)
+
+        valid = support != EMPTY_SLOT
+        support_ids = support - ID_OFFSET
+        in_shard = valid & (support_ids >= vocab_start) & (support_ids < vocab_end)
+        local_ids = torch.where(in_shard, support_ids - vocab_start, torch.zeros_like(support_ids))
+        label_in_shard = (label >= vocab_start) & (label < vocab_end)
+        local_label = torch.where(label_in_shard, label - vocab_start, torch.zeros_like(label))
+
+        is_label = valid & (support_ids == label.unsqueeze(-1))
+        use_support = is_label.any(-1)
+        if bool((valid.any(-1) & ~use_support).any()):
+            raise RuntimeError(
+                "sampling-mask replay: a target token lies outside its recorded sampling support; "
+                "the support rows are misaligned with the labels."
+            )
+
+        logits_max = all_reduce(buffer.max(dim=-1).values, dist.ReduceOp.MAX)
+        buffer.sub_(logits_max.unsqueeze(-1))
+        # shifted logits at the support ids and the label, owned by exactly one TP rank each
+        support_logits = all_reduce(buffer.gather(-1, local_ids) * in_shard, dist.ReduceOp.SUM)
+        label_logits = all_reduce(buffer[rows, local_label] * label_in_shard, dist.ReduceOp.SUM)
+        buffer.exp_()
+        sum_exp = all_reduce(buffer.sum(dim=-1), dist.ReduceOp.SUM)
+        full_log_probs = label_logits - sum_exp.log()
+
+        # Rows without support get finite dummy logits so no branch of the select is NaN.
+        support_logits = support_logits.masked_fill(~valid, float("-inf"))
+        support_logits = torch.where(use_support.unsqueeze(-1), support_logits, torch.zeros_like(support_logits))
+        support_lse = torch.logsumexp(support_logits, dim=-1)
+        support_probs = torch.exp(support_logits - support_lse.unsqueeze(-1))
+        # the label is in its support, so its support logit is label_logits
+        out = torch.where(use_support, label_logits - support_lse, full_log_probs)
+
+        ctx.save_for_backward(
+            logits_fp32, sum_exp, support_probs, local_ids, in_shard, is_label, use_support, local_label
+        )
+        ctx.label_in_shard = label_in_shard
+        ctx.logits_shape = logits.shape
+        return out.view(ctx.logits_shape[:-1])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        exp_logits, sum_exp, support_probs, local_ids, in_shard, is_label, use_support, local_label = ctx.saved_tensors
+        with torch.no_grad():
+            grad = grad_output.reshape(-1).float()
+            rows = torch.arange(grad.numel(), device=grad.device)
+            full_grad = torch.where(use_support, torch.zeros_like(grad), grad)
+            support_grad = grad - full_grad
+
+            # d log p(y) / dz = onehot(y) - softmax(z), over the vocabulary or over the support;
+            # the gradient overwrites the exp buffer in place
+            grad_input = exp_logits.view(-1, exp_logits.size(-1))
+            grad_input.div_(sum_exp.unsqueeze(-1)).mul_(-full_grad.unsqueeze(-1))
+            grad_input[rows, local_label] += full_grad * ctx.label_in_shard
+            support_term = support_grad.unsqueeze(-1) * (is_label.float() - support_probs) * in_shard
+            grad_input.scatter_add_(-1, local_ids, support_term)
+        return exp_logits, None, None
+
+
 def vocab_parallel_log_probs_over_support(
     logits: torch.Tensor, label: torch.Tensor, support: torch.Tensor
 ) -> torch.Tensor:
@@ -156,7 +248,9 @@ def vocab_parallel_log_probs_over_support(
     Each TP rank gathers the logits of the support ids in its vocabulary shard, and one all-reduce
     gives every rank the (rows, k) support logits. That is O(rows * k) memory, never a dense
     vocabulary mask. The gradient reaches only support ids, as in a masked softmax. Rows without
-    support use the full-vocabulary log-prob.
+    support use the full-vocabulary log-prob, computed in the same pass.
+
+    The logits are modified in place, as by ``vocab_parallel_log_probs_from_logits``.
 
     Args:
         logits: Temperature-scaled vocab-parallel logits, shape (..., vocab_size / tp).
@@ -166,44 +260,9 @@ def vocab_parallel_log_probs_over_support(
     Returns:
         Log-probs, shape (...), float32.
     """
-    from megatron.core import parallel_state as mpu
-    from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
-    from megatron.core.tensor_parallel.utils import VocabUtility
-
-    from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
-
     if support.shape[:-1] != label.shape or logits.shape[:-1] != label.shape:
         raise ValueError(
             f"support {tuple(support.shape)}, logits {tuple(logits.shape)} and label {tuple(label.shape)} "
             "must share their leading dims"
         )
-    support = support.to(device=logits.device, dtype=torch.long)
-    valid = support != EMPTY_SLOT
-    support_ids = support - ID_OFFSET
-    partition_vocab_size = logits.size(-1)
-    vocab_start, vocab_end = VocabUtility.vocab_range_from_per_partition_vocab_size(
-        partition_vocab_size, mpu.get_tensor_model_parallel_rank(), mpu.get_tensor_model_parallel_world_size()
-    )
-
-    # Gather before the full-vocabulary cross-entropy, which shifts the logits in place.
-    in_shard = valid & (support_ids >= vocab_start) & (support_ids < vocab_end)
-    local_ids = torch.where(in_shard, support_ids - vocab_start, torch.zeros_like(support_ids))
-    shard_logits = torch.gather(logits, -1, local_ids).float() * in_shard
-    support_logits = reduce_from_tensor_model_parallel_region(shard_logits)
-
-    is_label = valid & (support_ids == label.unsqueeze(-1).long())
-    use_support = is_label.any(-1)
-    if bool((valid.any(-1) & ~use_support).any()):
-        raise RuntimeError(
-            "sampling-mask replay: a target token lies outside its recorded sampling support; "
-            "the support rows are misaligned with the labels."
-        )
-
-    # Rows without support get finite dummy logits so neither branch of the final select is NaN.
-    support_logits = support_logits.masked_fill(~valid, float("-inf"))
-    support_logits = torch.where(use_support.unsqueeze(-1), support_logits, torch.zeros_like(support_logits))
-    label_logits = support_logits.gather(-1, is_label.float().argmax(-1, keepdim=True)).squeeze(-1)
-    support_log_probs = label_logits - torch.logsumexp(support_logits, dim=-1)
-
-    full_log_probs = vocab_parallel_log_probs_from_logits(logits, label)
-    return torch.where(use_support, support_log_probs, full_log_probs.float())
+    return _VocabParallelLogProbsOverSupport.apply(logits, label, support)
