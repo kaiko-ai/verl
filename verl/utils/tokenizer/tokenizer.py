@@ -233,7 +233,7 @@ def hf_processor(name_or_path, **kwargs):
                 # per-image-token check (which Qwen's processor lacks).
                 processor.validate_inputs = lambda *args, **kwargs: None
             case _:
-                pass  # Unknown processor — skip get_rope_index binding
+                raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
 
         if model_class is not None:
             processor.get_rope_index = types.MethodType(model_class.get_rope_index, processor)

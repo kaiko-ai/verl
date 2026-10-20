@@ -65,24 +65,6 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # 3. generate sequences
         metrics = {}
-        # apply_chat_template above called processor(text, images) → expanded ids (processor expansion
-        # track, e.g. Kitsune). vLLM expects unexpanded ids and handles expansion internally, so we
-        # keep two representations: unexpanded for vLLM generation, expanded for the actor forward pass.
-        if self.processor is not None:
-            prompt_ids_possibly_expanded = prompt_ids
-            raw_prompt = await self.loop.run_in_executor(
-                None,
-                lambda: self.processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    **self.apply_chat_template_kwargs,
-                ),
-            )
-            prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
-        else:
-            prompt_ids_possibly_expanded = prompt_ids
-
         with simple_timer("generate_sequences", metrics):
             request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
             output: TokenOutput = await self.server_manager.generate(
@@ -110,7 +92,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         prompt_ids = merge_result.token_ids[: len(merge_result.token_ids) - len(response_mask)]
 
         output: AgentLoopOutput = AgentLoopOutput(
-            prompt_ids=prompt_ids_possibly_expanded,
+            prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
