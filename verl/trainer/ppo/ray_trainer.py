@@ -68,7 +68,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip.skip_manager import SkipManager
-from verl.utils.torch_functional import build_think_token_mask, masked_mean
+from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
@@ -545,7 +545,7 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores, trace_ids=None):
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -604,8 +604,6 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
-        sample_trace_ids = []
-        sample_span_ids = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -692,24 +690,7 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-            # rollout trace/span ids are stamped by the agent loop when tracing is enabled
-            trace_id_col = test_batch.non_tensor_batch.get("rollout_trace_id")
-            if trace_id_col is not None:
-                sample_trace_ids.extend(trace_id_col.tolist())
-            else:
-                sample_trace_ids.extend([None] * reward_tensor.shape[0])
-            span_id_col = test_batch.non_tensor_batch.get("rollout_span_id")
-            if span_id_col is not None:
-                sample_span_ids.extend(span_id_col.tolist())
-            else:
-                sample_span_ids.extend([None] * reward_tensor.shape[0])
-
-        self._maybe_log_val_generations(
-            inputs=sample_inputs,
-            outputs=sample_outputs,
-            scores=sample_scores,
-            trace_ids=sample_trace_ids if any(t is not None for t in sample_trace_ids) else None,
-        )
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -735,11 +716,9 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(
-            data_sources, sample_uids, reward_extra_infos_dict, sample_turns, span_ids=sample_span_ids
-        )
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns, span_ids=None):
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -1563,18 +1542,6 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-
-                    if (
-                        self.distillation_config is not None
-                        and self.distillation_config.distillation_loss.think_token_coef < 1.0
-                    ):
-                        batch.batch["think_token_mask"] = build_think_token_mask(
-                            response_ids=batch.batch["responses"],
-                            response_mask=batch.batch["response_mask"],
-                            tokenizer=self.tokenizer,
-                            prompt_ids=batch.batch["prompts"],
-                        )
-
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
