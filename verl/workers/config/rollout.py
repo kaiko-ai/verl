@@ -15,7 +15,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
-from omegaconf import MISSING
+from omegaconf import MISSING, DictConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
@@ -152,6 +152,7 @@ class CheckpointEngineConfig(BaseConfig):
 class RolloutConfig(BaseConfig):
     _mutable_fields = {
         "max_model_len",
+        "max_num_batched_tokens",
         "load_format",
         "engine_kwargs",
         "prompt_length",
@@ -190,6 +191,7 @@ class RolloutConfig(BaseConfig):
 
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
+    standalone_gpu_memory_utilization: Optional[float] = None
     ignore_eos: bool = False
     enforce_eager: bool = False
     cudagraph_capture_sizes: Optional[list] = None
@@ -211,6 +213,9 @@ class RolloutConfig(BaseConfig):
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
 
+    # Ray max_concurrency of the rollout server actor.
+    ray_actor_max_concurrency: int = 1024
+
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size: Optional[int] = None
     log_prob_micro_batch_size_per_gpu: Optional[int] = None
@@ -223,6 +228,9 @@ class RolloutConfig(BaseConfig):
     engine_kwargs: dict = field(default_factory=dict)
 
     calculate_log_probs: bool = False
+
+    # Sampler top-k log-probs per generated token and support-recording budget for score centering; 0 disables.
+    topk_log_probs: int = 0
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
@@ -279,6 +287,8 @@ class RolloutConfig(BaseConfig):
 
     disaggregation: DisaggregationConfig = field(default_factory=DisaggregationConfig)
 
+    router_config_path: Optional[str] = None
+
     def __post_init__(self):
         """Validate the rollout config"""
         # Deprecation warning for mode field - only async mode is supported
@@ -331,8 +341,6 @@ class RolloutConfig(BaseConfig):
         if isinstance(self.disaggregation, dict):
             object.__setattr__(self, "disaggregation", DisaggregationConfig(**self.disaggregation))
         elif not isinstance(self.disaggregation, DisaggregationConfig):
-            from omegaconf import DictConfig, OmegaConf
-
             if not isinstance(self.disaggregation, DictConfig):
                 raise TypeError(
                     f"rollout.disaggregation must be dict, DictConfig, or DisaggregationConfig; "
@@ -344,8 +352,26 @@ class RolloutConfig(BaseConfig):
                 DisaggregationConfig(**OmegaConf.to_container(self.disaggregation, resolve=True)),
             )
 
-        if self.disaggregation.enabled and self.name != "sglang":
+        if self.disaggregation.enabled and self.name not in ("sglang", "vllm"):
             raise ValueError(
-                f"rollout.disaggregation.enabled=True is currently only supported with "
-                f"rollout.name='sglang'; got {self.name!r}. (vLLM PD is a tracked follow-up.)"
+                f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
             )
+
+        if self.topk_log_probs:
+            if self.name != "vllm":
+                raise ValueError("rollout.topk_log_probs is supported by the vLLM rollout only.")
+            if not self.calculate_log_probs or self.logprobs_mode != "processed_logprobs":
+                raise ValueError(
+                    "rollout.topk_log_probs needs calculate_log_probs=True, logprobs_mode='processed_logprobs' and "
+                    "the vLLM rollout so the returned head uses the sampling distribution."
+                )
+            if 0 < self.topk_log_probs < self.top_k:
+                warnings.warn(
+                    f"rollout.topk_log_probs={self.topk_log_probs} is smaller than the sampling top_k={self.top_k}. "
+                    "Increasing topk_log_probs can allow score centering to align the full sampling support. "
+                    "Actual coverage determines whether the trainer-tail approximation is used.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            vllm_kwargs = self.engine_kwargs.setdefault("vllm", {})
+            vllm_kwargs["max_logprobs"] = max(vllm_kwargs.get("max_logprobs", 0), self.topk_log_probs)

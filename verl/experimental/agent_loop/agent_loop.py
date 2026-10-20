@@ -41,32 +41,28 @@ import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
-from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+from verl.utils.import_utils import resolve_config_path
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
-    rollout_trace_current_span_id,
-    rollout_trace_current_trace_id,
 )
 from verl.utils.skip import SkipManager
 from verl.utils.tokenizer import (
     build_multimodal_processor_inputs,
     get_processor_token_id,
-    normalize_token_ids,
 )
-from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
 from verl.workers.config import (
     HFModelConfig,
@@ -112,13 +108,11 @@ class AgentLoopOutput(BaseModel):
     """Auxiliary performance metrics"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
-    trace_conversation: Optional[list[dict[str, Any]]] = Field(default=None, exclude=True)
-    """Decoded conversation for tracing. Set by agent, consumed by rollout_trace_op, then cleared."""
-    trace_tools: Optional[list[dict[str, Any]]] = Field(default=None, exclude=True)
-    """Tool definitions available to the agent, for tracing. Same lifecycle as trace_conversation."""
-
     mm_processor_kwargs: Optional[dict[str, Any]] = None
     """Processor/backend kwargs that must stay aligned across rollout and training paths."""
+    mm_processor_output: Optional[list[dict[str, Any]]] = None
+    """SGLang video payload (see AgentLoopBase.build_sglang_video_payload); reused by the teacher
+    (OPD) path so an SGLang teacher receives the video instead of raw frames. None otherwise."""
 
     def as_dict(self) -> dict[str, Any]:
         """Convert agent loop output to a dictionary."""
@@ -134,7 +128,17 @@ class AgentLoopOutput(BaseModel):
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
-            output["routed_experts"] = torch.tensor(routed_experts, dtype=torch.uint8)
+            routed_experts = torch.tensor(routed_experts, dtype=torch.int16)
+            # Router replay indexes this field by absolute token position, so it must
+            # span the whole sequence. The rollout engine records fewer rows than that:
+            # it only sees tokens fed through the model, and multi-turn loops stop
+            # recording at the last generation. Trailing rows stay zero; replay masks
+            # them out instead of consuming them.
+            total_length = output["prompts"].size(0) + output["responses"].size(0)
+            aligned = routed_experts.new_zeros((total_length, *routed_experts.shape[1:]))
+            num_rows = min(routed_experts.size(0), total_length)
+            aligned[:num_rows] = routed_experts[:num_rows]
+            output["routed_experts"] = aligned
 
         # rm_scores: reward score for each token
         reward_score = output.pop("reward_score", None)
@@ -143,14 +147,47 @@ class AgentLoopOutput(BaseModel):
             rm_scores[-1] = reward_score
             output["rm_scores"] = rm_scores
 
+        # Mutating a default dict does not add the field to Pydantic's fields-set,
+        # so model_dump(exclude_unset=True) can omit populated extra fields.
+        extra_fields = output.setdefault("extra_fields", self.extra_fields.copy())
         teacher_ids, teacher_logprobs = (
-            output["extra_fields"].pop("teacher_ids", None),
-            output["extra_fields"].pop("teacher_logprobs", None),
+            extra_fields.pop("teacher_ids", None),
+            extra_fields.pop("teacher_logprobs", None),
         )
         if teacher_ids is not None:
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
             output["teacher_logprobs"] = teacher_logprobs
+        response_topk_ids, response_topk_log_probs = (
+            extra_fields.pop("response_topk_ids", None),
+            extra_fields.pop("response_topk_log_probs", None),
+        )
+        if response_topk_ids is not None and response_topk_log_probs is not None:
+            from verl.trainer.ppo.score_centering import pad_rollout_topk
+
+            if self.num_turns > 2:
+                raise ValueError("rollout.topk_log_probs supports the single-turn agent loop only.")
+            if len(response_topk_ids) != output["responses"].size(0):
+                raise ValueError(
+                    f"sampler top-k heads cover {len(response_topk_ids)} tokens, "
+                    f"but the response has {output['responses'].size(0)}."
+                )
+            output["rollout_topk_ids"], output["rollout_topk_log_probs"] = pad_rollout_topk(
+                response_topk_ids, response_topk_log_probs, prompt_length=output["prompts"].size(0)
+            )
+            # Same prediction-row layout as the heads. Dummy prompt/padding heads are complete
+            # by construction; a legacy response without provider evidence remains unknown.
+            response_complete = extra_fields.pop("response_support_complete", None)
+            if response_complete is None:
+                response_complete = torch.zeros(len(response_topk_ids), dtype=torch.bool)
+            else:
+                response_complete = torch.as_tensor(response_complete)
+                if response_complete.dtype != torch.bool or response_complete.shape != (len(response_topk_ids),):
+                    raise ValueError("sampler support coverage must have one bool per response token")
+            complete = torch.ones(output["rollout_topk_ids"].size(0), dtype=torch.bool)
+            start = output["prompts"].size(0) - 1
+            complete[start : start + len(response_topk_ids)] = response_complete
+            output["rollout_support_complete"] = complete
         return output
 
 
@@ -178,10 +215,7 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
     routed_experts: Optional[torch.Tensor] = None
-    """Compact (unpadded) routed experts [length, layer, topk] uint8; the dense 131072-wide form
-    (~95% zeros) is rebuilt JIT on the trainer instead of being serialized. See routed_experts_start_pos."""
-    routed_experts_start_pos: Optional[int] = None
-    """Left-pad offset at which the compact routed_experts slice begins in the padded sequence."""
+    """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -214,6 +248,7 @@ class AgentLoopBase(ABC):
         processor (AutoProcessor): Processor for process messages.
         dataset_cls (type[Dataset]): Dataset class for creating dataset, Defaults to RLHFDataset.
         data_config (DictConfigWrap): Dataset config.
+        hf_model_type: Root Hugging Face ``model_type`` used for Continuous Token builder selection.
     """
 
     def __init__(
@@ -224,6 +259,7 @@ class AgentLoopBase(ABC):
         processor: AutoProcessor,
         dataset_cls: type[RLHFDataset],
         data_config: DictConfigWrap,
+        hf_model_type: str | None = None,
         **kwargs,
     ):
         self.config = trainer_config.config
@@ -235,29 +271,37 @@ class AgentLoopBase(ABC):
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
         self.mm_processor_kwargs = self.data_config.get("mm_processor_kwargs", {})
-        self.continuous_token_builder = None
-        self.enable_continuous_token = False
-        continuous_token_config = self.data_config.continuous_token
-        if continuous_token_config.enable and self.processor is None:
-            model_config = self.config.actor_rollout_ref.model
-            self.continuous_token_builder = create_continuous_token_builder(
-                self.tokenizer,
-                model_family=continuous_token_config.model_family,
-                model_path=model_config.path,
-                tokenizer_name_or_path=model_config.tokenizer_path,
-                chat_template_kwargs=self.apply_chat_template_kwargs,
-            )
-            self.enable_continuous_token = True
-            # Continuous Token doesn't use the legacy removable system prompt.
-            self.system_prompt = None
-        else:
-            if continuous_token_config.enable and self.processor is not None:
-                logger.warning(
-                    "Continuous Token is enabled but processor is set; falling back to legacy multimodal path."
-                )
-            processing_class = self.processor if self.processor is not None else self.tokenizer
-            self.system_prompt = initialize_system_prompt(processing_class, **self.apply_chat_template_kwargs)
+        # Continuous Token is the only rollout tokenization path for agent loops.
+        # The model family (boundary handling) is inferred by exact lookup of the
+        # root Hugging Face config's model_type. Unrecognized models use the
+        # default builder (or default VL builder with a multimodal processor).
+        self.continuous_token_builder = create_continuous_token_builder(
+            self.tokenizer,
+            hf_model_type=hf_model_type,
+            chat_template_kwargs=self.apply_chat_template_kwargs,
+            mm_processor_kwargs=self.mm_processor_kwargs,
+            processor=self.processor,
+        )
         self.loop = get_event_loop()
+
+    def _assert_mm_supported(self, has_multi_modal: bool) -> None:
+        """Fail loudly when multimodal inputs are present but unsupported.
+
+        Multimodal rollout requires both a Continuous Token builder that supports
+        multimodal boundaries and a non-None processor to render placeholder spans.
+        Silent fallback is not allowed; callers must invoke this before mutating any
+        rollout state so failures never leave a half-built prompt behind.
+        """
+        if not has_multi_modal:
+            return
+        if not (self.continuous_token_builder.supports_multimodal() and self.processor is not None):
+            raise ValueError(
+                "Multimodal inputs require a Continuous Token builder that supports multimodal "
+                "AND a non-None processor, but got "
+                f"supports_multimodal={self.continuous_token_builder.supports_multimodal()}, "
+                f"processor={'set' if self.processor is not None else 'None'}. "
+                "Use a VL base model (with its processor) or remove multimodal inputs."
+            )
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
         mm_processor_kwargs = dict(self.mm_processor_kwargs or {})
@@ -305,15 +349,74 @@ class AgentLoopBase(ABC):
         self,
         messages: list[dict],
         tools: list[dict] = None,
+        images: list[Image.Image] = None,
+        videos: list[tuple[torch.Tensor, dict]] = None,
+        audios: list[Any] = None,
+        mm_inputs_out: dict[str, Any] = None,
     ) -> list[int]:
-        """Build the initial prompt token ids with Continuous Token."""
+        """Build the initial prompt token ids with Continuous Token.
+
+        Multimodal inputs are forwarded to the builder so that VL builders can
+        render placeholder spans through the processor. Text-only builders accept
+        and ignore these arguments. ``mm_processor_kwargs`` is not threaded here:
+        it is a builder-lifetime constant captured at construction and applied by
+        the builder itself during rendering.
+        """
         prompt_ids = await self.loop.run_in_executor(
             None,
-            lambda: self.continuous_token_builder.build_initial_tokens(messages, tools=tools),
+            lambda: self.continuous_token_builder.build_initial_tokens(
+                messages,
+                tools=tools,
+                images=images,
+                videos=videos,
+                audios=audios,
+                mm_inputs_out=mm_inputs_out,
+            ),
         )
+
+        # Mirror the response-side ``response_ids[:response_length]`` cap on the prompt side:
+        # every prompt produced by the agent loop must fit in ``rollout.prompt_length`` so that
+        # ``_pad_token_ids`` (and downstream ``torch.cat``) can rely on uniform shapes.
+        # Multimodal prompts cannot be sliced here because placeholder tokens must remain
+        # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
+        prompt_length = self.rollout_config.prompt_length
+        if (images or videos or audios) and len(prompt_ids) > prompt_length:
+            raise ValueError(
+                f"Multimodal prompt produced {len(prompt_ids)} tokens, exceeding "
+                f"rollout.prompt_length={prompt_length}. Truncating multimodal token "
+                f"sequences corrupts vision/audio feature alignment, so this is treated "
+                f"as a configuration error. Reduce the multimodal input size "
+                f"(e.g. ``total_pixels`` / ``max_pixels`` / fps / number of frames) or "
+                f"increase ``rollout.prompt_length``."
+            )
         return self._cap_text_prompt_length(prompt_ids)
 
-    async def ct_merge_non_assistant_msg(
+    @staticmethod
+    def build_sglang_video_payload(videos, mm_inputs: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
+        """Wrap already-computed video features for SGLang's ``video_data``.
+
+        SGLang cannot ingest raw frames — its ``video_data`` accepts a path / URL / base64 string or
+        a dict. ``mm_inputs`` is the processor output captured during tokenization (via the
+        ``mm_inputs_out`` hook). Tagging it ``format="processor_output"`` makes
+        ``BaseMultimodalProcessor`` pass the dict through untouched instead of re-decoding the video,
+        which would re-sample frames and desync the rollout from the actor. Returns ``None`` when
+        there is no video, so callers can hand the result straight to ``generate(...)``.
+
+        Shared by SingleTurnAgentLoop and ToolAgentLoop; vLLM keeps the raw frames and ignores this
+        (the per-backend split lives in ``LLMServerClient.generate``).
+        """
+        if not videos or "pixel_values_videos" not in mm_inputs:
+            return None
+        payload = {
+            "format": "processor_output",
+            "pixel_values_videos": mm_inputs["pixel_values_videos"],
+            "video_grid_thw": mm_inputs["video_grid_thw"],
+        }
+        if "second_per_grid_ts" in mm_inputs:
+            payload["second_per_grid_ts"] = mm_inputs["second_per_grid_ts"]
+        return [payload]
+
+    async def ct_merge_context_msg(
         self,
         previous_messages: list[dict],
         updated_messages: list[dict],
@@ -322,10 +425,10 @@ class AgentLoopBase(ABC):
         response_logprobs: Optional[list[float]] = None,
         tools: list[dict] = None,
     ):
-        """Merge appended non-assistant messages into runtime tokens and metadata."""
+        """Merge appended context messages into runtime tokens and metadata."""
         merge_result = await self.loop.run_in_executor(
             None,
-            lambda: self.continuous_token_builder.merge_non_assistant_tokens(
+            lambda: self.continuous_token_builder.merge_context_tokens(
                 previous_messages,
                 updated_messages,
                 runtime_token_ids,
@@ -370,89 +473,6 @@ class AgentLoopBase(ABC):
                 prompt_length,
             )
             return prompt_ids[-prompt_length:]
-        return prompt_ids
-
-    async def apply_chat_template(
-        self,
-        messages: list[dict],
-        tools: list[dict] = None,
-        images: list[Image.Image] = None,
-        videos: list[tuple[torch.Tensor, dict]] = None,
-        audios: list[Any] = None,
-        mm_processor_kwargs: Optional[dict[str, Any]] = None,
-        remove_system_prompt: bool = False,
-    ):
-        """Apply chat template to messages with optional tools, images, and videos.
-
-        Args:
-            messages (list[dict]): Input messages.
-            tools (list[dict], optional): Tools schemas. Defaults to None.
-            images (list[Image.Image], optional): Input images. Defaults to None.
-            videos (list[tuple[torch.Tensor, dict]], optional): Input videos. Defaults to None.
-            remove_system_prompt (bool, optional): Whether to remove system prompt. Defaults to False.
-
-        Returns:
-            list[int]: Prompt token ids.
-        """
-        if self.processor is not None:
-            raw_prompt = await self.loop.run_in_executor(
-                None,
-                lambda: apply_chat_template(
-                    self.processor,
-                    messages,
-                    tools=tools,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    **self.apply_chat_template_kwargs,
-                ),
-            )
-
-            model_inputs = build_multimodal_processor_inputs(
-                self.processor,
-                text=[raw_prompt],
-                images=images,
-                videos=videos,
-                audio=audios,
-                mm_processor_kwargs=mm_processor_kwargs
-                if mm_processor_kwargs is not None
-                else self._get_mm_processor_kwargs(audios),
-            )
-            prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
-        else:
-            tokenized_prompt = await self.loop.run_in_executor(
-                None,
-                lambda: apply_chat_template(
-                    self.tokenizer,
-                    messages,
-                    tools=tools,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    **self.apply_chat_template_kwargs,
-                ),
-            )
-            prompt_ids = normalize_token_ids(tokenized_prompt)
-
-        if remove_system_prompt:
-            prompt_ids = prompt_ids[len(self.system_prompt) :]
-
-        # Mirror the response-side ``response_ids[:response_length]`` cap on the prompt side:
-        # every prompt produced by the agent loop must fit in ``rollout.prompt_length`` so that
-        # ``_pad_token_ids`` (and downstream ``torch.cat``) can rely on uniform shapes.
-        # Multimodal prompts cannot be sliced here because placeholder tokens must remain
-        # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
-        prompt_length = self.rollout_config.prompt_length
-        if len(prompt_ids) > prompt_length:
-            if images or videos or audios:
-                raise ValueError(
-                    f"Multimodal prompt produced {len(prompt_ids)} tokens, exceeding "
-                    f"rollout.prompt_length={prompt_length}. Truncating multimodal token "
-                    f"sequences corrupts vision/audio feature alignment, so this is treated "
-                    f"as a configuration error. Reduce the multimodal input size "
-                    f"(e.g. ``total_pixels`` / ``max_pixels`` / fps / number of frames) or "
-                    f"increase ``rollout.prompt_length``."
-                )
-            prompt_ids = self._cap_text_prompt_length(prompt_ids)
-
         return prompt_ids
 
     @abstractmethod
@@ -517,6 +537,8 @@ class AgentLoopWorker:
         self.dataset_cls = get_dataset_class(config.data)
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
+        hf_model_type = getattr(self.model_config.hf_config, "model_type", None)
+        self.hf_model_type: str | None = hf_model_type if isinstance(hf_model_type, str) else None
         self.mm_processor_kwargs = config.data.get("mm_processor_kwargs", {})
 
         # Online policy distillation
@@ -551,15 +573,16 @@ class AgentLoopWorker:
             self.model_config.tokenizer.chat_template = self.model_config.custom_chat_template
 
         trace_config = self.rollout_config.trace
+        if trace_config.get("token2text", False):
+            # rollout_trace_op runs on the LLM client, so provide the tokenizer
+            # needed to decode each generate call's prompt and response tokens.
+            self.llm_client.tokenizer = self.tokenizer
         RolloutTraceConfig.init(
             self.rollout_config.trace.project_name,
             self.rollout_config.trace.experiment_name,
             trace_config.get("backend"),
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
-            trace_config.get("trace_step_interval", 1),
-            val_sample_interval=trace_config.get("val_sample_interval", 1),
-            arize_config=trace_config.get("arize", None),
         )
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
@@ -603,6 +626,7 @@ class AgentLoopWorker:
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+            params.pop("topk_log_probs", None)
             params["top_p"] = 1.0
             params["top_k"] = -1
             params["temperature"] = 0
@@ -624,20 +648,10 @@ class AgentLoopWorker:
             index = np.arange(len(batch))
 
         max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
-        trace_step_interval = RolloutTraceConfig.get_instance().trace_step_interval
-        global_steps = batch.meta_info.get("global_steps", 0)
-        trace_this_step = (global_steps % trace_step_interval) == 0
 
         # For n rollouts per sample, we trace all n rollouts for selected samples
         # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
-        # Validation ignores both training knobs and instead traces every val_sample_interval-th
-        # position of each worker batch — deterministic, so the same samples are traced each pass.
-        if validate:
-            val_sample_interval = RolloutTraceConfig.get_instance().val_sample_interval
-            traced_indices = set(range(0, len(batch), val_sample_interval))
-        elif not trace_this_step:
-            traced_indices = set()
-        elif max_samples_per_worker is not None:
+        if max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
             if max_samples_per_worker < len(unique_sample_indices):
                 selected_samples = set(
@@ -703,16 +717,12 @@ class AgentLoopWorker:
                 server_manager=self.llm_client,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
+                hf_model_type=self.hf_model_type,
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            if RolloutTraceConfig.get_backend() is not None:
-                # Set on every rollout (None when untraced): extra_fields keys become
-                # non_tensor_batch columns and DataProto.concat requires identical keys.
-                output.extra_fields["rollout_trace_id"] = rollout_trace_current_trace_id()
-                output.extra_fields["rollout_span_id"] = rollout_trace_current_span_id()
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -802,7 +812,6 @@ class AgentLoopWorker:
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
         routed_experts = None
-        routed_experts_start_pos = None
         if output.routed_experts is not None:
             total_length = input_ids.shape[1]
             length, layer_num, topk_num = output.routed_experts.shape
@@ -815,17 +824,20 @@ class AgentLoopWorker:
                 experts_tensor = output.routed_experts
             else:
                 raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
-            # Left padding means the original prompt starts at the end of the padded prompt block.
+            experts_tensor = experts_tensor.to(torch.int16)
+            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
+
+            # Calculate start position: left padding means original prompt starts at the end
             start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
-            if start_pos < 0 or start_pos + length > total_length:
+            end_pos = min(start_pos + length, total_length)
+
+            # Add boundary checks for robustness
+            if start_pos < 0 or end_pos > total_length:
                 raise ValueError(
-                    f"Invalid routed_experts range: start_pos={start_pos}, length={length}, total_length={total_length}"
+                    f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
                 )
-            # Store only the compact [length, layer, topk] slice + its offset. The dense
-            # [1, total_length, layer, topk] form is ~95% zeros; it is rebuilt JIT during batch
-            # assembly so it is never serialized. uint8: routing indices are <256 experts.
-            routed_experts = experts_tensor.to(torch.uint8).contiguous()
-            routed_experts_start_pos = start_pos
+
+            routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(
@@ -873,7 +885,6 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
-            routed_experts_start_pos=routed_experts_start_pos,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             mm_processor_kwargs=output.mm_processor_kwargs,
@@ -895,9 +906,25 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
-        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-        if "<image>" in current_text:
-            current_text = current_text.replace("<image>", "")
+        # Collapse expanded vision placeholder runs back to a single placeholder
+        # per media item before decoding, so the processor re-expands cleanly.
+        # ``input_ids`` already contains fully expanded image/video pad tokens; if
+        # those placeholders are NOT registered as special tokens (e.g. Kimi-VL
+        # ``<|media_pad|>``, GLM-4.6V ``<|image|>``), ``skip_special_tokens=True``
+        # will not strip them, and re-feeding the already-expanded text to the
+        # processor triggers a double-expansion error. Collapsing at the token-id
+        # level (using the processor-resolved placeholder ids) is model-agnostic
+        # and leaves the well-behaved (special-token) placeholders untouched.
+        image_token_id = get_processor_token_id(self.processor, "image")
+        video_token_id = get_processor_token_id(self.processor, "video")
+        collapse_ids = {t for t in (image_token_id, video_token_id) if t is not None}
+        collapsed_ids, prev_id = [], None
+        for token_id in input_ids.squeeze(0).tolist():
+            if token_id in collapse_ids and token_id == prev_id:
+                continue
+            collapsed_ids.append(token_id)
+            prev_id = token_id
+        current_text = self.tokenizer.decode(collapsed_ids, skip_special_tokens=True)
 
         multi_modal_inputs = build_multimodal_processor_inputs(
             self.processor,
@@ -947,6 +974,11 @@ class AgentLoopWorker:
             if video_token_id is not None:
                 mm_token_type_ids[0][input_ids[0] == video_token_id] = 2
             multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
+
+        # Allow model-specific processors to contribute additional RoPE inputs.
+        get_rope_index_kwargs = getattr(self.processor, "get_rope_index_kwargs", None)
+        if get_rope_index_kwargs is not None:
+            multi_modal_kwargs.update(get_rope_index_kwargs(multi_modal_inputs))
 
         # Model's get_rope_index has been dynamically bind to the processor.
         vision_position_ids, _ = self.processor.get_rope_index(
@@ -1047,6 +1079,7 @@ class AgentLoopWorker:
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
+                mm_processor_output=getattr(output, "mm_processor_output", None),
                 routing_key=routing_key,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
@@ -1069,8 +1102,8 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        # routed_experts is carried compactly in non_tensor_batch (below) and rebuilt JIT on the
-        # trainer, so it is intentionally NOT stacked into the dense tensor batch here.
+        if inputs[0].routed_experts is not None:
+            optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
@@ -1099,19 +1132,6 @@ class AgentLoopWorker:
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
-        if inputs[0].routed_experts is not None:
-            # Compact routing slices ([length, layer, topk] uint8) + left-pad offsets; the trainer
-            # rebuilds the dense [bsz, seq_len, layer, topk] tensor JIT before left_right_2_no_padding.
-            # np.empty + per-element assign, NOT np.array([...], dtype=object): a group whose
-            # trajectories share one length collapses to a rectangular 4-D array, which then breaks
-            # DataProto.concat's axis-0 concat against a ragged (1-D object) sample.
-            compact = np.empty(len(inputs), dtype=object)
-            for i, inp in enumerate(inputs):
-                compact[i] = inp.routed_experts.numpy()
-            non_tensor_batch["routed_experts_compact"] = compact
-            non_tensor_batch["routed_experts_start_pos"] = np.array(
-                [inp.routed_experts_start_pos for inp in inputs], dtype=np.int32
-            )
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
             non_tensor_batch.update(input_non_tensor_batch)
 
@@ -1119,13 +1139,7 @@ class AgentLoopWorker:
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
-            vals = [info[key] for info in reward_extra_infos]
-            try:
-                non_tensor_batch[key] = np.array(vals)
-            except ValueError:
-                # ragged per-sample values (e.g. variable-length multi-turn fields) can't
-                # stack into a rectangular array; keep them as an object array like multi_modal_inputs
-                non_tensor_batch[key] = np.array(vals, dtype=object)
+            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

@@ -16,11 +16,10 @@ Contain small torch utilities
 """
 
 import math
-import re
+import os
 from contextlib import contextmanager
 from typing import Optional
 
-import numpy as np
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -88,7 +87,13 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
     Returns:
         Tensor: Log-probabilities of the target labels, shape logits.shape[:-1].
     """
-    if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
+    # The flash-attn Triton cross-entropy kernel's reduction may be non-deterministic
+    # and is NOT controlled by FLASH_ATTENTION_DETERMINISTIC (that only governs the
+    # attention kernels) nor by torch.use_deterministic_algorithms (Triton custom ops
+    # don't trigger warn_only). Set VERL_DISABLE_FLASH_ATTN_CE=1 to force the pure
+    # PyTorch log_softmax+gather path for bitwise-reproducible log_probs.
+    _use_flash_ce = FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE and os.environ.get("VERL_DISABLE_FLASH_ATTN_CE", "0") != "1"
+    if _use_flash_ce:
         batch_dim = logits.shape[:-1]
         last_dim = logits.shape[-1]
         logits = logits.reshape(-1, last_dim)
@@ -364,86 +369,6 @@ def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2,
     return (eos_mask.cumsum(dim=1) - eos_mask).eq(0).to(dtype)
 
 
-def build_think_token_mask(
-    response_ids: torch.Tensor,
-    response_mask: torch.Tensor,
-    tokenizer,
-    prompt_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Build a float mask that is 1.0 inside <think>...</think> blocks, 0.0 outside.
-
-    Uses string-based detection (decode → find markers → map back to tokens) to avoid
-    BPE boundary issues where token subsequences differ based on context.
-
-    Handles multiple think blocks per sequence. Only marks tokens within response_mask.
-    If prompt_ids is provided, checks whether each prompt ends with <think> to determine
-    if the response starts inside a think block.
-
-    Args:
-        response_ids: (bsz, resp_len) token IDs of the response portion.
-        response_mask: (bsz, resp_len) binary mask for valid response tokens.
-        tokenizer: tokenizer to encode <think>/</ think> markers.
-        prompt_ids: (bsz, prompt_len) optional prompt token IDs to detect initial state.
-
-    Returns:
-        (bsz, resp_len) float tensor, 1.0 inside think blocks, 0.0 outside.
-    """
-    bsz, seq_len = response_ids.shape
-    mask = torch.zeros(bsz, seq_len, dtype=torch.float32, device=response_ids.device)
-
-    open_tag = "<think>"
-    tag_pattern = re.compile(r"</?think>")
-
-    for b in range(bsz):
-        resp_len = int(response_mask[b].sum().item())
-        if resp_len == 0:
-            continue
-
-        # Check if prompt ends with <think> (decode last ~50 tokens in one call)
-        in_think = False
-        if prompt_ids is not None:
-            prompt_tail = tokenizer.decode(prompt_ids[b, -50:], skip_special_tokens=False)
-            if prompt_tail.rstrip().endswith(open_tag):
-                in_think = True
-
-        # Decode response and build char→token offset mapping
-        valid_ids = response_ids[b, :resp_len].tolist()
-        # Per-token decode for accurate char offsets (BPE tokens may produce
-        # different text when decoded individually vs in sequence)
-        token_texts = [tokenizer.decode([tid], skip_special_tokens=False) for tid in valid_ids]
-        token_lens = np.array([len(t) for t in token_texts], dtype=np.int64)
-        full_text = "".join(token_texts)
-
-        starts = np.zeros(len(token_lens), dtype=np.int64)
-        if len(token_lens) > 1:
-            starts[1:] = np.cumsum(token_lens[:-1])
-
-        char_mask = np.zeros(len(full_text), dtype=np.bool_)
-        state = in_think
-        prev = 0
-        for m in tag_pattern.finditer(full_text):
-            is_open = m.group() == open_tag
-            if state:
-                if not is_open:
-                    char_mask[prev : m.end()] = True
-                    state = False
-                    prev = m.end()
-                else:
-                    char_mask[prev : m.end()] = True
-                    prev = m.end()
-            elif is_open:
-                state = True
-                char_mask[m.start() : m.end()] = True
-                prev = m.end()
-        if state:
-            char_mask[prev:] = True
-
-        token_think = np.add.reduceat(char_mask.view(np.uint8), starts) > 0
-        mask[b, :resp_len] = torch.from_numpy(token_think.astype(np.float32)).to(device=response_ids.device)
-
-    return mask
-
-
 def compute_grad_norm(model: nn.Module) -> float:
     """Compute the squared L2 norm of all gradients in a model.
 
@@ -706,7 +631,7 @@ def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad
         logits_rmpad: [total_nnz, vocab_size]
         response_length: int
     """
-    from flash_attn.bert_padding import pad_input, unpad_input
+    from verl.utils.attention_utils import pad_input, unpad_input
 
     batch_size, seqlen = input_ids.shape
     input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask=attention_mask)
@@ -735,10 +660,7 @@ def log_probs_from_logits_all_rmpad(input_ids_rmpad, logits_rmpad, indices, batc
         seqlen: int
         response_length: int
     """
-    if get_device_name() == "cuda":
-        from flash_attn.bert_padding import pad_input
-    elif get_device_name() == "npu":
-        from verl.utils.attention_utils import pad_input
+    from verl.utils.attention_utils import pad_input
 
     input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # transpose back to [total_nnz, 1]
     input_ids_rmpad = input_ids_rmpad.squeeze(-1)

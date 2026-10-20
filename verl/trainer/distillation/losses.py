@@ -142,7 +142,7 @@ def compute_topk_loss(
     """
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
-        case "fsdp" | "veomni":
+        case "fsdp" | "veomni" | "fsdp2":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
             distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
@@ -213,9 +213,14 @@ def distillation_ppo_loss(
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
-    if not distillation_loss_config.use_task_rewards:
+    if not distillation_loss_config.use_task_rewards and not distillation_loss_config.use_policy_gradient:
+        # no need to compute policy loss
         policy_loss = 0.0
+        policy_metrics = {}
+    else:
+        policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+        if not distillation_loss_config.use_task_rewards:
+            policy_loss = 0.0
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
@@ -271,6 +276,12 @@ def distillation_loss(
     if loss_config.loss_max_clamp is not None:
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
+
+    # global batch info for loss aggregation
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
     if loss_config.use_policy_gradient:
         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
