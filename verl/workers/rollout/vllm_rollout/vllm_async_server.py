@@ -449,19 +449,10 @@ class vLLMHttpServer:
             args.update(lora_args)
 
         if self.config.enable_rollout_routing_replay:
-            # R3 (Rollout Router Replay) relies on vLLM's ``enable_return_routed_experts``
-            # path (RoutedExpertsManager / RoutedExpertsCapturer), which is only correct
-            # for hybrid-attention MoE models (e.g. Qwen3.5, whose linear + full attention
-            # layout produces >1 KV-cache group) starting from vLLM 0.22.0. Earlier
-            # releases either lack the feature or under-size the routed-experts host
-            # buffer and crash with an IndexError. Fail fast with an actionable message
-            # instead of surfacing an opaque runtime error deep inside vLLM.
-            if _VLLM_VERSION < version.parse("0.22.0"):
-                raise RuntimeError(
-                    "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
-                    f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
-                    "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
-                )
+            # Fork carry: upstream rejects R3 on vLLM < 0.22 (under-sized routed-experts host
+            # buffer on hybrid-attention MoE, vllm#40692). Our training image's vLLM 0.20.2 carries
+            # that fix and the SP-MoE capture fix as patches; restore the check once the image's
+            # vLLM is >= 0.22.
             args.update({"enable_return_routed_experts": True})
 
         if self._disaggregation_role != "null":
