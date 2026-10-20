@@ -242,21 +242,7 @@ class BaseModelMerger(ABC):
             elif "ForCausalLM" in self.model_config.architectures[0]:
                 return AutoModelForCausalLM
             elif "ForConditionalGeneration" in self.model_config.architectures[0]:
-                # Handle different transformers versions for Vision2Seq models
-                import transformers
-                from packaging import version
-
-                if version.parse(transformers.__version__) >= version.parse("4.54.0"):
-                    # transformers >= 4.54.0 uses AutoModelForImageTextToText
-                    from transformers import AutoModelForImageTextToText
-
-                    return AutoModelForImageTextToText
-                else:
-                    # transformers < 4.54.0 uses AutoModelForVision2Seq
-                    from transformers import AutoModelForVision2Seq
-
-                    return AutoModelForVision2Seq
-
+                return AutoModelForVision2Seq
 
             raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")
 
