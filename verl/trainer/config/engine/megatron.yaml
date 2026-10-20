@@ -37,6 +37,10 @@ use_dist_checkpointing: False
 # distributed checkpointing path
 dist_checkpointing_path: null
 
+# Eagerly create each parallel group's NCCL communicator before training, so its lazy allocation
+# does not fail ("Failed to CUDA calloc async") at the iteration-1 memory peak of tight MoE configs
+nccl_comm_warmup: False
+
 # Whether to use dynamic context parallel scheduling
 dynamic_context_parallel: False
 
