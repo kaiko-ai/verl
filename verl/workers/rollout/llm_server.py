@@ -24,6 +24,7 @@ import os
 from typing import Any, Optional
 from uuid import uuid4
 
+import numpy as np
 import ray
 import torch
 from cachetools import LRUCache
@@ -325,6 +326,23 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     )
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
+            # sampler top-k heads for score centering, one row per newly generated token
+            for key in ("response_topk_ids", "response_topk_log_probs"):
+                if key in output.extra_fields:
+                    previous = final_output.extra_fields.get(key)
+                    final_output.extra_fields[key] = (
+                        output.extra_fields[key]
+                        if previous is None
+                        else np.concatenate([previous, output.extra_fields[key]])
+                    )
+            if "response_topk_ids" in output.extra_fields:
+                current = output.extra_fields.get("response_support_complete")
+                if current is None:
+                    current = np.zeros(len(output.extra_fields["response_topk_ids"]), dtype=np.bool_)
+                previous = final_output.extra_fields.get("response_support_complete")
+                if previous is None:
+                    previous = np.zeros(len(final_output.token_ids) - len(output.token_ids), dtype=np.bool_)
+                final_output.extra_fields["response_support_complete"] = np.concatenate([previous, current])
             final_output.stop_reason = output.stop_reason
 
             # update model weights version

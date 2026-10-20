@@ -44,7 +44,14 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.utils import (
+    extract_response_topk_logprobs_with_coverage,
+    get_max_position_embeddings,
+    qwen2_5_vl_dedup_image_tokens,
+    run_uvicorn,
+    validate_topk_logprob_request,
+    warn_topk_logprob_budget,
+)
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -529,7 +536,11 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        topk_log_probs = sampling_params.pop("topk_log_probs", 0)
+        sampling_params["logprobs"] = (topk_log_probs or 0) if sampling_params.pop("logprobs", False) else None
+        if sampling_params["logprobs"]:
+            # the top-k head is read from flat lists, see extract_response_topk_logprobs
+            sampling_params["flat_logprobs"] = True
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
@@ -539,6 +550,10 @@ class vLLMHttpServer:
         if not sampling_params.get("stop") and not sampling_params.get("bad_words"):
             sampling_params.setdefault("detokenize", False)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        validate_topk_logprob_request(sampling_params)
+        budget_warnings = getattr(self, "_topk_budget_warnings", set())
+        warn_topk_logprob_budget(sampling_params, budget_warnings)
+        self._topk_budget_warnings = budget_warnings
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
@@ -626,7 +641,40 @@ class vLLMHttpServer:
         )
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
-        if sampling_params.logprobs is not None:
+        if sampling_params.logprobs:
+            # indexing FlatLogprobs per position would rebuild a k+1 dict per token
+            (
+                log_probs,
+                extra_fields["response_topk_ids"],
+                extra_fields["response_topk_log_probs"],
+                extra_fields["response_support_complete"],
+            ) = extract_response_topk_logprobs_with_coverage(
+                final_res.outputs[0].logprobs,
+                sampling_params.logprobs,
+                vocab_size=self.engine.model_config.get_vocab_size(),
+            )
+            truncated = sampling_params.top_p < 1 or sampling_params.top_k > 0 or sampling_params.min_p > 0
+            if truncated and not extra_fields["response_support_complete"].all():
+                # Use the effective request after defaults, hooks and vLLM canonicalization.
+                # Repeated requests with the same settings need only one diagnostic.
+                signature = (
+                    sampling_params.temperature,
+                    sampling_params.top_p,
+                    sampling_params.top_k,
+                    sampling_params.min_p,
+                    sampling_params.logprobs,
+                )
+                warned = getattr(self, "_topk_coverage_warnings", set())
+                if signature not in warned:
+                    logger.info(
+                        "The recorded top-k head does not prove complete sampling support for every token; "
+                        "score centering retains its head-plus-tail approximation for unknown rows. "
+                        "Effective request: temperature=%s, top_p=%s, top_k=%s, min_p=%s, logprobs=%s.",
+                        *signature,
+                    )
+                    warned.add(signature)
+                    self._topk_coverage_warnings = warned
+        elif sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
         routed_experts = None
