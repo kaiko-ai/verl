@@ -261,6 +261,11 @@ def distillation_loss(
     think_token_coef = loss_config.think_token_coef
     think_mask = data.get("think_token_mask", None)
     if think_token_coef < 1.0 and think_mask is not None:
+        # Separately stored nested masks don't share offsets, so they can't be combined elementwise.
+        if response_mask.is_nested:
+            response_mask = response_mask.to_padded_tensor(0)
+        if think_mask.is_nested:
+            think_mask = think_mask.to_padded_tensor(0)
         valid_tokens = response_mask.sum()
         think_tokens = (response_mask * think_mask).sum()
         if valid_tokens > 0:
