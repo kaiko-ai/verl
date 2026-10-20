@@ -60,6 +60,13 @@ from verl.utils.rollout_trace import (
     rollout_trace_current_span_id,
     rollout_trace_current_trace_id,
 )
+from verl.utils.sampling_support import (
+    SUPPORT_IDS_KEY,
+    SUPPORT_ROWS_EXTRA_KEY,
+    empty_support_rows,
+    pad_response_support,
+    pop_support_rows,
+)
 from verl.utils.skip import SkipManager
 from verl.utils.tokenizer import (
     build_multimodal_processor_inputs,
@@ -182,6 +189,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     (~95% zeros) is rebuilt JIT on the trainer instead of being serialized. See routed_experts_start_pos."""
     routed_experts_start_pos: Optional[int] = None
     """Left-pad offset at which the compact routed_experts slice begins in the padded sequence."""
+    rollout_support_ids: Optional[torch.Tensor] = None
+    """Response-aligned sampling support [1, response_length, k] int32 for sampling-mask replay."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -601,8 +610,12 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        # sampling-mask replay reads the sampler head; validation rollouts never train
+        if config.get("replay_sampling_mask", False) and not validate:
+            sampling_params["topk_log_probs"] = config.topk_log_probs
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+            params.pop("topk_log_probs", None)
             params["top_p"] = 1.0
             params["top_k"] = -1
             params["temperature"] = 0
@@ -797,6 +810,8 @@ class AgentLoopWorker:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
+        rollout_support_ids = self._build_rollout_support_ids(output, validate)
+
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -874,6 +889,7 @@ class AgentLoopWorker:
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
             routed_experts_start_pos=routed_experts_start_pos,
+            rollout_support_ids=rollout_support_ids,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             mm_processor_kwargs=output.mm_processor_kwargs,
@@ -884,6 +900,29 @@ class AgentLoopWorker:
             metrics=output.metrics,
             extra_fields=output.extra_fields,
         )
+
+    def _build_rollout_support_ids(self, output, validate: bool) -> Optional[torch.Tensor]:
+        """Pop the sampler heads from extra fields and build the sampling-mask replay tensor."""
+        # Popped unconditionally: per-token heads must not reach non_tensor_batch as object arrays.
+        support_rows = output.extra_fields.pop(SUPPORT_ROWS_EXTRA_KEY, None)
+        single_request_rows = pop_support_rows(output.extra_fields)
+        if support_rows is None:
+            support_rows = single_request_rows
+        if validate or not self.rollout_config.get("replay_sampling_mask", False):
+            return None
+        num_response_tokens = len(output.response_ids)
+        if support_rows is None:
+            if num_response_tokens > 0:
+                raise ValueError(
+                    "rollout.replay_sampling_mask is on but the agent loop returned no sampler support; "
+                    "multi-turn agent loops must set extra_fields['response_support_rows']."
+                )
+            support_rows = empty_support_rows(0, self.rollout_config.topk_log_probs)
+        if len(support_rows) != num_response_tokens:
+            raise ValueError(
+                f"sampling support covers {len(support_rows)} tokens, but the response has {num_response_tokens}."
+            )
+        return pad_response_support(support_rows, self.rollout_config.response_length)
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image, video and audio."""
@@ -1069,6 +1108,8 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        if inputs[0].rollout_support_ids is not None:
+            optional_outputs[SUPPORT_IDS_KEY] = torch.cat([input.rollout_support_ids for input in inputs], dim=0)
         # routed_experts is carried compactly in non_tensor_batch (below) and rebuilt JIT on the
         # trainer, so it is intentionally NOT stacked into the dense tensor batch here.
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:

@@ -18,6 +18,7 @@ from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, unpad_input
+from verl.utils.sampling_support import SUPPORT_IDS_KEY, response_support_to_prediction_rows
 
 
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
@@ -79,6 +80,14 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
             routed_experts_rmpad.squeeze(-1), offsets=cu_seqlens
         )
         data["routed_experts"] = routed_experts_nested
+
+    # sampling-mask replay: (bsz, response_len, k) response-aligned -> nested prediction rows
+    support_ids = data.get(SUPPORT_IDS_KEY, None)
+    if support_ids is not None and not support_ids.is_nested:
+        prompt_width = max_seq_len - max_response_len
+        support_ids = response_support_to_prediction_rows(support_ids, prompt_width, max_seq_len)
+        support_ids_rmpad = index_first_axis(support_ids.flatten(0, 1), indices)
+        data[SUPPORT_IDS_KEY] = torch.nested.nested_tensor_from_jagged(support_ids_rmpad, offsets=cu_seqlens)
 
     # (bsz, seqlen, topk)
     teacher_logprobs = data.get("teacher_logprobs", None)

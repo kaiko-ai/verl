@@ -66,6 +66,7 @@ from verl.utils.megatron_utils import (
     warmup_nccl_communicators,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
+from verl.utils.sampling_support import SUPPORT_IDS_KEY, vocab_parallel_log_probs_over_support
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
@@ -1023,6 +1024,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
         else:
             raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
 
+        # sampling-mask replay: nested (bsz, seq, k) support in prediction-row layout, so it is split
+        # like the logits and needs no roll (see verl.utils.sampling_support)
+        support_ids = batch.get(SUPPORT_IDS_KEY, None)
+        if support_ids is not None:
+            if use_fused_kernels:
+                raise NotImplementedError("rollout.replay_sampling_mask does not support use_fused_kernels=True.")
+            if not self.engine_config.use_remove_padding:
+                raise NotImplementedError("rollout.replay_sampling_mask needs use_remove_padding=True (THD).")
+
         if use_fused_kernels:
             if not self.engine_config.use_remove_padding:
                 logger.warning_once(
@@ -1065,7 +1075,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
             forward_fn = get_mcore_engine_forward_fn(self.model_config.hf_config)
             data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
 
-            def logits_processor(logits, label, temperature):
+            def logits_processor(logits, label, temperature, support_ids=None):
                 assert logits.shape[:2] == label.shape[:2]
                 # avoid non-positive temperature such as padding
                 temperature[temperature <= 0] = 1e-8
@@ -1099,7 +1109,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
                 if distillation_use_topk:
                     ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
-                log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
+                if support_ids is not None:
+                    log_probs = vocab_parallel_log_probs_over_support(logits_bak, label, support_ids)
+                else:
+                    log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                 ret["log_probs"] = log_probs
                 return ret
 
@@ -1112,6 +1125,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "loss_mask": loss_mask,
                 "response_attention_mask": response_attention_mask,
             }
+            if support_ids is not None:
+                logits_processor_args["support_ids"] = support_ids
 
             output = forward_fn(
                 model,
