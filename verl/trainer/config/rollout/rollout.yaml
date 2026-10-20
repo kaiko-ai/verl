@@ -327,7 +327,7 @@ trace:
   # Experiment name for run identification in tracking tools
   experiment_name: ${oc.select:trainer.experiment_name,null}
 
-  # trace backend, support mlflow, weave, trackio, arize
+  # trace backend, support mlflow, weave, trackio
   backend: null
 
   # whether translate token id to text in output
@@ -339,17 +339,6 @@ trace:
   # Total traces per step = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample
   max_samples_per_step_per_worker: null
 
-  # Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
-  trace_step_interval: 1
-
-  # During validation, trace every N-th sample of each worker batch (deterministic, so the
-  # same samples are traced on every validation pass). 1 traces all validation samples.
-  val_sample_interval: 1
-
-  # Arize-specific config
-  arize:
-    image_format: png
-    max_dimension: null
 
 # Whether to skip tokenizer initialization for rollout engine
 # When enabled (True), the rollout assume token in token out for generation

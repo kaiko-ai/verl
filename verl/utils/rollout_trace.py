@@ -25,7 +25,6 @@ from pydantic import BaseModel
 from verl.utils.ray_utils import get_event_loop
 
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
-_root_trace_span: ContextVar = ContextVar("_root_trace_span", default=None)
 _trace_attributes: ContextVar[dict | None] = ContextVar("_trace_attributes", default=None)
 
 
@@ -36,7 +35,7 @@ class RolloutTraceConfig:
             tracing backends like Weave, MLflow, and Trackio.
 
     Args:
-        backend (Optional[str]): Tracing backend to use ('weave', 'mlflow', 'arize', or None).
+        backend (Optional[str]): Tracing backend to use ('weave', 'mlflow', or None).
         client (Optional[object]): Client instance for the selected backend.
         token2text (bool): Whether to convert tokens to text in traces. Defaults to False.
         project_name (str): Name of the project for tracing.
@@ -45,12 +44,6 @@ class RolloutTraceConfig:
             per worker per step. If None, all samples are traced. If set, each worker will randomly
             select up to this many unique samples to trace (including all their rollouts for GRPO).
             Total traces = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample.
-        trace_step_interval (int): Only trace every N steps. E.g. 5 means trace on steps 0, 5, 10, ...
-            Defaults to 1 (trace every step).
-        val_sample_interval (int): During validation, trace every N-th sample of each worker
-            batch (positions 0, N, 2N, ...). Deterministic, so the same samples are traced on
-            every validation pass. Defaults to 1 (trace all validation samples). Validation
-            ignores max_samples_per_step_per_worker and trace_step_interval.
     """
 
     _instance: Optional["RolloutTraceConfig"] = None
@@ -61,9 +54,6 @@ class RolloutTraceConfig:
     project_name: str = None
     experiment_name: str = None
     max_samples_per_step_per_worker: int | None = None
-    trace_step_interval: int = 1
-    val_sample_interval: int = 1
-    arize_config: dict = {}
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -85,9 +75,6 @@ class RolloutTraceConfig:
         backend: str,
         token2text: bool = False,
         max_samples_per_step_per_worker: int | None = None,
-        trace_step_interval: int = 1,
-        val_sample_interval: int = 1,
-        arize_config: Optional[dict] = None,
     ):
         config = cls.get_instance()
         if config._initialized:
@@ -98,9 +85,6 @@ class RolloutTraceConfig:
         config.project_name = project_name
         config.experiment_name = experiment_name
         config.max_samples_per_step_per_worker = max_samples_per_step_per_worker
-        config.trace_step_interval = max(1, trace_step_interval)
-        config.val_sample_interval = max(1, val_sample_interval)
-        config.arize_config = arize_config or {}
 
         if backend == "weave":
             import weave
@@ -116,16 +100,6 @@ class RolloutTraceConfig:
             mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
             mlflow.set_experiment(project_name)
-        elif backend == "arize":
-            from arize.otel import register
-            from opentelemetry import trace
-
-            register(
-                space_id=os.environ["ARIZE_SPACE_ID"],
-                api_key=os.environ["ARIZE_API_KEY"],
-                project_name=project_name,
-            )
-            config.client = trace.get_tracer(f"verl.rollout.{project_name}")
         elif backend == "trackio":
             import trackio
             from trackio import context_vars
@@ -215,29 +189,6 @@ def rollout_trace_attr(
                 for key, value in attributes.items():
                     mlflow.set_trace_tag(trace_id, str(key), str(value))
                 yield
-        finally:
-            _trace_attributes.reset(token)
-    elif backend == "arize":
-        tracer = RolloutTraceConfig.get_client()
-        span_attributes = {str(k): str(v) for k, v in attributes.items()}
-        span_attributes["openinference.span.kind"] = "CHAIN"
-        # KAIKO_RUN_ID (audit-folder UUID / Ray submission id) uniquely identifies the
-        # training run; experiment_name alone collides across resubmissions. Doubling it
-        # as the OpenInference session id groups a run's traces in Arize's Sessions tab.
-        kaiko_run_id = os.environ.get("KAIKO_RUN_ID")
-        if kaiko_run_id:
-            span_attributes["kaiko_run_id"] = kaiko_run_id
-            span_attributes["session.id"] = kaiko_run_id
-        try:
-            with tracer.start_as_current_span(
-                name=name,
-                attributes=span_attributes,
-            ) as span:
-                span_token = _root_trace_span.set(span)
-                try:
-                    yield
-                finally:
-                    _root_trace_span.reset(span_token)
         finally:
             _trace_attributes.reset(token)
     else:
@@ -472,35 +423,6 @@ def rollout_trace_op(func):
                 _log_trackio_trace(func.__qualname__, inputs, exception=e)
                 raise e
 
-        elif backend == "arize":
-            from opentelemetry import trace as otel_trace
-
-            flat_inputs = {k: v for k, v in inputs.items() if k != "kwargs"}
-            if isinstance(inputs.get("kwargs"), dict):
-                flat_inputs.update(inputs["kwargs"])
-            _set_arize_root_span_metadata(flat_inputs)
-
-            tracer = RolloutTraceConfig.get_client()
-            with tracer.start_as_current_span(
-                name=func.__qualname__,
-                attributes={"openinference.span.kind": "CHAIN"},
-            ) as span:
-                try:
-                    result = await func(self, *args, **kwargs)
-                    _set_arize_root_span_result(result)
-                    _auto_attach_trace_conversation(result)
-                    if enable_token2text:
-                        _result = await add_token2text(self, result)
-                        if isinstance(_result, dict) and "response_text" in _result:
-                            span.set_attribute("output.value", _result["response_text"])
-                            span.set_attribute("output.mime_type", "text/plain")
-                    span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
-                    return result
-                except Exception as e:
-                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
-                    span.record_exception(e)
-                    raise
-
         else:
             return await func(self, *args, **kwargs)
 
@@ -535,29 +457,6 @@ def rollout_trace_op(func):
             import mlflow
 
             return mlflow.trace(func)(self, *args, **kwargs)
-        elif backend == "arize":
-            from opentelemetry import trace as otel_trace
-
-            flat_inputs = {k: v for k, v in inputs.items() if k != "kwargs"}
-            if isinstance(inputs.get("kwargs"), dict):
-                flat_inputs.update(inputs["kwargs"])
-            _set_arize_root_span_metadata(flat_inputs)
-
-            tracer = RolloutTraceConfig.get_client()
-            with tracer.start_as_current_span(
-                name=func.__qualname__,
-                attributes={"openinference.span.kind": "CHAIN"},
-            ) as span:
-                try:
-                    result = func(self, *args, **kwargs)
-                    _set_arize_root_span_result(result)
-                    _auto_attach_trace_conversation(result)
-                    span.set_status(otel_trace.Status(otel_trace.StatusCode.OK))
-                    return result
-                except Exception as e:
-                    span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, str(e)))
-                    span.record_exception(e)
-                    raise
         elif backend == "trackio":
             try:
                 result = func(self, *args, **kwargs)
@@ -570,251 +469,3 @@ def rollout_trace_op(func):
             return func(self, *args, **kwargs)
 
     return async_wrapper if inspect.iscoroutinefunction(func) else wrapper
-
-
-def _set_arize_root_span_metadata(inputs: dict) -> None:
-    """Write scalar kwargs onto the root rollout_trace_attr span as searchable attributes.
-
-    Flattens one level of ``extra_info``. Skips ``messages``, ``multi_modal_inputs``,
-    and ``sampling_params``.
-    """
-    root_span = _root_trace_span.get()
-    if root_span is None or not root_span.is_recording():
-        return
-
-    skip_keys = {"messages", "multi_modal_inputs", "sampling_params"}
-    for key, value in inputs.items():
-        if key in skip_keys:
-            continue
-        if isinstance(value, (str, int, float, bool)):
-            root_span.set_attribute(key, str(value))
-        elif isinstance(value, dict) and key == "extra_info":
-            for sub_key, sub_value in value.items():
-                if isinstance(sub_value, (str, int, float, bool)):
-                    root_span.set_attribute(f"extra_info.{sub_key}", str(sub_value))
-
-
-def _set_arize_root_span_result(result) -> None:
-    """Write scalar result fields (e.g. ``reward_score``, ``num_turns``) onto the root span."""
-    root_span = _root_trace_span.get()
-    if root_span is None or not root_span.is_recording():
-        return
-
-    result_dict = vars(result) if hasattr(result, "__dict__") else {}
-    skip_keys = {"prompt_ids", "response_ids", "response_mask", "response_logprobs",
-                 "multi_modal_data", "extra_fields", "metrics"}
-    for key, value in result_dict.items():
-        if key in skip_keys:
-            continue
-        if isinstance(value, (str, int, float, bool)):
-            root_span.set_attribute(key, str(value))
-
-
-def _auto_attach_trace_conversation(result) -> None:
-    """If result has trace_conversation, attach it to the current span and clear it."""
-    messages = getattr(result, "trace_conversation", None)
-    if messages is None:
-        return
-    images = None
-    multi_modal = getattr(result, "multi_modal_data", None)
-    if isinstance(multi_modal, dict):
-        images = multi_modal.get("images")
-    arize = RolloutTraceConfig.get_instance().arize_config
-    rollout_trace_attach_conversation(
-        messages=messages,
-        images=images,
-        image_format=arize.get("image_format", "png"),
-        max_dimension=arize.get("max_dimension"),
-        span_kind="AGENT",
-        tools=getattr(result, "trace_tools", None),
-    )
-    result.trace_conversation = None
-    if hasattr(result, "trace_tools"):
-        result.trace_tools = None
-
-
-def rollout_trace_current_trace_id() -> str | None:
-    """Return the 32-hex trace id of the root rollout trace span, or None when untraced.
-
-    Only valid inside a ``rollout_trace_attr`` context with a recording span; callers
-    use it to correlate a rollout's output with its trace in the backend (e.g. Arize).
-    """
-    span = _root_trace_span.get()
-    if span is None or not span.is_recording():
-        return None
-    return format(span.get_span_context().trace_id, "032x")
-
-
-def rollout_trace_current_span_id() -> str | None:
-    """Return the 16-hex span id of the root rollout trace span, or None when untraced.
-
-    Post-hoc span evaluations (e.g. Arize update_evaluations) attach by span id;
-    the root span makes them trace-level.
-    """
-    span = _root_trace_span.get()
-    if span is None or not span.is_recording():
-        return None
-    return format(span.get_span_context().span_id, "016x")
-
-
-def _message_text(msg: dict) -> str | None:
-    """Extract the plain-text content of a chat message, or None if it has none."""
-    content = msg.get("content")
-    if isinstance(content, str):
-        return content or None
-    if content is not None and not isinstance(content, list) and hasattr(content, "__iter__"):
-        content = list(content)
-    if isinstance(content, list):
-        text = "\n".join(
-            item.get("text", "") for item in content if hasattr(item, "get") and item.get("type") == "text"
-        )
-        return text or None
-    return None
-
-
-def _encode_image(img, image_format: str = "png", max_dimension: int | None = None) -> str | None:
-    """Encode a PIL image to a base64 data URI. Returns None if img is not a valid image."""
-    if not hasattr(img, "save"):
-        return None
-
-    import base64
-    import io
-
-    if max_dimension is not None:
-        w, h = img.size
-        if max(w, h) > max_dimension:
-            scale = max_dimension / max(w, h)
-            img = img.resize(
-                (int(w * scale), int(h * scale)),
-                resample=getattr(img, "Resampling", img).LANCZOS if hasattr(img, "Resampling") else 1,
-            )
-
-    buffer = io.BytesIO()
-    img.save(buffer, format=image_format.upper())
-    b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    return f"data:image/{image_format.lower()};base64,{b64}"
-
-
-def rollout_trace_attach_conversation(
-    messages: list[dict] | None,
-    images: list | None = None,
-    image_format: str = "png",
-    max_dimension: int | None = None,
-    span_kind: str | None = None,
-    tools: list[dict] | None = None,
-):
-    """Attach a conversation (messages + images) to the root trace span.
-
-    For the Arize backend, serializes the conversation as OpenInference
-    ``llm.input_messages`` attributes with roles, text, and inline images.
-    Image placeholders (``{"type": "image"}``) in message content are resolved
-    to base64-encoded images from the ``images`` list, consumed in order.
-
-    Targets the root span opened by ``rollout_trace_attr`` (falling back to the
-    current span outside that context) so the trace list renders the episode the
-    way Arize expects: kind, input and output on the top-level row. Also derives
-    ``input.value`` from the first user message and ``output.value`` from the
-    last assistant message.
-
-    Should be called once at the end of a ``@rollout_trace_op``-decorated function.
-
-    For Weave/MLflow backends, this is a no-op.
-
-    Args:
-        messages: Chat message dicts with ``role`` and ``content`` keys.
-            Content can be a string or a list of content items
-            (``{"type": "text", "text": "..."}`` or ``{"type": "image"}``).
-        images: Flat list of PIL Image objects, consumed in order as
-            ``{"type": "image"}`` placeholders are encountered.
-        image_format: Image encoding format ('png' or 'jpeg'). Default 'png'.
-        max_dimension: If set, resize images so the largest dimension is at most
-            this value (preserving aspect ratio).
-        span_kind: If set, override the ``openinference.span.kind`` attribute
-            on the current span (e.g. "AGENT").
-        tools: Tool definition dicts (OpenAI function schema format) available to
-            the agent, serialized as ``llm.tools.{i}.tool.json_schema`` attributes.
-    """
-    if not messages:
-        return
-
-    backend = RolloutTraceConfig.get_backend()
-    if backend != "arize":
-        return
-
-    if not _trace_enabled.get():
-        return
-
-    from opentelemetry import trace
-
-    span = _root_trace_span.get()
-    if span is None or not span.is_recording():
-        span = trace.get_current_span()
-    if not span.is_recording():
-        return
-
-    if span_kind:
-        span.set_attribute("openinference.span.kind", span_kind)
-
-    for tool_idx, tool in enumerate(tools or []):
-        span.set_attribute(f"llm.tools.{tool_idx}.tool.json_schema", json.dumps(tool))
-
-    first_user_text = next(
-        (_message_text(m) for m in messages if m.get("role") == "user" and _message_text(m)), None
-    )
-    last_assistant_text = next(
-        (_message_text(m) for m in reversed(messages) if m.get("role") == "assistant" and _message_text(m)), None
-    )
-    if first_user_text is not None:
-        span.set_attribute("input.value", first_user_text)
-        span.set_attribute("input.mime_type", "text/plain")
-    if last_assistant_text is not None:
-        span.set_attribute("output.value", last_assistant_text)
-        span.set_attribute("output.mime_type", "text/plain")
-
-    image_idx = 0
-    images = images or []
-
-    for msg_idx, msg in enumerate(messages):
-        role = msg.get("role", "unknown")
-        content = msg.get("content")
-        prefix = f"llm.input_messages.{msg_idx}.message"
-
-        # Normalize OmegaConf ListConfig to native Python list
-        if not isinstance(content, (str, list, type(None))) and hasattr(content, "__iter__"):
-            content = list(content)
-
-        span.set_attribute(f"{prefix}.role", role)
-
-        if isinstance(content, str):
-            span.set_attribute(f"{prefix}.content", content)
-        elif isinstance(content, list):
-            has_images = any(
-                hasattr(item, "get") and item.get("type") == "image" for item in content
-            )
-            if not has_images:
-                # Text-only list: set as plain string to avoid duplication
-                text = "\n".join(
-                    item.get("text", "") for item in content if hasattr(item, "get") and item.get("type") == "text"
-                )
-                if text:
-                    span.set_attribute(f"{prefix}.content", text)
-            else:
-                # Mixed content (text + images): use structured format only
-                content_idx = 0
-                for item in content:
-                    item_type = item.get("type") if hasattr(item, "get") else None
-                    content_prefix = f"{prefix}.contents.{content_idx}.message_content"
-
-                    if item_type == "text":
-                        text = item.get("text", "")
-                        span.set_attribute(f"{content_prefix}.type", "text")
-                        span.set_attribute(f"{content_prefix}.text", text)
-                        content_idx += 1
-                    elif item_type == "image":
-                        if image_idx < len(images):
-                            data_uri = _encode_image(images[image_idx], image_format, max_dimension)
-                            if data_uri:
-                                span.set_attribute(f"{content_prefix}.type", "image")
-                                span.set_attribute(f"{content_prefix}.image.image.url", data_uri)
-                                content_idx += 1
-                        image_idx += 1

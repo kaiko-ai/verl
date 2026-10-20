@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.utils.ray_utils import get_event_loop
+from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -103,6 +104,7 @@ class HermesToolParser(ToolParser):
         self.tool_call_end_token: str = "</tool_call>"
         self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
 
+    @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
@@ -151,6 +153,7 @@ class GptOssToolParser(ToolParser):
             regex.DOTALL,
         )
 
+    @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
@@ -341,6 +344,7 @@ class Qwen3XMLToolParser(ToolParser):
         function_calls = [match[0] if match[0] else match[1] for match in raw_function_calls]
         return function_calls
 
+    @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
@@ -419,6 +423,7 @@ class GLMToolParser(ToolParser):
         content = regex.sub(r"^\s*</think>", "", content)
         return content
 
+    @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
@@ -476,6 +481,7 @@ class SeedToolParser(ToolParser):
         }
         return FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False))
 
+    @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
@@ -530,6 +536,7 @@ class MiniMaxToolParser(ToolParser):
             function_calls.append(FunctionCall(name=name.strip(), arguments=json.dumps(arguments, ensure_ascii=False)))
         return function_calls
 
+    @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
@@ -615,6 +622,7 @@ class KimiToolParser(ToolParser):
 
         return raw_name
 
+    @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
@@ -779,6 +787,7 @@ class Gemma4ToolParser(ToolParser):
                             result[key] = bare_val
         return result
 
+    @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
