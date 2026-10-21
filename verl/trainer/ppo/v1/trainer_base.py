@@ -1654,6 +1654,7 @@ class PPOTrainer(ABC):
                 "calculate_entropy": True,
                 "compute_loss": False,
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
+                "replay_sampling_mask": self.config.actor_rollout_ref.rollout.replay_sampling_mask,
             }
         )
         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1859,6 +1860,7 @@ class PPOTrainer(ABC):
             "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            "replay_sampling_mask": self.config.actor_rollout_ref.rollout.replay_sampling_mask,
         }
         batch.extra_info.update(extra_info)
 

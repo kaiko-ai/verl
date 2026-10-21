@@ -25,12 +25,17 @@ prediction-row layout, encoded ``id + 1`` with ``0`` for an empty slot so every 
 "no support". Rows without support keep the full-vocabulary log-prob.
 """
 
+import logging
 import time
 from collections import defaultdict
 from typing import Any, Optional
 
 import numpy as np
 import torch
+
+from verl.utils import tensordict_utils as tu
+
+logger = logging.getLogger(__name__)
 
 SUPPORT_COUNTS_KEY = "rollout_support_counts"
 SUPPORT_FLAT_IDS_KEY = "rollout_support_flat_ids"
@@ -146,11 +151,15 @@ def prediction_rows_from_compact(
 def nested_support_ids(batch: Any) -> Optional[torch.Tensor]:
     """Expand a micro-batch's CSR supports into nested prediction rows aligned with ``input_ids``.
 
-    Returns None when the batch carries no support (replay off). Also records the coverage of the
-    trained tokens and the cost of the expansion for pop_support_stats.
+    Returns None when the batch carries no support. With replay on that means TransferQueue dropped
+    the fields (some row of the fetch lacks them), so its trained tokens count as uncovered. Also
+    records the coverage of the trained tokens and the cost of the expansion for pop_support_stats.
     """
     counts = batch.get(SUPPORT_COUNTS_KEY, None)
     if counts is None:
+        if tu.get_non_tensor_data(batch, key="replay_sampling_mask", default=False):
+            _STATS["trained_tokens"].append(sum(int(m.sum()) for m in batch["loss_mask"].unbind()))
+            _STATS["missing_micro_batches"].append(1)
         return None
     start = time.perf_counter()
     input_ids = batch["input_ids"]
@@ -193,6 +202,8 @@ def pop_support_stats() -> dict[str, float]:
 
     - ``coverage``: fraction of trained tokens normalized over their sampling support; the rest
       used the full vocabulary.
+    - ``missing_micro_batches``: micro-batches that arrived without the support fields although
+      replay is on (all their tokens used the full vocabulary).
     - ``support_size_{mean,max,p50,p90,p99,p999}``: support size of the covered tokens; a token whose
       support does not fit the recorded head is uncovered, so ``topk_log_probs`` should exceed p99.9.
     - ``csr_mb``: CSR support bytes this rank received.
@@ -205,16 +216,22 @@ def pop_support_stats() -> dict[str, float]:
         return {}
     metrics: dict[str, float] = {}
     trained, covered = sum(stats.get("trained_tokens", [])), sum(stats.get("covered_tokens", []))
+    missing = sum(stats.get("missing_micro_batches", []))
+    if missing:
+        metrics["sampling_mask/missing_micro_batches"] = float(missing)
+        logger.warning(
+            "sampling-mask replay: %d micro-batches arrived without their sampling support and used "
+            "full-vocabulary log-probs (a TransferQueue fetch drops fields that any of its rows lacks).",
+            missing,
+        )
     if trained:
         metrics["sampling_mask/coverage"] = covered / trained
-        metrics["sampling_mask/support_size_mean"] = sum(stats["covered_ids"]) / covered if covered else 0.0
+    if covered:
+        metrics["sampling_mask/support_size_mean"] = sum(stats["covered_ids"]) / covered
         metrics["sampling_mask/support_size_max"] = float(max(stats["support_size_max"]))
         cumulative = np.cumsum(np.sum(stats["support_size_hist"], axis=0)[1:])
-        if cumulative[-1]:
-            for name, q in (("p50", 0.5), ("p90", 0.9), ("p99", 0.99), ("p999", 0.999)):
-                metrics[f"sampling_mask/support_size_{name}"] = float(
-                    1 + np.searchsorted(cumulative, q * cumulative[-1])
-                )
+        for name, q in (("p50", 0.5), ("p90", 0.9), ("p99", 0.99), ("p999", 0.999)):
+            metrics[f"sampling_mask/support_size_{name}"] = float(1 + np.searchsorted(cumulative, q * cumulative[-1]))
     if "csr_bytes" in stats:
         metrics["sampling_mask/csr_mb"] = sum(stats["csr_bytes"]) / 1e6
     if "expand_ms" in stats:

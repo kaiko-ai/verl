@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from verl.utils import tensordict_utils as tu
 from verl.utils.sampling_support import (
     EMPTY_SLOT,
     SUPPORT_COUNTS_KEY,
@@ -67,6 +68,15 @@ def test_nested_support_ids_aligns_rows_with_the_packed_sequence_and_records_cov
     assert stats["sampling_mask/support_size_p50"] == 1
     assert stats["sampling_mask/support_size_p999"] == 2
     assert pop_support_stats() == {}
+
+    # with replay on, a fetch that lost the support fields counts its trained tokens as uncovered
+    support_keys = (SUPPORT_COUNTS_KEY, SUPPORT_FLAT_IDS_KEY)
+    dropped = list_of_dict_to_tensordict([{k: v for k, v in row.items() if k not in support_keys} for row in rows])
+    assert nested_support_ids(dropped) is None and pop_support_stats() == {}
+    tu.assign_non_tensor(dropped, replay_sampling_mask=True)
+    assert nested_support_ids(dropped) is None
+    stats = pop_support_stats()
+    assert stats == {"sampling_mask/missing_micro_batches": 1.0, "sampling_mask/coverage": 0.0}
 
 
 class _ReduceFromTP(torch.autograd.Function):
