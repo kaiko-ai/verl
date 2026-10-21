@@ -104,6 +104,15 @@ class FusedOutputProcessorContext:
     support_ids: Tensor | None = None
 
 
+def _replay_sampling_support(logprobs, hidden_states, weight, labels, support_ids, temperature):
+    if support_ids is None:
+        return logprobs
+    support_log_probs, has_support = log_probs_over_support_from_hidden(
+        hidden_states, weight, labels, support_ids, temperature
+    )
+    return torch.where(has_support.view_as(logprobs), support_log_probs.view_as(logprobs), logprobs)
+
+
 def fused_output_processor(
     *,
     hidden_states,
@@ -138,11 +147,7 @@ def fused_output_processor(
         parallel_state.get_tensor_model_parallel_group(),
         impl_backend=context.impl_backend,
     )
-    if context.support_ids is not None:
-        support_log_probs, has_support = log_probs_over_support_from_hidden(
-            hidden_states, weight, labels, context.support_ids, temperature
-        )
-        logprobs = torch.where(has_support.view_as(logprobs), support_log_probs.view_as(logprobs), logprobs)
+    logprobs = _replay_sampling_support(logprobs, hidden_states, weight, labels, context.support_ids, temperature)
 
     if has_config_logger_enabled(config):
         payload = OrderedDict(
@@ -355,11 +360,11 @@ def fused_forward_model_engine(vision_model: bool = False):
             labels=labels_rmpad,
             **model_kwargs,
         )
+        impl_backend = get_fused_impl_backend(model)
+        if support_ids is not None and impl_backend.lower() == "liger":
+            # the support log-prob leaves dHidden partial per TP rank, which Liger does not reduce
+            raise NotImplementedError("rollout.replay_sampling_mask needs the triton fused kernel backend.")
         if _use_output_processor_hook(model):
-            impl_backend = get_fused_impl_backend(model)
-            if support_ids is not None and impl_backend.lower() == "liger":
-                # the support log-prob leaves dHidden partial per TP rank, which Liger does not reduce
-                raise NotImplementedError("rollout.replay_sampling_mask needs the triton fused kernel backend.")
             output_orig: CausalLMOutputForPPO = model(
                 **forward_kwargs,
                 output_processor=fused_output_processor,
@@ -370,12 +375,10 @@ def fused_forward_model_engine(vision_model: bool = False):
                 ),
             )
         else:
-            if support_ids is not None:
-                raise NotImplementedError("rollout.replay_sampling_mask needs Megatron's output_processor hook.")
-            impl_backend = get_fused_impl_backend(model)
             output_orig: CausalLMOutputForPPO = model(
                 temperature=temperature,
                 impl_backend=impl_backend,
+                support_ids=support_ids,
                 **forward_kwargs,
             )
 
@@ -434,6 +437,7 @@ def _fused_GPTModel_forward(
     temperature: float = 1.0,
     impl_backend: str = "triton",
     padding_mask: Tensor | None = None,
+    support_ids: Tensor | None = None,
     **kwargs,
 ) -> CausalLMOutputForPPO:
     """
@@ -513,6 +517,7 @@ def _fused_GPTModel_forward(
         parallel_state.get_tensor_model_parallel_group(),
         impl_backend=impl_backend,
     )
+    logprobs = _replay_sampling_support(logprobs, hidden_states, output_weight, labels, support_ids, temperature)
 
     if has_config_logger_enabled(model.config):
         payload = OrderedDict(
