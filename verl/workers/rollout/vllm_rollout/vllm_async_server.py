@@ -52,6 +52,7 @@ from verl.workers.rollout.utils import (
     validate_topk_logprob_request,
     warn_topk_logprob_budget,
 )
+from verl.workers.rollout.vllm_rollout.flat_logprobs import patch_vllm_flat_logprobs
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -431,6 +432,7 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
+        patch_vllm_flat_logprobs()
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory
@@ -648,7 +650,8 @@ class vLLMHttpServer:
                 extra_fields["response_topk_ids"],
                 extra_fields["response_topk_log_probs"],
                 extra_fields["response_support_complete"],
-            ) = extract_response_topk_logprobs_with_coverage(
+            ) = await asyncio.to_thread(  # numpy work on long responses must not stall the event loop
+                extract_response_topk_logprobs_with_coverage,
                 final_res.outputs[0].logprobs,
                 sampling_params.logprobs,
                 vocab_size=self.engine.model_config.get_vocab_size(),
