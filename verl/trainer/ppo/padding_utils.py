@@ -36,6 +36,7 @@ except ImportError:
 
 from verl.trainer.ppo.score_centering import dummy_rollout_topk
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.sampling_support import SUPPORT_COUNTS_KEY, SUPPORT_FLAT_IDS_KEY
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,10 @@ def construct_minimal_padding_template(
         template_sample["rollout_topk_log_probs"] = log_probs
         if "rollout_support_complete" in template_sample:
             template_sample["rollout_support_complete"] = torch.ones(sequence_length, dtype=torch.bool)
+
+    if SUPPORT_COUNTS_KEY in template_sample:
+        template_sample[SUPPORT_COUNTS_KEY] = torch.zeros(responses.size(0), dtype=torch.uint8)
+        template_sample[SUPPORT_FLAT_IDS_KEY] = torch.zeros(0, dtype=torch.int32)
 
     # Update the fields and remove redundant parts
     template_sample.update(

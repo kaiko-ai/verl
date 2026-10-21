@@ -248,6 +248,10 @@ calculate_log_probs: True
 # 0 disables; the paper uses 128 (32 also matches). vLLM only for now, single-turn agent loop only.
 topk_log_probs: 0
 
+# Replay the top-k/top-p sampling support in the trainer's log-probs (Megatron, remove-padding, unfused).
+# Needs topk_log_probs > top_k so the recorded head can prove the support is complete.
+replay_sampling_mask: false
+
 # [Experimental] agent loop based rollout configs
 agent:
 

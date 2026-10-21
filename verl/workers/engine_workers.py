@@ -44,6 +44,7 @@ from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
 from verl.utils.qat import dispatch_rollout_weight_quantizer
+from verl.utils.sampling_support import pop_support_stats
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.workers.config import (
@@ -235,6 +236,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
+        metrics.update(pop_support_stats())
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
         if dp_group is not None:
