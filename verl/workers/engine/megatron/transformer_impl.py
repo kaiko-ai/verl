@@ -1027,11 +1027,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
         # sampling-mask replay: nested (bsz, seq, k) support in prediction-row layout, so it is split
         # like the logits and needs no roll (see verl.utils.sampling_support)
         support_ids = batch.get(SUPPORT_IDS_KEY, None)
-        if support_ids is not None:
-            if use_fused_kernels:
-                raise NotImplementedError("rollout.replay_sampling_mask does not support use_fused_kernels=True.")
-            if not self.engine_config.use_remove_padding:
-                raise NotImplementedError("rollout.replay_sampling_mask needs use_remove_padding=True (THD).")
+        if support_ids is not None and not self.engine_config.use_remove_padding:
+            raise NotImplementedError("rollout.replay_sampling_mask needs use_remove_padding=True (THD).")
 
         if use_fused_kernels:
             if not self.engine_config.use_remove_padding:
@@ -1062,6 +1059,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 temperature=temperature_value,
                 calculate_entropy=calculate_entropy,
                 pad_token_id=self.model_config.tokenizer.pad_token_id,
+                support_ids=support_ids,
             )
         else:
             if not isinstance(temperature, torch.Tensor):

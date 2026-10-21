@@ -35,6 +35,7 @@ from verl.utils.sampling_support import (
     compact_support_rows,
     compute_support_metrics,
     empty_support_rows,
+    log_probs_over_support_from_hidden,
     pop_support_rows,
     prediction_rows_from_compact,
     support_rows_from_topk,
@@ -382,6 +383,72 @@ def test_kernel_zero_padded_rows_use_full_vocabulary():
         torch.testing.assert_close(out, expected)
     finally:
         _restore_modules(saved)
+
+
+def _check_fused_against_masked_softmax(world_size, rank):
+    tokens, hidden_size, vocab, k, temperature = 12, 8, 16, 4, 0.7
+    gen = torch.Generator().manual_seed(0)
+    hidden = torch.randn(tokens, 1, hidden_size, generator=gen)
+    weight = torch.randn(vocab, hidden_size, generator=gen)
+    labels = torch.randint(0, vocab, (1, tokens), generator=gen)
+    support = torch.zeros(1, tokens, k, dtype=torch.int32)
+    for t in range(tokens):
+        if t % 4 == 3:
+            continue
+        others = [v for v in torch.randperm(vocab, generator=gen).tolist() if v != int(labels[0, t])]
+        support[0, t, : 1 + t % k] = torch.tensor([int(labels[0, t])] + others[: t % k]) + 1
+    shard = slice(rank * vocab // world_size, (rank + 1) * vocab // world_size)
+    loss_weights = torch.linspace(0.5, 1.5, tokens).view(1, tokens)
+
+    local_hidden = hidden.clone().requires_grad_(True)
+    local_weight = weight[shard].clone().requires_grad_(True)
+    log_probs, has_support = log_probs_over_support_from_hidden(
+        local_hidden, local_weight, labels, support, temperature
+    )
+    torch.where(has_support, log_probs * loss_weights, 0.0).sum().backward()
+    d_hidden = local_hidden.grad.clone()
+    if dist.is_initialized():
+        dist.all_reduce(d_hidden)  # the sequence-parallel gather's backward sums the partial gradients
+
+    ref_hidden = hidden.clone().requires_grad_(True)
+    ref_weight = weight.clone().requires_grad_(True)
+    logits = (ref_hidden.view(tokens, hidden_size) @ ref_weight.T / temperature).unsqueeze(0)
+    valid = support != EMPTY_SLOT
+    supported = valid.any(-1)
+    ids = (support.long() - 1).clamp(min=0)
+    mask = torch.zeros(logits.shape, dtype=torch.long).scatter_add_(-1, ids, valid.long()) > 0
+    masked = logits.masked_fill(~(mask | ~supported.unsqueeze(-1)), float("-inf"))
+    ref = torch.log_softmax(masked, -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    torch.where(supported, ref * loss_weights, 0.0).sum().backward()
+
+    assert torch.equal(has_support, supported)
+    torch.testing.assert_close(log_probs[supported], ref[supported])
+    torch.testing.assert_close(d_hidden, ref_hidden.grad)
+    torch.testing.assert_close(local_weight.grad, ref_weight.grad[shard])
+
+
+def _fused_tp_worker(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    saved = _install_fake_megatron()
+    try:
+        _check_fused_against_masked_softmax(world_size, rank)
+    finally:
+        _restore_modules(saved)
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_fused_support_log_probs_from_hidden_match_masked_softmax(world_size):
+    if world_size == 1:
+        saved = _install_fake_megatron()
+        try:
+            _check_fused_against_masked_softmax(world_size, rank=0)
+        finally:
+            _restore_modules(saved)
+    else:
+        mp.spawn(_fused_tp_worker, args=(world_size, 29700 + os.getpid() % 1000), nprocs=world_size, join=True)
 
 
 # --------------------------------------------------------------------------- config and agent loop
