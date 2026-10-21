@@ -406,9 +406,9 @@ def preprocess_thd_engine(
             # alignment size, pad the tensor with zeros so that its total
             # length matches `align_size`. This ensures size alignment for
             # downstream operations (e.g., communication or memory alignment).
-            if d.numel() < align_size:
-                original_size = d.numel()
-                pad = torch.zeros(align_size - d.numel(), dtype=d.dtype, device=d.device)
+            if d.shape[0] < align_size:
+                original_size = d.shape[0]
+                pad = torch.zeros((align_size - d.shape[0], *d.shape[1:]), dtype=d.dtype, device=d.device)
                 d = torch.cat([d, pad], dim=0)
                 logger.warning_once(
                     f"Padding tensor for context parallel alignment, original_size={original_size}, "

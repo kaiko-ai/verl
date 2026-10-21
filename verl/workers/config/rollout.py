@@ -224,6 +224,12 @@ class RolloutConfig(BaseConfig):
 
     calculate_log_probs: bool = False
 
+    # Sampler top-k log-probs per generated token and support-recording budget for score centering; 0 disables.
+    topk_log_probs: int = 0
+
+    # Replay the top-k/top-p sampling support (from the topk_log_probs head) in the trainer's log-probs.
+    replay_sampling_mask: bool = False
+
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)
@@ -349,3 +355,38 @@ class RolloutConfig(BaseConfig):
                 f"rollout.disaggregation.enabled=True is currently only supported with "
                 f"rollout.name='sglang'; got {self.name!r}. (vLLM PD is a tracked follow-up.)"
             )
+
+        if self.topk_log_probs:
+            if self.name != "vllm":
+                raise ValueError("rollout.topk_log_probs is supported by the vLLM rollout only.")
+            if not self.calculate_log_probs or self.logprobs_mode != "processed_logprobs":
+                raise ValueError(
+                    "rollout.topk_log_probs needs calculate_log_probs=True, logprobs_mode='processed_logprobs' and "
+                    "the vLLM rollout so the returned head uses the sampling distribution."
+                )
+            if 0 < self.topk_log_probs < self.top_k:
+                warnings.warn(
+                    f"rollout.topk_log_probs={self.topk_log_probs} is smaller than the sampling top_k={self.top_k}. "
+                    "Increasing topk_log_probs can allow score centering to align the full sampling support. "
+                    "Actual coverage determines whether the trainer-tail approximation is used.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            vllm_kwargs = self.engine_kwargs.setdefault("vllm", {})
+            vllm_kwargs["max_logprobs"] = max(vllm_kwargs.get("max_logprobs", 0), self.topk_log_probs)
+
+        if self.replay_sampling_mask:
+            if self.topk_log_probs <= 0:
+                raise ValueError("rollout.replay_sampling_mask needs rollout.topk_log_probs > 0.")
+            if self.top_k > 0 and self.topk_log_probs <= self.top_k:
+                # Only an -inf entry in the head proves the support is complete.
+                raise ValueError(
+                    f"rollout.replay_sampling_mask needs rollout.topk_log_probs > top_k "
+                    f"(got {self.topk_log_probs} <= {self.top_k})."
+                )
+            if self.temperature <= 0 or not self.do_sample:
+                raise ValueError("rollout.replay_sampling_mask needs stochastic sampling with temperature > 0.")
+            if self.repetition_penalty != 1.0:
+                raise ValueError("rollout.replay_sampling_mask cannot replay repetition_penalty != 1.0.")
+            if self.mtp is not None and self.mtp.enable and self.mtp.enable_rollout:
+                raise ValueError("rollout.replay_sampling_mask does not support speculative decoding (MTP).")

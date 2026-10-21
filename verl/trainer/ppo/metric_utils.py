@@ -30,6 +30,7 @@ from verl import DataProto
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import deprecated
 from verl.utils.model import update_model_config
+from verl.utils.sampling_support import SUPPORT_COUNTS_KEY, compute_support_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -586,6 +587,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    if SUPPORT_COUNTS_KEY in batch.non_tensor_batch:
+        metrics.update(compute_support_metrics(list(batch.non_tensor_batch[SUPPORT_COUNTS_KEY]), response_mask))
 
     return metrics
 

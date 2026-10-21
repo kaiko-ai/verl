@@ -33,6 +33,7 @@ from verl.models.mcore.util import preprocess_packed_seqs, preprocess_thd_engine
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
+from verl.utils.sampling_support import log_probs_over_support_from_hidden
 
 from .util import postprocess_packed_seqs_for_dict_output, postprocess_thd_engine
 
@@ -146,6 +147,7 @@ def fused_forward_model_engine(vision_model: bool = False):
         temperature: float,
         calculate_entropy: bool,
         pad_token_id: int,
+        support_ids: Optional[Tensor] = None,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
@@ -181,6 +183,11 @@ def fused_forward_model_engine(vision_model: bool = False):
             labels, pre_process=True, need_roll=True, use_fp8_padding=use_fp8_padding
         )
         labels_rmpad = labels_rmpad.contiguous()
+        if support_ids is not None and post_process:
+            # prediction-row layout already lines up with the rolled labels
+            model_kwargs["support_ids"] = preprocess_thd_engine(
+                support_ids, pre_process=True, use_fp8_padding=use_fp8_padding
+            )[0].contiguous()
         output_orig: CausalLMOutputForPPO = model(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,
@@ -232,6 +239,7 @@ def _fused_GPTModel_forward(
     inference_params: Optional[BaseInferenceContext] = None,
     loss_mask: Optional[Tensor] = None,
     temperature: float = 1.0,
+    support_ids: Optional[Tensor] = None,
     **kwargs,
 ) -> CausalLMOutputForPPO:
     """
@@ -297,6 +305,11 @@ def _fused_GPTModel_forward(
         "none",
         parallel_state.get_tensor_model_parallel_group(),
     )
+    if support_ids is not None:
+        support_log_probs, has_support = log_probs_over_support_from_hidden(
+            hidden_states, output_weight, labels, support_ids, temperature
+        )
+        logprobs = torch.where(has_support.view_as(logprobs), support_log_probs.view_as(logprobs), logprobs)
 
     if has_config_logger_enabled(model.config):
         payload = OrderedDict(

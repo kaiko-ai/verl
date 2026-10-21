@@ -18,6 +18,12 @@ from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, unpad_input
+from verl.utils.sampling_support import (
+    SUPPORT_COUNTS_KEY,
+    SUPPORT_FLAT_IDS_KEY,
+    SUPPORT_IDS_KEY,
+    prediction_rows_from_compact,
+)
 
 
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
@@ -79,6 +85,18 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
             routed_experts_rmpad.squeeze(-1), offsets=cu_seqlens
         )
         data["routed_experts"] = routed_experts_nested
+
+    # sampling-mask replay: per-trajectory CSR supports -> nested prediction rows (bsz, j, k_batch)
+    if SUPPORT_COUNTS_KEY in data.keys():
+        counts = tu.get(data, SUPPORT_COUNTS_KEY)
+        flat_ids = tu.get(data, SUPPORT_FLAT_IDS_KEY)
+        data.pop(SUPPORT_COUNTS_KEY)
+        data.pop(SUPPORT_FLAT_IDS_KEY)
+        prompt_lens = attention_mask[:, : max_seq_len - max_response_len].sum(dim=1)
+        support_rows = prediction_rows_from_compact(counts, flat_ids, prompt_lens, cu_seqlens)
+        data[SUPPORT_IDS_KEY] = torch.nested.nested_tensor_from_jagged(
+            support_rows.to(cu_seqlens.device), offsets=cu_seqlens
+        )
 
     # (bsz, seqlen, topk)
     teacher_logprobs = data.get("teacher_logprobs", None)

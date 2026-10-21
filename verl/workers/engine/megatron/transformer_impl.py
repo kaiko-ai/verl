@@ -66,6 +66,7 @@ from verl.utils.megatron_utils import (
     warmup_nccl_communicators,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
+from verl.utils.sampling_support import SUPPORT_IDS_KEY
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
@@ -1040,6 +1041,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
             else:
                 temperature_value = float(temperature)
 
+        support_ids = batch.get(SUPPORT_IDS_KEY, None)
+        if support_ids is not None and not use_fused_kernels:
+            raise NotImplementedError(
+                "rollout.replay_sampling_mask needs the fused-kernel path (use_fused_kernels=True, "
+                "use_remove_padding=True, one temperature per batch)."
+            )
+
         if use_fused_kernels:
             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
 
@@ -1052,6 +1060,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 temperature=temperature_value,
                 calculate_entropy=calculate_entropy,
                 pad_token_id=self.model_config.tokenizer.pad_token_id,
+                support_ids=support_ids,
             )
         else:
             if not isinstance(temperature, torch.Tensor):
