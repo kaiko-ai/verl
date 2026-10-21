@@ -196,7 +196,7 @@ class McoreEngineConfig(EngineConfig):
     entropy_from_logits_chunk_size: int = 2048
     max_seqlen_per_dp_cp_rank: Optional[int] = None
     sequence_parallel: bool = True
-    nccl_comm_warmup: bool = False
+    nccl_comm_warmup: bool = True
     use_distributed_optimizer: bool = True
     pad_bshd_to_minibatch_max: bool = True
     pad_to_length: bool = False

@@ -457,7 +457,7 @@ def _clear_te_fp8_weight_workspaces(model_chunk):
 
 
 def warmup_nccl_communicators() -> list[str]:
-    """Eagerly initialize the NCCL communicator of every active Megatron parallel group.
+    """Eagerly initialize the NCCL communicator of every active Megatron parallel group and the default group.
 
     NCCL creates a communicator lazily on a group's first collective. For the distributed
     optimizer's grad reduce-scatter that first use is iteration 1, which coincides with the
@@ -504,6 +504,9 @@ def warmup_nccl_communicators() -> list[str]:
             continue
         torch.distributed.all_reduce(probe, group=group)
         warmed.append(f"{name}{tuple(kwargs.values()) or ''}")
+    # The default group: collectives outside Megatron's parallel state (e.g. the non-finite grad check).
+    torch.distributed.all_reduce(probe)
+    warmed.append("default_group")
     torch.cuda.synchronize()
     return warmed
 
