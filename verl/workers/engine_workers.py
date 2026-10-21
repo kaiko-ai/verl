@@ -236,7 +236,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
-        metrics.update(pop_support_stats())
+        metrics.update({key: [value] for key, value in pop_support_stats().items()})
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
         if dp_group is not None:

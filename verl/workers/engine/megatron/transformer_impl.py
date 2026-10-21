@@ -76,7 +76,7 @@ from verl.utils.megatron_utils import (
     warmup_nccl_communicators,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
-from verl.utils.sampling_support import nested_support_ids, vocab_parallel_log_probs_over_support
+from verl.utils.sampling_support import nested_support_ids
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
@@ -1244,7 +1244,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
         logits_processor_func: Callable,
         batch: TensorDict,
         data_format: str,
-        support_ids: torch.Tensor | None = None,
     ):
         assert logits.shape[:2] == label.shape[:2]
         # avoid non-positive temperature such as padding
@@ -1280,10 +1279,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if distillation_use_topk:
             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
         if not distillation_only:
-            if support_ids is not None:
-                ret["log_probs"] = vocab_parallel_log_probs_over_support(logits_bak, label, support_ids)
-            else:
-                ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
+            ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
         return ret
 
@@ -1321,14 +1317,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
             )
-        # sampling-mask replay: nested (bsz, seq, k) support in prediction-row layout, so it is split
-        # like the logits and needs no roll (see verl.utils.sampling_support)
         support_ids = nested_support_ids(batch)
-        if support_ids is not None:
-            if use_fused_kernels:
-                raise NotImplementedError("rollout.replay_sampling_mask does not support use_fused_kernels=True.")
-            if not self.engine_config.use_remove_padding:
-                raise NotImplementedError("rollout.replay_sampling_mask needs use_remove_padding=True (THD).")
+        if support_ids is not None and not use_fused_kernels:
+            raise NotImplementedError("rollout.replay_sampling_mask needs use_fused_kernels=True.")
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
         model_inputs = self.prepare_model_inputs(batch)
@@ -1406,6 +1397,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 router_padding_mask=router_padding_mask,
                 pad_to_length_bucket=pad_to_length_bucket,
                 position_ids=batch.get("position_ids", None),
+                support_ids=support_ids,
             )
         else:
             if not isinstance(temperature, torch.Tensor):
@@ -1439,8 +1431,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "loss_mask": loss_mask,
                 "response_attention_mask": response_attention_mask,
             }
-            if support_ids is not None:
-                logits_processor_args["support_ids"] = support_ids
 
             mtp_loss_normalization_factor = None
             if (

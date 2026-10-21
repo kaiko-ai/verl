@@ -35,6 +35,7 @@ from verl.models.mcore.util import preprocess_thd_engine, preprocess_vlm_thd_eng
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
+from verl.utils.sampling_support import log_probs_over_support_from_hidden
 
 from .util import postprocess_thd_engine
 
@@ -100,6 +101,7 @@ class FusedOutputProcessorContext:
 
     temperature: float
     impl_backend: str = "triton"
+    support_ids: Tensor | None = None
 
 
 def fused_output_processor(
@@ -136,6 +138,11 @@ def fused_output_processor(
         parallel_state.get_tensor_model_parallel_group(),
         impl_backend=context.impl_backend,
     )
+    if context.support_ids is not None:
+        support_log_probs, has_support = log_probs_over_support_from_hidden(
+            hidden_states, weight, labels, context.support_ids, temperature
+        )
+        logprobs = torch.where(has_support.view_as(logprobs), support_log_probs.view_as(logprobs), logprobs)
 
     if has_config_logger_enabled(config):
         payload = OrderedDict(
@@ -284,6 +291,7 @@ def fused_forward_model_engine(vision_model: bool = False):
         router_padding_mask: Tensor | None = None,
         pad_to_length_bucket: int | None = None,
         position_ids: Tensor | None = None,
+        support_ids: Tensor | None = None,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
@@ -336,6 +344,9 @@ def fused_forward_model_engine(vision_model: bool = False):
             local_cp_size=local_cp_size,
         )
         labels_rmpad = labels_rmpad.contiguous()
+        if support_ids is not None and post_process:
+            # prediction-row layout already lines up with the rolled labels
+            support_ids = preprocess_thd_engine(support_ids, pre_process=True, **thd_kwargs)[0].contiguous()
         forward_kwargs = dict(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,
@@ -346,15 +357,21 @@ def fused_forward_model_engine(vision_model: bool = False):
         )
         if _use_output_processor_hook(model):
             impl_backend = get_fused_impl_backend(model)
+            if support_ids is not None and impl_backend.lower() == "liger":
+                # the support log-prob leaves dHidden partial per TP rank, which Liger does not reduce
+                raise NotImplementedError("rollout.replay_sampling_mask needs the triton fused kernel backend.")
             output_orig: CausalLMOutputForPPO = model(
                 **forward_kwargs,
                 output_processor=fused_output_processor,
                 output_processor_context=FusedOutputProcessorContext(
                     temperature=temperature,
                     impl_backend=impl_backend,
+                    support_ids=support_ids,
                 ),
             )
         else:
+            if support_ids is not None:
+                raise NotImplementedError("rollout.replay_sampling_mask needs Megatron's output_processor hook.")
             impl_backend = get_fused_impl_backend(model)
             output_orig: CausalLMOutputForPPO = model(
                 temperature=temperature,
