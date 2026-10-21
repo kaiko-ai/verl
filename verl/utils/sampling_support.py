@@ -203,6 +203,7 @@ def nested_support_ids(batch: Any) -> Optional[torch.Tensor]:
     _STATS["covered_tokens"].append(int((sizes > 0).sum()))
     _STATS["covered_ids"].append(int(sizes.sum()))
     _STATS["support_size_max"].append(int(sizes.max()) if sizes.size else 0)
+    _STATS["support_size_hist"].append(np.bincount(sizes, minlength=256))
     _STATS["csr_bytes"].append(sum(c.nbytes for c in counts_list) + sum(f.nbytes for f in flat_list))
     return support
 
@@ -228,7 +229,8 @@ def pop_support_stats() -> dict[str, float]:
 
     - ``coverage``: fraction of trained tokens normalized over their sampling support; the rest
       used the full vocabulary.
-    - ``support_size_{mean,max}``: support size of the covered tokens.
+    - ``support_size_{mean,max,p50,p90,p99,p999}``: support size of the covered tokens; a token whose
+      support does not fit the recorded head is uncovered, so ``topk_log_probs`` should exceed p99.9.
     - ``csr_mb``: CSR support bytes this rank received.
     - ``expand_ms``: CPU time expanding the CSR into prediction rows.
     - ``logprob_{fwd,bwd}_ms``: GPU time of the support log-prob forward / backward.
@@ -245,6 +247,12 @@ def pop_support_stats() -> dict[str, float]:
         metrics["sampling_mask/coverage"] = covered / trained
         metrics["sampling_mask/support_size_mean"] = sum(stats["covered_ids"]) / covered if covered else 0.0
         metrics["sampling_mask/support_size_max"] = float(max(stats["support_size_max"]))
+        cumulative = np.cumsum(np.sum(stats["support_size_hist"], axis=0)[1:])
+        if cumulative[-1]:
+            for name, q in (("p50", 0.5), ("p90", 0.9), ("p99", 0.99), ("p999", 0.999)):
+                metrics[f"sampling_mask/support_size_{name}"] = float(
+                    1 + np.searchsorted(cumulative, q * cumulative[-1])
+                )
     if "csr_bytes" in stats:
         metrics["sampling_mask/csr_mb"] = sum(stats["csr_bytes"]) / 1e6
     if "expand_ms" in stats:

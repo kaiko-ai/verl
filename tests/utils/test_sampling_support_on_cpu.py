@@ -187,6 +187,9 @@ def test_nested_support_ids_aligns_rows_with_the_packed_sequence_and_records_cov
     assert stats["sampling_mask/coverage"] == pytest.approx(2 / 4)
     assert stats["sampling_mask/support_size_mean"] == pytest.approx(1.5)
     assert stats["sampling_mask/support_size_max"] == 2
+    # covered sizes {2, 1}: half the tokens have support 1
+    assert stats["sampling_mask/support_size_p50"] == 1
+    assert stats["sampling_mask/support_size_p90"] == stats["sampling_mask/support_size_p999"] == 2
     assert stats["sampling_mask/csr_mb"] == pytest.approx((5 + 12) / 1e6)
     assert pop_support_stats() == {}
     assert nested_support_ids(list_of_dict_to_tensordict([{"input_ids": torch.tensor([1, 2])}])) is None
