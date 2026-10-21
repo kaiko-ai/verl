@@ -25,16 +25,18 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from tensordict import TensorDict
 
+from verl import DataProto
 from verl.utils.sampling_support import (
     EMPTY_SLOT,
+    SUPPORT_COUNTS_KEY,
+    SUPPORT_FLAT_IDS_KEY,
     SUPPORT_IDS_KEY,
+    compact_support_rows,
     compute_support_metrics,
     empty_support_rows,
-    pad_response_support,
     pop_support_rows,
-    response_support_to_prediction_rows,
+    prediction_rows_from_compact,
     support_rows_from_topk,
     vocab_parallel_log_probs_over_support,
 )
@@ -80,17 +82,36 @@ def test_pop_support_rows_removes_head_fields():
     assert pop_support_rows({"global_steps": 7}) is None
 
 
-def test_pad_and_prediction_rows():
-    rows = np.concatenate([np.array([[11, 12], [13, 0]], dtype=np.int32), empty_support_rows(1, 2)])
-    padded = pad_response_support(rows, response_length=5)
-    assert padded.shape == (1, 5, 2)
-    assert padded[0, 3:].eq(EMPTY_SLOT).all()
+def test_compact_support_rows_is_csr_of_nonempty_slots():
+    rows = np.concatenate([np.array([[11, 12, 0], [0, 0, 0], [13, 0, 0]], dtype=np.int32), empty_support_rows(1, 3)])
+    counts, flat_ids = compact_support_rows(rows)
+    assert counts.dtype == np.uint8 and flat_ids.dtype == np.int32
+    np.testing.assert_array_equal(counts, [2, 0, 1, 0])
+    np.testing.assert_array_equal(flat_ids, [10, 11, 12])  # raw token ids
 
-    full = response_support_to_prediction_rows(padded, prompt_width=4, seq_width=9)
-    assert full.shape == (1, 9, 2)
-    # response token r is predicted by column prompt_width + r - 1
-    torch.testing.assert_close(full[0, 3:8], padded[0])
-    assert full[0, :3].eq(EMPTY_SLOT).all() and full[0, 8].eq(EMPTY_SLOT).all()
+
+def test_prediction_rows_from_compact():
+    # trajectory 0: prompt 3, response 2 (+1 padding token in the packed sequence); trajectory 1: prompt 1, response 3
+    counts = [np.array([2, 1], dtype=np.uint8), np.array([0, 3, 1], dtype=np.uint8)]
+    flat_ids = [np.array([7, 8, 9], dtype=np.int32), np.array([4, 5, 6, 3], dtype=np.int32)]
+    cu_seqlens = torch.tensor([0, 6, 10], dtype=torch.int32)
+
+    rows = prediction_rows_from_compact(counts, flat_ids, torch.tensor([3, 1]), cu_seqlens)
+
+    assert rows.shape == (10, 3) and rows.dtype == torch.int32  # k_batch = largest support
+    expected = torch.zeros(10, 3, dtype=torch.int32)
+    expected[2, :2] = torch.tensor([8, 9])  # response token r is predicted by row prompt_len - 1 + r
+    expected[3, :1] = 10
+    expected[6 + 1, :3] = torch.tensor([5, 6, 7])
+    expected[6 + 2, :1] = 4
+    torch.testing.assert_close(rows, expected)
+
+
+def test_prediction_rows_from_compact_rejects_mismatched_ids():
+    with pytest.raises(ValueError, match="sum to"):
+        prediction_rows_from_compact(
+            [np.array([2], dtype=np.uint8)], [np.array([1], dtype=np.int32)], torch.tensor([1]), torch.tensor([0, 2])
+        )
 
 
 def _torch_unpad_input(hidden_states, attention_mask):
@@ -111,38 +132,37 @@ def test_left_right_2_no_padding_aligns_support_with_labels(monkeypatch):
         monkeypatch.setattr(padding, "index_first_axis", lambda x, indices: x[indices])
     left_right_2_no_padding = padding.left_right_2_no_padding
 
-    k = 3
-    prompt_width, response_width = 4, 5
+    prompt_width = 4
     # sample 0: prompt [1, 2, 3], response [4, 5]; sample 1: prompt [6, 7, 8, 9], response [10, 11, 12]
     input_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 0, 0, 0], [6, 7, 8, 9, 10, 11, 12, 0, 0]])
     attention_mask = torch.tensor([[0, 1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 0, 0]])
     response_mask = attention_mask[:, prompt_width:].clone()
     position_ids = (attention_mask.cumsum(-1) - 1).clamp(min=0)
     # every generated token's support holds the token itself plus a distractor
-    support = torch.zeros(2, response_width, k, dtype=torch.int32)
+    counts = np.empty(2, dtype=object)
+    flat_ids = np.empty(2, dtype=object)
     for b in range(2):
-        for r in range(int(response_mask[b].sum())):
-            token = int(input_ids[b, prompt_width + r])
-            support[b, r, 0] = token + 1
-            support[b, r, 1] = 100 + 1
-    data = TensorDict(
-        {
+        tokens = input_ids[b, prompt_width:][response_mask[b].bool()].tolist()
+        counts[b] = np.full(len(tokens), 2, dtype=np.uint8)
+        flat_ids[b] = np.array([v for t in tokens for v in (t, 100)], dtype=np.int32)
+    batch = DataProto.from_dict(
+        tensors={
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "response_mask": response_mask,
             "position_ids": position_ids,
-            SUPPORT_IDS_KEY: support,
         },
-        batch_size=2,
+        non_tensors={SUPPORT_COUNTS_KEY: counts, SUPPORT_FLAT_IDS_KEY: flat_ids},
     )
 
-    data = left_right_2_no_padding(data)
+    data = left_right_2_no_padding(batch.to_tensordict())
 
+    assert SUPPORT_COUNTS_KEY not in data.keys() and SUPPORT_FLAT_IDS_KEY not in data.keys()
     nested = data[SUPPORT_IDS_KEY]
     assert nested.is_nested
     packed_ids = data["input_ids"].values()
     packed_support = nested.values()
-    assert packed_support.shape == (packed_ids.shape[0], k)
+    assert packed_support.shape == (packed_ids.shape[0], 2)
     # the label of packed row t is token t + 1 of the same sequence
     offsets = data["input_ids"].offsets().tolist()
     for start, end in zip(offsets[:-1], offsets[1:], strict=True):
@@ -157,9 +177,9 @@ def test_left_right_2_no_padding_aligns_support_with_labels(monkeypatch):
 
 
 def test_compute_support_metrics():
-    support = torch.tensor([[[3, 4], [0, 0], [5, 0]]], dtype=torch.int32)
-    response_mask = torch.tensor([[1, 1, 0]])
-    metrics = compute_support_metrics(support, response_mask)
+    counts = [np.array([2, 0, 1], dtype=np.uint8)]
+    response_mask = torch.tensor([[1, 1, 0, 0]])
+    metrics = compute_support_metrics(counts, response_mask)
     assert metrics["sampling_mask/coverage"] == pytest.approx(0.5)
     assert metrics["sampling_mask/support_size_mean"] == pytest.approx(2.0)
     assert metrics["sampling_mask/support_size_max"] == 2
@@ -401,7 +421,7 @@ def _postprocess_owner(replay=True, k=3, response_length=6):
         rollout_config={"replay_sampling_mask": replay, "topk_log_probs": k, "response_length": response_length}
     )
     owner.rollout_config = types.SimpleNamespace(**owner.rollout_config, get=owner.rollout_config.get)
-    return owner, AgentLoopWorker._build_rollout_support_ids
+    return owner, AgentLoopWorker._build_rollout_support
 
 
 def test_agent_loop_builds_support_from_single_turn_head():
@@ -415,10 +435,10 @@ def test_agent_loop_builds_support_from_single_turn_head():
             "global_steps": 3,
         },
     )
-    support = build(owner, output, validate=False)
-    assert support.shape == (1, 6, 3)
-    assert support[0, 0].tolist() == [5, 2, 0]
-    assert support[0, 1:].eq(EMPTY_SLOT).all()
+    counts, flat_ids = build(owner, output, validate=False)
+    # the second token's head is unproven, so it has no support
+    np.testing.assert_array_equal(counts, [2, 0])
+    np.testing.assert_array_equal(flat_ids, [4, 1])
     assert output.extra_fields == {"global_steps": 3}
 
 
@@ -426,8 +446,9 @@ def test_agent_loop_prefers_multi_turn_rows_and_checks_length():
     owner, build = _postprocess_owner()
     rows = np.array([[5, 0, 0], [0, 0, 0], [7, 8, 0]], dtype=np.int32)
     output = types.SimpleNamespace(response_ids=[4, 99, 6], extra_fields={"response_support_rows": rows})
-    support = build(owner, output, validate=False)
-    torch.testing.assert_close(support[0, :3], torch.as_tensor(rows))
+    counts, flat_ids = build(owner, output, validate=False)
+    np.testing.assert_array_equal(counts, [1, 0, 2])
+    np.testing.assert_array_equal(flat_ids, [4, 6, 7])
 
     output = types.SimpleNamespace(response_ids=[4, 99], extra_fields={"response_support_rows": rows})
     with pytest.raises(ValueError, match="covers 3 tokens"):

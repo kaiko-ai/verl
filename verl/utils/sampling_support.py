@@ -24,14 +24,17 @@ proves complete support, the support is the set of ids with a finite log-prob. R
 proof fall back to full-vocabulary log-probs.
 
 Encoding: support slots hold ``token_id + 1`` and ``0`` marks an empty slot, so every zero padding
-on the way (response padding, sequence packing, TP/CP alignment) means "no support". A row with no
-nonzero slot (prompt, tool and padding tokens, unproven rows) uses the full vocabulary.
+on the way (sequence packing, TP/CP alignment) means "no support". A row with no nonzero slot
+(prompt, tool and padding tokens, unproven rows) uses the full vocabulary.
 
-Layout: ``rollout_support_ids`` is ``[bsz, response_length, K]`` int32, response-aligned (row ``r``
-is the support of response token ``r``) and right-padded. ``left_right_2_no_padding`` turns it into
-a nested full-sequence tensor in prediction-row layout (row ``t`` holds the support of token
-``t + 1``, so it lines up with the logits row that predicts that token), which the logits processor
-can split like the logits without rolling.
+Storage: supports are small (often 2-3 ids for top_p < 1) next to the recorded head (k ids), so
+each trajectory carries them in CSR form in ``non_tensor_batch``: ``rollout_support_counts``
+(uint8, one count per response token) and ``rollout_support_flat_ids`` (int32, the ids
+concatenated). ``left_right_2_no_padding`` expands them straight into ``rollout_support_ids``, a
+nested ``[bsz, seq, k_batch]`` int32 tensor over the real tokens in prediction-row layout (row
+``t`` holds the support of token ``t + 1``, so it lines up with the logits row that predicts that
+token) with ``k_batch`` the largest support in the batch. The logits processor splits it like the
+logits, without rolling.
 """
 
 from typing import Optional
@@ -40,6 +43,8 @@ import numpy as np
 import torch
 
 SUPPORT_IDS_KEY = "rollout_support_ids"
+SUPPORT_COUNTS_KEY = "rollout_support_counts"
+SUPPORT_FLAT_IDS_KEY = "rollout_support_flat_ids"
 EMPTY_SLOT = 0
 ID_OFFSET = 1
 
@@ -92,59 +97,85 @@ def empty_support_rows(num_rows: int, k: int) -> np.ndarray:
     return np.full((num_rows, k), EMPTY_SLOT, dtype=np.int32)
 
 
-def pad_response_support(support_rows: np.ndarray, response_length: int) -> torch.Tensor:
-    """Right-pad response-aligned support rows to ``(1, response_length, k)``."""
-    rows = torch.as_tensor(np.asarray(support_rows), dtype=torch.int32)
-    num_rows, k = rows.shape
-    if num_rows > response_length:
-        raise ValueError(f"support covers {num_rows} tokens, more than response_length={response_length}")
-    padded = torch.full((1, response_length, k), EMPTY_SLOT, dtype=torch.int32)
-    padded[0, :num_rows] = rows
-    return padded
+def compact_support_rows(support_rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """CSR form of encoded support rows: per-row counts (uint8) and the token ids concatenated (int32)."""
+    rows = np.asarray(support_rows)
+    if rows.ndim != 2:
+        raise ValueError(f"expected (T, k) support rows, got shape {rows.shape}")
+    if rows.shape[1] > np.iinfo(np.uint8).max:
+        raise ValueError(f"support width {rows.shape[1]} does not fit uint8 counts")
+    nonempty = rows != EMPTY_SLOT
+    counts = nonempty.sum(-1).astype(np.uint8)
+    flat_ids = (rows[nonempty] - ID_OFFSET).astype(np.int32)
+    return counts, flat_ids
 
 
-def response_support_to_prediction_rows(support: torch.Tensor, prompt_width: int, seq_width: int) -> torch.Tensor:
-    """Lay response-aligned support over the left/right-padded prompt+response sequence.
+def prediction_rows_from_compact(
+    counts: list[np.ndarray],
+    flat_ids: list[np.ndarray],
+    prompt_lens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Expand per-trajectory CSR supports into packed encoded rows in prediction-row layout.
 
-    Response token ``r`` sits at column ``prompt_width + r`` and is predicted by the logits row at
-    column ``prompt_width + r - 1``, so its support goes there. The row at ``prompt_width - 1`` is
-    the last prompt token, which is real because prompts are left-padded and non-empty.
+    Response token ``r`` of trajectory ``i`` is predicted by packed row
+    ``cu_seqlens[i] + prompt_lens[i] - 1 + r``, so its support goes there; all other rows are empty.
 
     Args:
-        support: Response-aligned support, shape (bsz, response_length, k).
-        prompt_width: Width of the left-padded prompt block.
-        seq_width: Width of the padded prompt+response sequence.
+        counts: Per trajectory, the support size of each response token, shape (T_i,).
+        flat_ids: Per trajectory, the support ids concatenated, shape (sum(counts[i]),).
+        prompt_lens: Real prompt length per trajectory, shape (bsz,).
+        cu_seqlens: Packed sequence offsets of the real tokens, shape (bsz + 1,).
 
     Returns:
-        Support in prediction-row layout, shape (bsz, seq_width, k).
+        Encoded support rows, shape (cu_seqlens[-1], k_batch), int32, with ``k_batch`` the largest
+        support in the batch (at least 1).
     """
-    bsz, response_length, k = support.shape
-    if prompt_width < 1 or prompt_width + response_length != seq_width:
-        raise ValueError(
-            f"support of width {response_length} does not fit prompt_width={prompt_width}, seq_width={seq_width}"
-        )
-    full = torch.full((bsz, seq_width, k), EMPTY_SLOT, dtype=support.dtype, device=support.device)
-    full[:, prompt_width - 1 : prompt_width - 1 + response_length] = support
-    return full
+    prompt_lens = prompt_lens.cpu().long()
+    cu_seqlens = cu_seqlens.cpu().long()
+    seq_lens = cu_seqlens.diff()
+    num_rows = torch.tensor([len(c) for c in counts], dtype=torch.long)
+    if len(counts) != len(prompt_lens) or (prompt_lens < 1).any() or (prompt_lens + num_rows > seq_lens).any():
+        raise ValueError("support rows do not fit the packed sequences")
+    all_counts = torch.from_numpy(np.concatenate(counts).astype(np.int64)) if counts else torch.zeros(0)
+    all_ids = torch.from_numpy(np.concatenate(flat_ids).astype(np.int32)) if flat_ids else torch.zeros(0)
+    if int(all_counts.sum()) != all_ids.numel():
+        raise ValueError(f"support counts sum to {int(all_counts.sum())}, but {all_ids.numel()} ids were given")
+
+    k_batch = max(int(all_counts.max()) if all_counts.numel() else 0, 1)
+    rows = torch.full((int(cu_seqlens[-1]), k_batch), EMPTY_SLOT, dtype=torch.int32)
+    if all_ids.numel() == 0:
+        return rows
+    # packed row of every response token, then of every support id, and its slot within the row
+    first_row = cu_seqlens[:-1] + prompt_lens - 1
+    token_rows = torch.repeat_interleave(first_row, num_rows) + (
+        torch.arange(int(num_rows.sum())) - torch.repeat_interleave(num_rows.cumsum(0) - num_rows, num_rows)
+    )
+    id_rows = torch.repeat_interleave(token_rows, all_counts)
+    id_slots = torch.arange(all_ids.numel()) - torch.repeat_interleave(all_counts.cumsum(0) - all_counts, all_counts)
+    rows[id_rows, id_slots] = all_ids + ID_OFFSET
+    return rows
 
 
-def compute_support_metrics(support: torch.Tensor, response_mask: torch.Tensor) -> dict[str, float]:
+def compute_support_metrics(counts: list[np.ndarray], response_mask: torch.Tensor) -> dict[str, float]:
     """Coverage of the replayed support over generated tokens.
 
     ``sampling_mask/coverage`` is the fraction of generated tokens trained over their sampling
     support; the rest fall back to the full vocabulary (head without proof of complete support).
     """
-    response_mask = response_mask.bool()
-    num_tokens = response_mask.sum()
+    response_mask = response_mask.bool().cpu()
+    num_tokens = int(response_mask.sum())
     if num_tokens == 0:
         return {}
-    support_size = (support != EMPTY_SLOT).sum(-1)
-    covered = (support_size > 0) & response_mask
-    num_covered = covered.sum()
+    sizes = []
+    for i, c in enumerate(counts):
+        c = torch.from_numpy(np.asarray(c, dtype=np.int64))
+        sizes.append(c[(c > 0) & response_mask[i, : len(c)]])
+    sizes = torch.cat(sizes) if sizes else torch.zeros(0, dtype=torch.long)
     return {
-        "sampling_mask/coverage": (num_covered / num_tokens).item(),
-        "sampling_mask/support_size_mean": (support_size[covered].float().mean().item() if num_covered > 0 else 0.0),
-        "sampling_mask/support_size_max": (support_size[covered].max().item() if num_covered > 0 else 0),
+        "sampling_mask/coverage": sizes.numel() / num_tokens,
+        "sampling_mask/support_size_mean": sizes.float().mean().item() if sizes.numel() else 0.0,
+        "sampling_mask/support_size_max": int(sizes.max()) if sizes.numel() else 0,
     }
 
 
