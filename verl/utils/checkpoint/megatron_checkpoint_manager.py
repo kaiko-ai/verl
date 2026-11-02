@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
+import gc
 import json
 import logging
 import os
@@ -29,9 +29,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject
 from packaging import version
 from transformers import GenerationConfig
 
-from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.device import get_device_name, get_torch_device, is_device_available
 from verl.utils.fs import is_non_local, local_mkdir_safe
-from verl.utils.host_memory import release_freed_host_memory
 from verl.utils.logger import log_with_rank
 from verl.utils.megatron.dist_checkpointing import load_dist_checkpointing, save_dist_checkpointing
 from verl.utils.megatron_utils import (
@@ -120,10 +119,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
       the ``model`` slot are saved/loaded via ``dist_checkpointing`` under
       ``model/dist_ckpt/`` (mirrors ``*.megatron.use_dist_checkpointing``).
 
-    * **HuggingFace / mbridge** -- any HF-format model weights (``hf_model`` in
+    * **HuggingFace / Megatron-Bridge** -- any HF-format model weights (``hf_model`` in
       contents, or ``model`` when not using dist shards for that slot) require a
-      non-``None`` ``bridge`` instance. The engine constructs the bridge when
-      mbridge is enabled.
+      non-``None`` ``bridge`` instance.
 
     These combine: e.g. ``save_contents=['model', 'hf_model', ...]`` with
     ``use_dist_checkpointing=True`` and a ``bridge`` writes both
@@ -150,7 +148,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         lr_scheduler: The learning rate scheduler instance.
         use_dist_checkpointing: If ``True``, include Megatron ``dist_checkpointing``
             shards for the ``model`` slot. Mirrors ``*.megatron.use_dist_checkpointing``.
-        bridge: mbridge / Megatron-Bridge instance for HF save/load; required whenever
+        bridge: Megatron-Bridge instance for HF save/load; required whenever
             checkpoint contents request HF-format model weights.
     """
 
@@ -199,7 +197,6 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         self.bridge = bridge
         self.provider = provider
-        self.vanilla_bridge = self.provider is None
         self.peft_cls = peft_cls
         self.use_megatron_fsdp = use_megatron_fsdp
         self.rank = torch.distributed.get_rank()
@@ -212,7 +209,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         if "hf_model" in self.checkpoint_save_contents and self.bridge is None:
             raise ValueError(
                 "`save_contents` contains 'hf_model' but `bridge` is None. "
-                "HuggingFace-format model weights require mbridge (pass `bridge=...`) "
+                "HuggingFace-format model weights require Megatron-Bridge (pass `bridge=...`) "
                 "or remove 'hf_model' from `save_contents`."
             )
         if "hf_model" in self.checkpoint_load_contents and self.bridge is None:
@@ -275,7 +272,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             "rng_tracker_states": tensor_parallel.get_cuda_rng_tracker().get_states(),
         }
 
-        if get_device_name() != "cpu":
+        # get_device_name() reports the platform's accelerator even on hosts that have
+        # none, so the accelerator RNG state is only reachable when the device is
+        # actually usable in this process.
+        if get_device_name() != "cpu" and is_device_available():
             rng_state[f"{get_device_name()}_rng_state"] = get_torch_device().get_rng_state()
 
         rng_state_list = None
@@ -501,7 +501,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             model_entry: dict = {
                 "path": hf_rel,
                 "format": "huggingface",
-                "backend": "mbridge",
+                "backend": "megatron-bridge",
             }
             if self.peft_cls is not None:
                 model_entry["peft_adapter_path"] = os.path.join(hf_rel, "adapter")
@@ -571,13 +571,11 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         directories: dict[str, str] = {}
         if self.should_save_hf_model:
             directories[hf_rel] = (
-                "HuggingFace-format artifacts written via mbridge: model weights, "
+                "HuggingFace-format artifacts written via Megatron-Bridge: model weights, "
                 "config.json, tokenizer files, and optional generation_config.json."
             )
         if self.should_save_dist_ckpt_model or (self.should_save_hf_model and self.peft_cls is not None):
-            directories[model_dist_rel] = (
-                "Megatron dist_checkpointing shards for model weights (or PEFT adapter shards when mbridge is enabled)."
-            )
+            directories[model_dist_rel] = "Megatron dist_checkpointing shards for model weights or PEFT adapter shards."
         if self.should_save_optimizer:
             directories[optim_dist_rel] = (
                 "Megatron dist_checkpointing shards for the optimizer state (includes lr_scheduler when present)."
@@ -636,10 +634,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     def _load_model_as_hf_via_bridge(self, hf_model_path: str):
         """Load model weights through megatron-bridge."""
-        if self.vanilla_bridge:
-            self.bridge.load_weights(self.model, hf_model_path)
-        else:
-            self.bridge.load_hf_weights(self.model, hf_model_path)
+        self.bridge.load_hf_weights(self.model, hf_model_path)
 
     @staticmethod
     def _has_checkpoint_files(path: str) -> bool:
@@ -833,8 +828,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         np.random.set_state(rng_states["np_rng_state"])
         torch.set_rng_state(rng_states["torch_rng_state"])
 
-        if get_device_name() != "cpu":
-            get_torch_device().set_rng_state(rng_states[f"{get_device_name()}_rng_state"])
+        device_rng_key = f"{get_device_name()}_rng_state"
+        if is_device_available() and device_rng_key in rng_states:
+            get_torch_device().set_rng_state(rng_states[device_rng_key])
 
         # Check for empty states array
         if not rng_states["rng_tracker_states"]:
@@ -897,7 +893,6 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         )
         metadata = self._load_content_metadata(metadata_source)
 
-
         # Model sharded state dict is shared across the model-load and
         # optimizer-load metadata inputs, so build it once when either path
         # needs it. The dist_ckpt model load and the HF+PEFT load both read
@@ -938,7 +933,6 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             self._load_model_as_hf_via_bridge(hf_model_path)
             log_with_rank(f"Loaded HF model checkpoint from {hf_model_path} with bridge", rank=self.rank, logger=logger)
 
-
         # ── Load optimizer / LR scheduler ───────────────────────────────────
         if self.should_load_optimizer:
             optim_sd = self._build_optimizer_state_dict(model_sharded_state_dict, metadata, is_loading=True)
@@ -946,8 +940,6 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 sharded_state_dict=optim_sd,
                 ckpt_dir=optim_dist_path,
             )
-            # Each rank reads a SUPERSET of its shard here and slices afterwards, so this is the
-            # expected peak; the question these probes answer is whether it is ever given back.
             assert "optimizer" in loaded_optim, (
                 f"Optimizer state dict not found in {loaded_optim.keys()}. "
                 f"Please check the checkpoint file {optim_dist_path}."
@@ -979,16 +971,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             self.load_rng_states(loaded_extra["rng_state"])
             log_with_rank(f"Loaded RNG states from {extra_dist_path}", rank=self.rank, logger=logger)
 
-        # From here the sharded state dicts built for the load, and the superset the dist-checkpoint
-        # reader materialised, are all garbage -- but they sit in reference cycles, so dropping the
-        # names is not enough and scope exit does not free them. The forced collection inside
-        # release_freed_host_memory is what actually returns the memory, and it matters because
-        # Ray's OOM monitor counts anon and ignores page cache.
+        # The load's state dicts sit in reference cycles, so dropping the names alone frees nothing;
+        # collect now so the host RAM (counted by Ray's OOM monitor) is returned before training.
         model_sharded_state_dict = model_sd = loaded_model = None
         optim_sd = loaded_optim = None
         extra_sd = loaded_extra = None
-        del model_sharded_state_dict, model_sd, loaded_model, optim_sd, loaded_optim, extra_sd, loaded_extra
-        release_freed_host_memory("post-load", rank=self.rank)
+        gc.collect()
 
         if del_local_after_load:
             try:
@@ -1002,33 +990,19 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
     # -- Save ------------------------------------------------------------------
 
-    def _get_bridge_extended_args(self):
-        """Build extra kwargs for ``bridge.save_weights`` from checkpoint config."""
-        extended_args = {}
-        mbridge_config = getattr(self.checkpoint_config, "mbridge_config", None) or {}
-        for sig in inspect.signature(self.bridge.save_weights).parameters:
-            if sig in ("weights_path", "models"):
-                continue
-            if sig in mbridge_config:
-                extended_args[sig] = mbridge_config[sig]
-        return extended_args
-
     def _save_model_as_hf_via_bridge(self, hf_ckpt_path: str):
         """Save model weights through megatron-bridge."""
-        if self.vanilla_bridge:
-            self.bridge.save_weights(self.model, hf_ckpt_path, **self._get_bridge_extended_args())
+        if self.peft_cls is not None:
+            hf_adapter_ckpt_path = os.path.join(hf_ckpt_path, "adapter")
+            self.bridge.save_hf_adapter(self.model, hf_adapter_ckpt_path, self.peft_cls)
+            log_with_rank(
+                f"Saved HF PEFT adapter checkpoint to {hf_adapter_ckpt_path}",
+                rank=self.rank,
+                logger=logger,
+                log_only_rank_0=True,
+            )
         else:
-            if self.peft_cls is not None:
-                hf_adapter_ckpt_path = os.path.join(hf_ckpt_path, "adapter")
-                self.bridge.save_hf_adapter(self.model, hf_adapter_ckpt_path, self.peft_cls)
-                log_with_rank(
-                    f"Saved HF PEFT adapter checkpoint to {hf_adapter_ckpt_path}",
-                    rank=self.rank,
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
-            else:
-                self.bridge.save_hf_weights(self.model, hf_ckpt_path)
+            self.bridge.save_hf_weights(self.model, hf_ckpt_path, strict=self.checkpoint_config.strict)
 
     def _save_hf_config_and_tokenizer(self, local_path: str):
         """Rank-0 saves HF config, tokenizer, and generation config."""
@@ -1194,7 +1168,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             ├── model/
             │   ├── huggingface/         # HF weights when ``bridge`` is set (+ ``hf_model`` / HF ``model`` path)
             │   └── dist_ckpt/           # Megatron model shards when ``use_dist_checkpointing``;
-            │                            # also PEFT adapters with mbridge
+            │                            # also PEFT adapters when enabled
             ├── optimizer/dist_ckpt/     # optimizer + lr_scheduler shards
             └── extra/dist_ckpt/         # rng_state shards
 

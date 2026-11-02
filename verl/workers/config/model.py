@@ -110,16 +110,12 @@ class HFModelConfig(BaseConfig):
     # custom chat template for the model
     custom_chat_template: Optional[str] = None
 
-    # overwrite kwargs for processor
-    processor_kwargs: dict = field(default_factory=dict)
-
     external_lib: Any = None
 
     override_config: dict = field(default_factory=dict)
 
     enable_gradient_checkpointing: bool = True
     enable_activation_offload: bool = False
-    freeze_vision_tower: bool = False
 
     use_remove_padding: bool = True
 
@@ -163,9 +159,7 @@ class HFModelConfig(BaseConfig):
         if self.load_tokenizer:
             self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
             self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
-            self.processor = hf_processor(
-                self.local_tokenizer_path, trust_remote_code=self.trust_remote_code, **self.processor_kwargs
-            )
+            self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
 
         # For base models (e.g. Qwen3.5-2b-Base), the processor may not have a chat_template
         # while the tokenizer does. Sync it so that processor.apply_chat_template() works.
@@ -189,9 +183,23 @@ class HFModelConfig(BaseConfig):
 
         # construct hf_config
         attn_implementation = self.override_config.get("attn_implementation", "flash_attention_2")
-        self.hf_config = AutoConfig.from_pretrained(
-            self.local_hf_config_path, trust_remote_code=self.trust_remote_code, attn_implementation=attn_implementation
-        )
+        try:
+            self.hf_config = AutoConfig.from_pretrained(
+                self.local_hf_config_path,
+                trust_remote_code=self.trust_remote_code,
+                attn_implementation=attn_implementation,
+            )
+        except ValueError as error:
+            lookup_error = error.__cause__ or error.__context__
+            if not isinstance(lookup_error, KeyError) or lookup_error.args != ("deepseek_v4",):
+                raise
+            from vllm.transformers_utils.config import get_config
+
+            self.hf_config = get_config(
+                self.local_hf_config_path,
+                trust_remote_code=self.trust_remote_code,
+                attn_implementation=attn_implementation,
+            )
 
         override_config_kwargs = {}
 

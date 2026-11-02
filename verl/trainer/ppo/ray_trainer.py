@@ -68,7 +68,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip.skip_manager import SkipManager
-from verl.utils.torch_functional import build_think_token_mask, masked_mean
+from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
@@ -404,7 +404,7 @@ class RayPPOTrainer:
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
@@ -545,7 +545,7 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores, trace_ids=None):
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -604,8 +604,6 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
-        sample_trace_ids = []
-        sample_span_ids = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -692,24 +690,7 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-            # rollout trace/span ids are stamped by the agent loop when tracing is enabled
-            trace_id_col = test_batch.non_tensor_batch.get("rollout_trace_id")
-            if trace_id_col is not None:
-                sample_trace_ids.extend(trace_id_col.tolist())
-            else:
-                sample_trace_ids.extend([None] * reward_tensor.shape[0])
-            span_id_col = test_batch.non_tensor_batch.get("rollout_span_id")
-            if span_id_col is not None:
-                sample_span_ids.extend(span_id_col.tolist())
-            else:
-                sample_span_ids.extend([None] * reward_tensor.shape[0])
-
-        self._maybe_log_val_generations(
-            inputs=sample_inputs,
-            outputs=sample_outputs,
-            scores=sample_scores,
-            trace_ids=sample_trace_ids if any(t is not None for t in sample_trace_ids) else None,
-        )
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -735,11 +716,9 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(
-            data_sources, sample_uids, reward_extra_infos_dict, sample_turns, span_ids=sample_span_ids
-        )
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns, span_ids=None):
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -831,12 +810,24 @@ class RayPPOTrainer:
             engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
             engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
 
+            # Build the critic profiler config via the hydra path (same as the actor / ref / SFT),
+            # so its tool_config entries are real dataclass instances the torch/nsys/npu backends can
+            # read. The critic is a standalone TrainingWorker (no outer ActorRolloutRefWorker wrapper),
+            # and the trainer drives start_profile()/stop_profile() and train_batch annotation directly
+            # on it; without a profiler_config its DistProfiler silently degrades to a no-op, so the
+            # critic (update_critic / compute_values) was never profiled by any backend.
+            critic_omega_profiler_config = self.config.critic.get("profiler", {})
+            critic_profiler_config = (
+                omega_conf_to_dataclass(critic_omega_profiler_config) if critic_omega_profiler_config else None
+            )
+
             critic_cfg = TrainingWorkerConfig(
                 model_type="value_model",
                 model_config=orig_critic_cfg.model,
                 engine_config=engine_config,
                 optimizer_config=orig_critic_cfg.optim,
                 checkpoint_config=orig_critic_cfg.checkpoint,
+                profiler_config=critic_profiler_config,
                 extra_context=getattr(self, "_critic_extra_context", {}),
             )
 
@@ -1127,21 +1118,46 @@ class RayPPOTrainer:
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
-        if do_profile:
-            self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
-            if self.use_reference_policy:
-                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
-            if self.use_critic:
-                self.critic_wg.start_profile(profile_step=self.global_steps)
+        if not do_profile:
+            return
+        # In the hybrid engine, actor/rollout and the (colocated) reference -- and sometimes the
+        # critic -- are the SAME worker group object, so ref_policy_wg / critic_wg can alias
+        # actor_rollout_wg. Each start_profile/stop_profile round-trips to every rank and, on stop,
+        # runs the finish hook (e.g. the user's trace-upload command). Driving the same physical
+        # workers more than once would fire that hook once per alias and upload the very same trace
+        # file multiple times. Drive each distinct worker group exactly once.
+        # "train", not "e2e": this window only holds what the training worker itself runs
+        # (log-prob forwards and the actor update). Generation happens in the rollout engines,
+        # which are profiled separately and write their own traces.
+        self.actor_rollout_wg.start_profile(role="train", profile_step=self.global_steps)
+        seen = {id(self.actor_rollout_wg)}
+        if self.use_reference_policy and id(self.ref_policy_wg) not in seen:
+            seen.add(id(self.ref_policy_wg))
+            self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+        if self.use_critic and id(self.critic_wg) not in seen:
+            seen.add(id(self.critic_wg))
+            self.critic_wg.start_profile(profile_step=self.global_steps)
 
-    def _stop_profiling(self, do_profile: bool) -> None:
-        """Stop profiling for all worker groups if profiling is enabled."""
-        if do_profile:
-            self.actor_rollout_wg.stop_profile()
-            if self.use_reference_policy:
-                self.ref_policy_wg.stop_profile()
-            if self.use_critic:
-                self.critic_wg.stop_profile()
+    def _stop_profiling(self, do_profile: bool, run_command: bool = False) -> None:
+        """Stop profiling for all worker groups if profiling is enabled.
+
+        ``run_command`` is passed straight to ``stop_profile`` and is True only on the last profiled
+        step, so the finish command (e.g. a one-shot upload of the whole save_path) fires once at the
+        end rather than once per profiled step. Backend stop and artifact relocation still happen on
+        every profiled step.
+        """
+        if not do_profile:
+            return
+        # See _start_profiling: skip aliased worker groups so the finish hook (and any trace upload
+        # it triggers) fires exactly once per distinct process instead of once per role alias.
+        self.actor_rollout_wg.stop_profile(run_command=run_command)
+        seen = {id(self.actor_rollout_wg)}
+        if self.use_reference_policy and id(self.ref_policy_wg) not in seen:
+            seen.add(id(self.ref_policy_wg))
+            self.ref_policy_wg.stop_profile(run_command=run_command)
+        if self.use_critic and id(self.critic_wg) not in seen:
+            seen.add(id(self.critic_wg))
+            self.critic_wg.stop_profile(run_command=run_command)
 
     def _get_dp_size(self, worker_group, role: str) -> int:
         """Get data parallel size from worker group dispatch info.
@@ -1325,6 +1341,14 @@ class RayPPOTrainer:
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
+        if is_distillation_enabled(self.config.get("distillation")):
+            distillation_loss_cfg = self.distillation_config.distillation_loss
+            distillation_only = (
+                distillation_use_topk
+                and not distillation_loss_cfg.use_task_rewards
+                and not distillation_loss_cfg.use_policy_gradient
+            )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
@@ -1334,6 +1358,7 @@ class RayPPOTrainer:
             batch_td,
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
+            distillation_only=distillation_only,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
             epochs=ppo_epochs,
@@ -1517,18 +1542,6 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-
-                    if (
-                        self.distillation_config is not None
-                        and self.distillation_config.distillation_loss.think_token_coef < 1.0
-                    ):
-                        batch.batch["think_token_mask"] = build_think_token_mask(
-                            response_ids=batch.batch["responses"],
-                            response_mask=batch.batch["response_mask"],
-                            tokenizer=self.tokenizer,
-                            prompt_ids=batch.batch["prompts"],
-                        )
-
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1726,10 +1739,21 @@ class RayPPOTrainer:
                         if self.config.global_profiler.steps is not None
                         else False
                     )
+                    # Run the finish command (e.g. the trace upload) only once, on the last profiled
+                    # step, so a command that uploads the whole save_path sends each trace once rather
+                    # than re-uploading the accumulating directory every step. "Last" is the largest
+                    # configured step, or the run's final step if it ends earlier on a profiled step.
+                    profiled_steps = self.config.global_profiler.steps
+                    run_finish_command = bool(
+                        curr_step_profile
+                        and profiled_steps
+                        and (self.global_steps == max(profiled_steps) or is_last_step)
+                    )
                     self._stop_profiling(
                         curr_step_profile and not next_step_profile
                         if self.config.global_profiler.profile_continuous_steps
-                        else curr_step_profile
+                        else curr_step_profile,
+                        run_command=run_finish_command,
                     )
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile

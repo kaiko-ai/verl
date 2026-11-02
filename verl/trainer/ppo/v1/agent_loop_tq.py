@@ -20,6 +20,7 @@ import logging
 import os
 from typing import Any
 
+import numpy as np
 import ray
 import torch
 import transfer_queue as tq
@@ -32,6 +33,7 @@ from verl.experimental.agent_loop import (
     get_trajectory_info,
 )
 from verl.utils.ray_utils import auto_await
+from verl.utils.sampling_support import SUPPORT_COUNTS_KEY, SUPPORT_FLAT_IDS_KEY, pop_response_support
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
@@ -39,9 +41,31 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+    # Greedy REMAX baselines are used for their rewards, not score-centering training heads.
+    params.pop("topk_log_probs", None)
     params["top_p"] = 1.0
     params["top_k"] = -1
     params["temperature"] = 0
+
+
+async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseException]:
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return [result for result in results if isinstance(result, BaseException)]
+
+
+def _support_fields(support: tuple[np.ndarray, np.ndarray] | None, num_response_tokens: int) -> dict:
+    """Per-trajectory CSR support fields for sampling-mask replay."""
+    if support is None:
+        if num_response_tokens > 0:
+            raise ValueError(
+                "rollout.replay_sampling_mask is on but the agent loop returned no sampler support; multi-turn "
+                "agent loops must set extra_fields['response_support_counts'/'response_support_flat_ids']."
+            )
+        support = (np.zeros(0, dtype=np.uint8), np.zeros(0, dtype=np.int32))
+    counts, flat_ids = support
+    if len(counts) != num_response_tokens:
+        raise ValueError(f"sampling support covers {len(counts)} tokens, but the response has {num_response_tokens}.")
+    return {SUPPORT_COUNTS_KEY: torch.from_numpy(counts), SUPPORT_FLAT_IDS_KEY: torch.from_numpy(flat_ids)}
 
 
 @ray.remote
@@ -63,6 +87,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        # the trainer never consumes the sampler head on validation rollouts
+        if config.topk_log_probs and not validate:
+            sampling_params["topk_log_probs"] = config.topk_log_probs
 
         # override sampling params for validation
         if validate:
@@ -103,6 +130,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+        tasks = []
         try:
             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
             config = self.config.actor_rollout_ref.rollout
@@ -121,10 +149,24 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     )
                 )
                 tasks.append(task)
-            await asyncio.gather(*tasks)
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+
+            # Publish a terminal status only after every session settles, so no sibling can write after
+            # ReplayBuffer clears a failed group.
+            session_errors = await _settle_session_tasks(tasks)
+            if session_errors:
+                for error in session_errors:
+                    logger.error(
+                        f"Error in _run_prompt for uid={uid}",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                status = "failure"
+            else:
+                status = "finished"
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
+            if tasks:
+                await _settle_session_tasks(tasks)
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
     async def _agent_loop_postprocess(
@@ -159,8 +201,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # - uid: raw prompt uid from dataset
         # - session_id: session id for rollout.n sampling
         # - index: index of agent loop output
+        replay_sampling_mask = self.rollout_config.get("replay_sampling_mask", False) and not validate
         keys, fields, tags = [], [], []
         for i, output in enumerate(outputs):
+            support = pop_response_support(output.extra_fields) if replay_sampling_mask else None
             prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
             responses = torch.tensor(output.response_ids, dtype=torch.int64)
             input_ids = torch.cat([prompts, responses], dim=0)
@@ -180,6 +224,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
+            if replay_sampling_mask:
+                field.update(_support_fields(support, num_response_tokens=responses.size(0)))
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             tags.append(

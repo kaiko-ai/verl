@@ -36,9 +36,6 @@ enable_gradient_checkpointing: True
 # whether to enable activation offload. Only valid when we use hf model definition
 enable_activation_offload: False
 
-# whether to freeze the vision tower (for VLM models)
-freeze_vision_tower: False
-
 # whether to use remove padding. Only valid when we use hf model definition
 use_remove_padding: True
 
@@ -66,7 +63,8 @@ use_fused_kernels: False
 # fused kernel options.
 fused_kernel_options:
 
-  # the implementation backend for fused kernels.
+  # the implementation backend for fused kernels: torch, triton, or liger.
+  # Megatron only supports triton.
   impl_backend: torch
 
 # TiledMLP configuration for memory-efficient MLP computation.

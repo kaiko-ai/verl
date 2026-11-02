@@ -1,6 +1,6 @@
 # Fork Maintenance Guide
 
-This document explains how we maintain the `kaiko-ai/verl` fork of `volcengine/verl`.
+This document explains how we maintain the `kaiko-ai/verl` fork of `verl-project/verl`.
 
 ## Branching Strategy
 
